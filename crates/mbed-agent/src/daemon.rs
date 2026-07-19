@@ -261,7 +261,7 @@ async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> Ser
         }
     };
     persist_diagnostic(&id, active, &report, state).await;
-    ServerResponse::success(id, ResponseData::WanDiagnostic(report))
+    ServerResponse::success(id, ResponseData::WanDiagnostic(Box::new(report)))
 }
 
 async fn persist_diagnostic(

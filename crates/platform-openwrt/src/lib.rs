@@ -133,13 +133,8 @@ impl Discovery {
             .collect();
         let has = |name: &str| available_commands.iter().any(|command| command == name);
 
-        let backend = if has("fw4") {
-            FirewallBackend::Fw4
-        } else if has("fw3") {
-            FirewallBackend::Fw3
-        } else {
-            FirewallBackend::Unknown
-        };
+        let firewall_service = self.read("/etc/init.d/firewall");
+        let backend = select_firewall_backend(has("fw3"), has("fw4"), firewall_service.as_deref());
         let device_model = if self.exists("/sys/class/net/br-lan/bridge/vlan_filtering") {
             NetworkDeviceModel::Dsa
         } else if has("swconfig") {
@@ -164,6 +159,12 @@ impl Discovery {
         }
         if kind == PlatformKind::OpenWrt && backend == FirewallBackend::Unknown {
             warnings.push("unable to identify the active fw3/fw4 firewall backend".into());
+        }
+        if has("fw3") && has("fw4") && firewall_service.is_none() {
+            warnings.push(
+                "both fw3 and fw4 were found without readable firewall service evidence; using fw4 fallback"
+                    .into(),
+            );
         }
         if backend == FirewallBackend::Fw4 && !has("nft") {
             warnings.push("fw4 was found but nft is unavailable".into());
@@ -210,6 +211,36 @@ impl Discovery {
             .into_iter()
             .map(|directory| Path::new(directory).join(command))
             .any(|path| self.rooted(path.to_string_lossy().as_ref()).is_file())
+    }
+}
+
+fn select_firewall_backend(
+    has_fw3: bool,
+    has_fw4: bool,
+    service_script: Option<&str>,
+) -> FirewallBackend {
+    if let Some(script) = service_script {
+        if has_fw4
+            && script
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| word == "fw4")
+        {
+            return FirewallBackend::Fw4;
+        }
+        if has_fw3
+            && script
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| word == "fw3")
+        {
+            return FirewallBackend::Fw3;
+        }
+    }
+    if has_fw4 {
+        FirewallBackend::Fw4
+    } else if has_fw3 {
+        FirewallBackend::Fw3
+    } else {
+        FirewallBackend::Unknown
     }
 }
 
@@ -265,6 +296,19 @@ mod tests {
         assert!(capabilities.release_supported);
         assert_eq!(capabilities.firewall.backend, FirewallBackend::Fw3);
         assert_eq!(capabilities.package_manager, PackageManager::Opkg);
+    }
+
+    #[test]
+    fn mixed_install_uses_backend_referenced_by_firewall_service() {
+        let fixture = Fixture::new();
+        fixture.write("etc/openwrt_release", "DISTRIB_RELEASE='23.05.5'\n");
+        fixture.write("sbin/fw3", "");
+        fixture.write("sbin/fw4", "");
+        fixture.write("usr/sbin/iptables-save", "");
+        fixture.write("usr/sbin/nft", "");
+        fixture.write("etc/init.d/firewall", "#!/bin/sh\n/usr/sbin/fw3 -q start\n");
+        let capabilities = Discovery::new(&fixture.root).discover();
+        assert_eq!(capabilities.firewall.backend, FirewallBackend::Fw3);
     }
 
     struct Fixture {

@@ -64,7 +64,7 @@ pub enum ResponseData {
     Pong { daemon_version: String },
     Status(StatusResponse),
     Capabilities(Value),
-    WanDiagnostic(WanDiagnosticReport),
+    WanDiagnostic(Box<WanDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
 }
 
@@ -100,10 +100,21 @@ pub struct WanSummary {
     pub default_routes: Vec<WanRoute>,
     pub dns_servers: Vec<String>,
     pub firewall_backend: String,
+    pub firewall_zone: Option<FirewallZoneSummary>,
     pub active_attempted: bool,
     pub gateway_reachable: Option<bool>,
     pub internet_reachable: Option<bool>,
     pub dns_reachable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallZoneSummary {
+    pub name: String,
+    pub networks: Vec<String>,
+    pub input_policy: Option<String>,
+    pub output_policy: Option<String>,
+    pub forward_policy: Option<String>,
+    pub masquerading: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -6,7 +6,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use agent_protocol::{
-    ProbeEvidence, ProbeStatus, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
+    FirewallZoneSummary, ProbeEvidence, ProbeStatus, WanAssessment, WanDiagnosticReport, WanRoute,
+    WanSummary,
 };
 use platform_openwrt::{FirewallBackend, PlatformCapabilities};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -49,9 +50,10 @@ impl ToolRunner {
         platform: &PlatformCapabilities,
         active: bool,
     ) -> io::Result<WanDiagnosticReport> {
-        let mut evidence = Vec::with_capacity(8);
+        let mut evidence = Vec::with_capacity(9);
         for probe in [
             Probe::UbusWan,
+            Probe::UciFirewall,
             Probe::IpLink,
             Probe::IpAddress,
             Probe::IpRoute,
@@ -227,6 +229,7 @@ impl ToolRunner {
 #[derive(Debug, Clone, Copy)]
 enum Probe {
     UbusWan,
+    UciFirewall,
     IpLink,
     IpAddress,
     IpRoute,
@@ -237,6 +240,7 @@ impl Probe {
     const fn name(self) -> &'static str {
         match self {
             Self::UbusWan => "openwrt.interface.wan",
+            Self::UciFirewall => "openwrt.firewall.uci",
             Self::IpLink => "network.interface.link",
             Self::IpAddress => "network.interface.address",
             Self::IpRoute => "network.route.list",
@@ -247,6 +251,7 @@ impl Probe {
     const fn command(self) -> &'static str {
         match self {
             Self::UbusWan => "ubus",
+            Self::UciFirewall => "uci",
             Self::IpLink | Self::IpAddress | Self::IpRoute | Self::IpRule => "ip",
         }
     }
@@ -254,6 +259,7 @@ impl Probe {
     const fn args(self) -> &'static [&'static str] {
         match self {
             Self::UbusWan => &["call", "network.interface.wan", "status"],
+            Self::UciFirewall => &["-q", "show", "firewall"],
             Self::IpLink => &["-j", "link", "show"],
             Self::IpAddress => &["-j", "address", "show"],
             Self::IpRoute => &["-j", "route", "show", "table", "all"],
@@ -320,6 +326,7 @@ fn normalize(evidence: &[ProbeEvidence], platform: &PlatformCapabilities) -> Wan
             FirewallBackend::Unknown => "unknown",
         }
         .into(),
+        firewall_zone: None,
         active_attempted: false,
         gateway_reachable: None,
         internet_reachable: None,
@@ -337,6 +344,9 @@ fn normalize(evidence: &[ProbeEvidence], platform: &PlatformCapabilities) -> Wan
     }
     if let Some(output) = successful_output(evidence, "network.interface.link") {
         parse_ip_link(output, &mut summary);
+    }
+    if let Some(output) = successful_output(evidence, "openwrt.firewall.uci") {
+        summary.firewall_zone = parse_wan_firewall_zone(output);
     }
     for probe in ["network.dns.openwrt", "network.dns.system"] {
         if let Some(output) = successful_output(evidence, probe) {
@@ -527,6 +537,90 @@ fn parse_resolvers(output: &str, servers: &mut Vec<String>) {
     }
 }
 
+#[derive(Debug, Default)]
+struct UciZone {
+    section: String,
+    name: Option<String>,
+    networks: Vec<String>,
+    input_policy: Option<String>,
+    output_policy: Option<String>,
+    forward_policy: Option<String>,
+    masquerading: bool,
+}
+
+fn parse_wan_firewall_zone(output: &str) -> Option<FirewallZoneSummary> {
+    let mut zones: Vec<UciZone> = Vec::new();
+    for line in output.lines() {
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(key) = key.strip_prefix("firewall.") else {
+            continue;
+        };
+        if !key.contains('.') {
+            if strip_uci_scalar(raw_value) == "zone" {
+                zones.push(UciZone {
+                    section: key.into(),
+                    ..UciZone::default()
+                });
+            }
+            continue;
+        }
+        let Some((section, option)) = key.rsplit_once('.') else {
+            continue;
+        };
+        let Some(zone) = zones.iter_mut().find(|zone| zone.section == section) else {
+            continue;
+        };
+        match option {
+            "name" => zone.name = Some(strip_uci_scalar(raw_value)),
+            "network" => zone.networks = parse_uci_list(raw_value),
+            "input" => zone.input_policy = Some(strip_uci_scalar(raw_value)),
+            "output" => zone.output_policy = Some(strip_uci_scalar(raw_value)),
+            "forward" => zone.forward_policy = Some(strip_uci_scalar(raw_value)),
+            "masq" => {
+                zone.masquerading = matches!(
+                    strip_uci_scalar(raw_value).as_str(),
+                    "1" | "true" | "yes" | "on"
+                );
+            }
+            _ => {}
+        }
+    }
+    let zone = zones.into_iter().find(|zone| {
+        zone.name.as_deref() == Some("wan") || zone.networks.iter().any(|network| network == "wan")
+    })?;
+    Some(FirewallZoneSummary {
+        name: zone.name.unwrap_or_else(|| "wan".into()),
+        networks: zone.networks,
+        input_policy: zone.input_policy,
+        output_policy: zone.output_policy,
+        forward_policy: zone.forward_policy,
+        masquerading: zone.masquerading,
+    })
+}
+
+fn strip_uci_scalar(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character| character == '\'' || character == '"')
+        .into()
+}
+
+fn parse_uci_list(value: &str) -> Vec<String> {
+    let quoted: Vec<String> = value
+        .split('\'')
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .map(|(_, item)| item.to_owned())
+        .collect();
+    if quoted.is_empty() {
+        value.split_whitespace().map(strip_uci_scalar).collect()
+    } else {
+        quoted
+    }
+}
+
 fn probe_reachability(evidence: &[ProbeEvidence], probe: &str) -> Option<bool> {
     evidence
         .iter()
@@ -612,6 +706,12 @@ fn summarize(summary: &WanSummary, evidence: &[ProbeEvidence]) -> Vec<String> {
     if summary.firewall_backend == "unknown" {
         findings.push("active fw3/fw4 firewall backend could not be identified".into());
     }
+    if summary.firewall_backend != "unknown"
+        && successful_output(evidence, "openwrt.firewall.uci").is_some()
+        && summary.firewall_zone.is_none()
+    {
+        findings.push("no UCI firewall zone is assigned to logical network wan".into());
+    }
     if summary.active_attempted
         && summary.gateway_reachable.is_none()
         && summary.internet_reachable.is_none()
@@ -668,6 +768,39 @@ mod tests {
             firewall_evidence(&platform(FirewallBackend::Fw4)).output,
             "fw4/nftables"
         );
+    }
+
+    #[test]
+    fn normalizes_anonymous_fw3_wan_zone() {
+        let zone = parse_wan_firewall_zone(
+            "firewall.@zone[1]=zone\n\
+             firewall.@zone[1].name='wan'\n\
+             firewall.@zone[1].network='wan' 'wan6'\n\
+             firewall.@zone[1].input='REJECT'\n\
+             firewall.@zone[1].output='ACCEPT'\n\
+             firewall.@zone[1].forward='REJECT'\n\
+             firewall.@zone[1].masq='1'\n",
+        )
+        .expect("WAN zone");
+        assert_eq!(zone.networks, ["wan", "wan6"]);
+        assert_eq!(zone.input_policy.as_deref(), Some("REJECT"));
+        assert!(zone.masquerading);
+    }
+
+    #[test]
+    fn normalizes_named_fw4_wan_zone() {
+        let zone = parse_wan_firewall_zone(
+            "firewall.wan=zone\n\
+             firewall.wan.name='external'\n\
+             firewall.wan.network='wan'\n\
+             firewall.wan.input='DROP'\n\
+             firewall.wan.output='ACCEPT'\n\
+             firewall.wan.forward='DROP'\n",
+        )
+        .expect("WAN zone");
+        assert_eq!(zone.name, "external");
+        assert_eq!(zone.forward_policy.as_deref(), Some("DROP"));
+        assert!(!zone.masquerading);
     }
 
     #[test]
