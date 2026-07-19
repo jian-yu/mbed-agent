@@ -1,0 +1,49 @@
+# Mbed Agent
+
+Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and small embedded Linux systems. The current implementation is the Phase 0 runtime foundation described in [the architecture plan](docs/architecture-plan.zh-CN.md).
+
+## Current scope
+
+- A single-threaded Rust daemon and local CLI connected through a bounded Unix socket protocol.
+- Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
+- A size-capped SQLite store intended only for volatile runtime state.
+- Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
+- OpenWrt procd and UCI configuration skeletons.
+
+LLM providers, typed network tools, MQTT, WeCom, WeChat ClawBot, administrator elevation, and configuration transactions are planned but are not implemented yet.
+
+The implemented and deferred Phase 0 decisions are recorded in
+[ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
+the daemon foundation is usable now, while network-changing tools and remote
+channels remain disabled until their permission and rollback boundaries exist.
+
+## Build and test
+
+The workspace is pinned to Rust 1.85.1.
+
+```sh
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release -p mbed-agentd -p mbed-agent
+```
+
+## Local smoke test
+
+Use the example configuration so the daemon does not read `/etc`:
+
+```sh
+cargo run -p mbed-agentd -- --config config/mbed-agent.example.toml
+cargo run -p mbed-agent -- status
+cargo run -p mbed-agent -- capabilities
+```
+
+All generated runtime state is placed below `/tmp/mbed-agent` and may be discarded at reboot.
+
+## OpenWrt integration
+
+The `openwrt/files` tree contains the initial procd service and UCI/config files.
+It targets OpenWrt 21.02 and later and does not assume either fw3 or fw4; runtime
+capability discovery selects the available firewall stack. A feed package
+Makefile and per-architecture `.ipk`/`.apk` artifacts will be added only after
+validation against real OpenWrt SDK images.

@@ -1,0 +1,128 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const PROTOCOL_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientRequest {
+    pub protocol_version: u16,
+    pub id: String,
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Command {
+    Ping,
+    Status,
+    Capabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerResponse {
+    pub protocol_version: u16,
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResponseData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolError>,
+}
+
+impl ServerResponse {
+    #[must_use]
+    pub fn success(id: impl Into<String>, result: ResponseData) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.into(),
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn error(id: impl Into<String>, code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            id: id.into(),
+            ok: false,
+            result: None,
+            error: Some(ProtocolError {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ResponseData {
+    Pong { daemon_version: String },
+    Status(StatusResponse),
+    Capabilities(Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusResponse {
+    pub daemon_version: String,
+    pub protocol_version: u16,
+    pub uptime_secs: u64,
+    pub profile: String,
+    pub storage: StorageStatus,
+    pub platform_kind: String,
+    pub degraded_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageStatus {
+    pub database_bytes: u64,
+    pub database_limit_bytes: u64,
+    pub managed_bytes: u64,
+    pub total_budget_bytes: u64,
+    pub tmp_available_bytes: u64,
+    pub pressure: StoragePressure,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePressure {
+    Normal,
+    Pressure,
+    Critical,
+    Emergency,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidRequest,
+    UnsupportedProtocol,
+    Internal,
+    ResourceExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_round_trip_is_stable() {
+        let request = ClientRequest {
+            protocol_version: PROTOCOL_VERSION,
+            id: "test-1".into(),
+            command: Command::Capabilities,
+        };
+
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        let decoded: ClientRequest = serde_json::from_str(&encoded).expect("deserialize request");
+        assert_eq!(decoded, request);
+    }
+}

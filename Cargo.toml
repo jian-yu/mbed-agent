@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "crates/agent-core",
+    "crates/agent-protocol",
+    "crates/agent-store",
+    "crates/mbed-agent-cli",
+    "crates/mbed-agentd",
+    "crates/platform-openwrt",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jian-yu/mbed-agent"
+rust-version = "1.85"
+
+[workspace.dependencies]
+agent-core = { path = "crates/agent-core" }
+agent-protocol = { path = "crates/agent-protocol" }
+agent-store = { path = "crates/agent-store", default-features = false }
+platform-openwrt = { path = "crates/platform-openwrt" }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+rusqlite = { version = "0.37", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

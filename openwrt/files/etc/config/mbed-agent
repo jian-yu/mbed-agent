@@ -1,0 +1,4 @@
+config agent 'main'
+	option enabled '1'
+	option config_path '/etc/mbed-agent/config.toml'
+

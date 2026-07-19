@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.85.1 --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo +1.85.1 fmt --all -- --check
+      - name: Run tests
+        run: cargo +1.85.1 test --workspace --locked
+      - name: Run Clippy
+        run: cargo +1.85.1 clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build release binaries
+        run: cargo +1.85.1 build --release --locked -p mbed-agentd -p mbed-agent
+      - name: Validate OpenWrt service script
+        run: sh -n openwrt/files/etc/init.d/mbed-agent
