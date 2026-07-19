@@ -12,6 +12,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens a `SQLite` runtime store and applies its hard page limit and migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be created, `SQLite` cannot be
+    /// opened or configured, or a migration fails.
     pub fn open(path: &Path, max_database_bytes: u64) -> Result<Self, StoreError> {
         let parent = path
             .parent()
@@ -50,6 +56,12 @@ impl Store {
         })
     }
 
+    /// Runs `SQLite`'s quick integrity check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection cannot be locked, the check cannot
+    /// execute, or `SQLite` reports an integrity problem.
     pub fn health_check(&self) -> Result<(), StoreError> {
         let connection = self.connection()?;
         let result: String = connection

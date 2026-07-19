@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+const LOG_LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -31,6 +32,11 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// Loads and validates a configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, parsed, or validated.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -44,6 +50,12 @@ impl AgentConfig {
         Ok(config)
     }
 
+    /// Loads a configuration file when present, or returns validated defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing file cannot be loaded or the resulting
+    /// configuration is invalid.
     pub fn load_or_default(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
             Self::load(path)
@@ -54,6 +66,11 @@ impl AgentConfig {
         }
     }
 
+    /// Validates schema compatibility, runtime paths, and resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported schema or inconsistent limits.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(ConfigError::Validation(format!(
@@ -92,7 +109,6 @@ impl AgentConfig {
             ));
         }
 
-        const LOG_LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
         if !LOG_LEVELS.contains(&self.logging.level.as_str()) {
             return Err(ConfigError::Validation(format!(
                 "logging.level must be one of {}",

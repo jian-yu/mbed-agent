@@ -3,8 +3,7 @@ members = [
     "crates/agent-core",
     "crates/agent-protocol",
     "crates/agent-store",
-    "crates/mbed-agent-cli",
-    "crates/mbed-agentd",
+    "crates/mbed-agent",
     "crates/platform-openwrt",
 ]
 resolver = "2"

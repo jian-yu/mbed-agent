@@ -4,7 +4,8 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 
 ## Current scope
 
-- A single-threaded Rust daemon and local CLI connected through a bounded Unix socket protocol.
+- One Rust executable: `mbed-agent daemon` runs the service, while the other
+  subcommands act as its local CLI over a bounded Unix socket protocol.
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
@@ -25,7 +26,7 @@ The workspace is pinned to Rust 1.85.1.
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build --release -p mbed-agentd -p mbed-agent
+cargo build --release -p mbed-agent
 ```
 
 ## Local smoke test
@@ -33,7 +34,7 @@ cargo build --release -p mbed-agentd -p mbed-agent
 Use the example configuration so the daemon does not read `/etc`:
 
 ```sh
-cargo run -p mbed-agentd -- --config config/mbed-agent.example.toml
+cargo run -p mbed-agent -- daemon --config config/mbed-agent.example.toml
 cargo run -p mbed-agent -- status
 cargo run -p mbed-agent -- capabilities
 ```

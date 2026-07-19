@@ -12,7 +12,10 @@ limits before LLM providers or remote channels are enabled.
 
 ## Decisions
 
-1. Use one current-thread Tokio runtime. Blocking platform work will later run
+1. Ship one `mbed-agent` executable. The `daemon` subcommand runs the long-lived
+   service; local control operations such as `status` and `capabilities` use the
+   same executable as Unix socket clients. Use one current-thread Tokio runtime.
+   Blocking platform work will later run
    through a small, explicitly bounded worker pool rather than an unbounded task
    executor.
 2. Keep the local control protocol versioned, newline-delimited JSON over a Unix

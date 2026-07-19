@@ -13,6 +13,12 @@ pub struct TmpBudget {
 }
 
 impl TmpBudget {
+    /// Creates the managed runtime directory and its budget tracker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured path has no parent or the runtime
+    /// directory cannot be created.
     pub fn new(config: StorageConfig) -> Result<Self, ResourceError> {
         let root = config
             .path
@@ -26,6 +32,11 @@ impl TmpBudget {
         Ok(Self { root, config })
     }
 
+    /// Returns currently available bytes on the runtime filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when filesystem capacity cannot be inspected.
     pub fn available_bytes(&self) -> Result<u64, ResourceError> {
         fs2::available_space(&self.root).map_err(|source| ResourceError::Inspect {
             path: self.root.clone(),
@@ -33,6 +44,11 @@ impl TmpBudget {
         })
     }
 
+    /// Classifies storage pressure using both managed usage and free-space reserves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when filesystem capacity cannot be inspected.
     pub fn pressure(&self, managed_bytes: u64) -> Result<StoragePressure, ResourceError> {
         let available = self.available_bytes()?;
         let total = fs2::total_space(&self.root).map_err(|source| ResourceError::Inspect {
@@ -57,6 +73,11 @@ impl TmpBudget {
         )
     }
 
+    /// Sums regular-file bytes below the managed runtime root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a managed directory or file cannot be inspected.
     pub fn managed_bytes(&self) -> Result<u64, ResourceError> {
         let mut total = 0_u64;
         let mut directories = vec![self.root.clone()];

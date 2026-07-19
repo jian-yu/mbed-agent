@@ -9,7 +9,7 @@
 
 Mbed Agent 定位为运行在 OpenWrt、Buildroot、Yocto 等小型嵌入式 Linux 设备上的专业网络运维 Agent。它不是把通用聊天机器人简单塞进路由器，而是一个“设备本地确定性控制面 + 可替换 LLM 推理面”的系统：本地侧采集状态、执行诊断、验证配置、管理权限、保存审计记录和完成故障回滚；LLM 负责理解自然语言、选择诊断路径、解释证据和提出结构化操作计划。
 
-首版建议采用一个 Rust 守护进程、一个 CLI、可选的 LuCI，以及按需加载的工具和 Channel 适配器。核心运行时保持单进程、有限并发、无动态插件装载；扩展采用编译期 feature、声明式 Skill/Runbook 和受控外部程序三种方式。企业微信和微信官方 Channel 由设备直接连接，不依赖项目自建云端中继；CLI 负责显示官方授权二维码并完成绑定。设备侧不运行大模型，默认通过 HTTPS 使用远端模型；在资源较充足的边缘网关上，也可通过 OpenAI-compatible 接口连接本地推理服务。
+首版建议只发布一个 Rust 可执行程序 `mbed-agent`：`daemon` 子命令运行守护进程，其他子命令作为本地 CLI；另有可选的 LuCI，以及按需加载的工具和 Channel 适配器。核心运行时保持单进程、有限并发、无动态插件装载；扩展采用编译期 feature、声明式 Skill/Runbook 和受控外部程序三种方式。企业微信和微信官方 Channel 由设备直接连接，不依赖项目自建云端中继；CLI 负责显示官方授权二维码并完成绑定。设备侧不运行大模型，默认通过 HTTPS 使用远端模型；在资源较充足的边缘网关上，也可通过 OpenAI-compatible 接口连接本地推理服务。
 
 本方案采用严格的易失运行时：除 `/etc/config/*` 与 `/etc/mbed-agent/` 下的配置、Channel 绑定凭据外，Agent 运行产生的会话、任务、审计、快照、日志和附件一律不得写入 Flash。唯一数据库为 `/tmp/mbed-agent/agent.db` 中的 SQLite；守护进程重启时可继续使用同一次开机内的数据，整机重启或断电后无需恢复。
 
@@ -133,8 +133,7 @@ flowchart TB
 mbed-agent/
 ├── Cargo.toml
 ├── crates/
-│   ├── mbed-agentd/          # 守护进程 composition root
-│   ├── mbed-agent-cli/       # 本地 CLI，Unix socket 客户端
+│   ├── mbed-agent/           # 单一程序：daemon composition root + Unix socket CLI
 │   ├── agent-core/           # Agent loop、任务状态机、context 管理
 │   ├── agent-protocol/       # Provider/Channel/Tool 共享 DTO 与版本化协议
 │   ├── agent-policy/         # 风险、权限、审批、配额、脱敏
@@ -665,7 +664,7 @@ strip = "symbols"
 
 ```text
 mbed-agent-core
-mbed-agent-cli
+mbed-agent（同一程序提供 daemon 与 CLI 子命令）
 mbed-agent-channel-mqtt
 mbed-agent-channel-wecom
 mbed-agent-channel-wechat-clawbot

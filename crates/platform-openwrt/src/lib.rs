@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent discovered capabilities, not state flags.
 pub struct PlatformCapabilities {
     pub kind: PlatformKind,
     pub release: Option<String>,
@@ -47,6 +48,7 @@ impl PlatformKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent command capabilities reported to clients.
 pub struct FirewallCapabilities {
     pub backend: FirewallBackend,
     pub has_iptables_save: bool,

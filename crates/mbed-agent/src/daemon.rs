@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,23 +12,15 @@ use agent_protocol::{
     StatusResponse, StoragePressure, StorageStatus,
 };
 use agent_store::Store;
-use clap::Parser;
 use platform_openwrt::PlatformCapabilities;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-mod logging;
+use crate::logging;
 
-const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Debug, Parser)]
-#[command(version, about = "Mbed Agent daemon")]
-struct Args {
-    #[arg(short, long, default_value = "/etc/mbed-agent/config.toml")]
-    config: PathBuf,
-}
+const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct AppState {
     config: AgentConfig,
@@ -38,10 +30,8 @@ struct AppState {
     started: Instant,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
-    let config = AgentConfig::load_or_default(&args.config)?;
+pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
+    let config = AgentConfig::load_or_default(config_path)?;
     init_logging(&config)?;
 
     let budget = TmpBudget::new(config.storage.clone())?;
@@ -67,7 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!(
         socket = %state.config.server.socket_path.display(),
         platform = state.platform.kind.as_str(),
-        "mbed-agentd ready"
+        "mbed-agent daemon ready"
     );
 
     loop {
@@ -175,7 +165,7 @@ fn handle_request(request: ClientRequest, state: &AppState) -> ServerResponse {
 
     let result = match request.command {
         Command::Ping => ResponseData::Pong {
-            daemon_version: DAEMON_VERSION.into(),
+            daemon_version: AGENT_VERSION.into(),
         },
         Command::Capabilities => match serde_json::to_value(&state.platform) {
             Ok(value) => ResponseData::Capabilities(value),
@@ -200,7 +190,7 @@ fn handle_request(request: ClientRequest, state: &AppState) -> ServerResponse {
                 degraded_reasons.push(format!("runtime storage pressure is {pressure:?}"));
             }
             ResponseData::Status(StatusResponse {
-                daemon_version: DAEMON_VERSION.into(),
+                daemon_version: AGENT_VERSION.into(),
                 protocol_version: PROTOCOL_VERSION,
                 uptime_secs: state.started.elapsed().as_secs(),
                 profile: state.config.profile.as_str().into(),
