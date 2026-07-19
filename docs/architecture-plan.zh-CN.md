@@ -599,6 +599,8 @@ mbed-agent storage prune [--artifacts|--history|--logs]
 
 ## 13. OpenWrt 集成与发布
 
+普通嵌入式 Linux 与 OpenWrt 是并列支持目标，不把前者当作 OpenWrt 能力缺失后的降级模式。普通 Linux 基线使用 `/etc/os-release`、procfs/sysfs、iproute2、原生 nftables/iptables，以及 systemd-resolved、NetworkManager 或 `/etc/resolv.conf`；不得调用 ubus/UCI。服务管理通过独立 adapter 适配 systemd、OpenRC、BusyBox init 或厂商 supervisor。OpenWrt adapter 在此 Linux 基线上增加 ubus、UCI、netifd、procd、fw3/fw4 与 DSA/swconfig 语义。
+
 ### 13.1 支持范围与兼容策略
 
 最低兼容版本确定为 **OpenWrt 21.02**，并支持其后的正式版本。这里的“支持”表示 Agent 可以安装、启动、诊断和执行该版本已具备的受控配置能力；21.02、22.03 等已结束 OpenWrt 上游安全维护的版本仍可做兼容测试，但 Agent 必须在状态页提示其 EOL 风险，不能把“Agent 可运行”表述为“系统仍安全受支持”。

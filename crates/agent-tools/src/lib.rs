@@ -9,7 +9,7 @@ use agent_protocol::{
     FirewallZoneSummary, ProbeEvidence, ProbeStatus, WanAssessment, WanDiagnosticReport, WanRoute,
     WanSummary,
 };
-use platform_openwrt::{FirewallBackend, PlatformCapabilities};
+use platform_openwrt::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -50,10 +50,11 @@ impl ToolRunner {
         platform: &PlatformCapabilities,
         active: bool,
     ) -> io::Result<WanDiagnosticReport> {
-        let mut evidence = Vec::with_capacity(9);
+        let mut evidence = Vec::with_capacity(12);
+        if platform.kind == PlatformKind::OpenWrt {
+            evidence.push(self.run(Probe::UbusWan).await?);
+        }
         for probe in [
-            Probe::UbusWan,
-            Probe::UciFirewall,
             Probe::IpLink,
             Probe::IpAddress,
             Probe::IpRoute,
@@ -61,7 +62,18 @@ impl ToolRunner {
         ] {
             evidence.push(self.run(probe).await?);
         }
+        if platform.kind == PlatformKind::OpenWrt {
+            evidence.push(self.run(Probe::UciFirewall).await?);
+        }
         evidence.push(self.read_file("network.dns.openwrt", "/tmp/resolv.conf.d/resolv.conf.auto"));
+        evidence.push(self.read_file(
+            "network.dns.systemd_resolved",
+            "/run/systemd/resolve/resolv.conf",
+        ));
+        evidence.push(self.read_file(
+            "network.dns.network_manager",
+            "/run/NetworkManager/resolv.conf",
+        ));
         evidence.push(self.read_file("network.dns.system", "/etc/resolv.conf"));
         evidence.push(firewall_evidence(platform));
 
@@ -97,7 +109,7 @@ impl ToolRunner {
         }
 
         let summary = normalize(&evidence, platform);
-        let findings = summarize(&summary, &evidence);
+        let findings = summarize(&summary, &evidence, platform.kind);
         let complete = summary.status_source.is_some()
             && !summary.addresses.is_empty()
             && !summary.default_routes.is_empty()
@@ -292,6 +304,8 @@ fn firewall_evidence(platform: &PlatformCapabilities) -> ProbeEvidence {
     let backend = match platform.firewall.backend {
         FirewallBackend::Fw3 => "fw3/iptables",
         FirewallBackend::Fw4 => "fw4/nftables",
+        FirewallBackend::Iptables => "iptables",
+        FirewallBackend::Nftables => "nftables",
         FirewallBackend::Unknown => "unknown",
     };
     ProbeEvidence {
@@ -323,6 +337,8 @@ fn normalize(evidence: &[ProbeEvidence], platform: &PlatformCapabilities) -> Wan
         firewall_backend: match platform.firewall.backend {
             FirewallBackend::Fw3 => "fw3/iptables",
             FirewallBackend::Fw4 => "fw4/nftables",
+            FirewallBackend::Iptables => "iptables",
+            FirewallBackend::Nftables => "nftables",
             FirewallBackend::Unknown => "unknown",
         }
         .into(),
@@ -348,7 +364,12 @@ fn normalize(evidence: &[ProbeEvidence], platform: &PlatformCapabilities) -> Wan
     if let Some(output) = successful_output(evidence, "openwrt.firewall.uci") {
         summary.firewall_zone = parse_wan_firewall_zone(output);
     }
-    for probe in ["network.dns.openwrt", "network.dns.system"] {
+    for probe in [
+        "network.dns.openwrt",
+        "network.dns.systemd_resolved",
+        "network.dns.network_manager",
+        "network.dns.system",
+    ] {
         if let Some(output) = successful_output(evidence, probe) {
             parse_resolvers(output, &mut summary.dns_servers);
         }
@@ -675,7 +696,11 @@ fn push_route(routes: &mut Vec<WanRoute>, route: WanRoute) {
     }
 }
 
-fn summarize(summary: &WanSummary, evidence: &[ProbeEvidence]) -> Vec<String> {
+fn summarize(
+    summary: &WanSummary,
+    evidence: &[ProbeEvidence],
+    platform_kind: PlatformKind,
+) -> Vec<String> {
     let mut findings = Vec::new();
     let primary = match summary.assessment {
         WanAssessment::PrerequisitesReady => {
@@ -696,15 +721,22 @@ fn summarize(summary: &WanSummary, evidence: &[ProbeEvidence]) -> Vec<String> {
         WanAssessment::InsufficientEvidence => "WAN evidence is insufficient for a conclusion",
     };
     findings.push(primary.into());
-    match summary.status_source.as_deref() {
-        Some("kernel") => {
+    match (platform_kind, summary.status_source.as_deref()) {
+        (PlatformKind::OpenWrt, Some("kernel")) => {
             findings.push("OpenWrt WAN status is unavailable; kernel evidence was used".into());
         }
-        None => findings.push("OpenWrt and kernel WAN status evidence are unavailable".into()),
+        (PlatformKind::OpenWrt, None) => {
+            findings.push("OpenWrt and kernel WAN status evidence are unavailable".into());
+        }
+        (_, None) => findings.push("kernel WAN status evidence is unavailable".into()),
         _ => {}
     }
     if summary.firewall_backend == "unknown" {
-        findings.push("active fw3/fw4 firewall backend could not be identified".into());
+        findings.push(if platform_kind == PlatformKind::OpenWrt {
+            "active fw3/fw4 firewall backend could not be identified".into()
+        } else {
+            "nftables/iptables firewall backend could not be identified".into()
+        });
     }
     if summary.firewall_backend != "unknown"
         && successful_output(evidence, "openwrt.firewall.uci").is_some()
@@ -743,10 +775,16 @@ mod tests {
             release_supported: true,
             firewall: FirewallCapabilities {
                 backend,
-                has_iptables_save: backend == FirewallBackend::Fw3,
-                has_ip6tables_save: backend == FirewallBackend::Fw3,
-                has_nft: backend == FirewallBackend::Fw4,
-                can_trace: backend == FirewallBackend::Fw4,
+                has_iptables_save: matches!(
+                    backend,
+                    FirewallBackend::Fw3 | FirewallBackend::Iptables
+                ),
+                has_ip6tables_save: matches!(
+                    backend,
+                    FirewallBackend::Fw3 | FirewallBackend::Iptables
+                ),
+                has_nft: matches!(backend, FirewallBackend::Fw4 | FirewallBackend::Nftables),
+                can_trace: matches!(backend, FirewallBackend::Fw4 | FirewallBackend::Nftables),
             },
             device_model: NetworkDeviceModel::Unknown,
             package_manager: PackageManager::Opkg,
@@ -852,7 +890,7 @@ mod tests {
         assert_eq!(summary.assessment, WanAssessment::GatewayProbeFailed);
         assert_eq!(summary.gateway_reachable, Some(false));
         assert!(
-            summarize(&summary, &evidence)
+            summarize(&summary, &evidence, PlatformKind::OpenWrt)
                 .first()
                 .is_some_and(|finding| finding.contains("did not answer"))
         );
@@ -887,7 +925,7 @@ mod tests {
         let summary = normalize(&[], &platform(FirewallBackend::Unknown));
         assert_eq!(summary.assessment, WanAssessment::InsufficientEvidence);
         assert!(
-            summarize(&summary, &[])
+            summarize(&summary, &[], PlatformKind::OpenWrt)
                 .iter()
                 .any(|finding| finding.contains("evidence are unavailable"))
         );
@@ -926,6 +964,35 @@ mod tests {
         }));
         assert_eq!(report.summary.dns_servers, ["192.0.2.53"]);
         assert_eq!(report.summary.firewall_backend, "fw4/nftables");
+    }
+
+    #[tokio::test]
+    async fn generic_linux_uses_resolved_dns_without_openwrt_probes() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "run/systemd/resolve/resolv.conf",
+            "nameserver 2001:db8::53\n",
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![],
+            timeout: Duration::from_millis(100),
+            max_output_bytes: 1024,
+        };
+        let mut generic = platform(FirewallBackend::Nftables);
+        generic.kind = PlatformKind::GenericLinux;
+        let report = runner
+            .diagnose_wan(&generic, false)
+            .await
+            .expect("generic Linux diagnosis");
+        assert_eq!(report.summary.dns_servers, ["2001:db8::53"]);
+        assert_eq!(report.summary.firewall_backend, "nftables");
+        assert!(!report.evidence.iter().any(|item| {
+            matches!(
+                item.probe.as_str(),
+                "openwrt.interface.wan" | "openwrt.firewall.uci"
+            )
+        }));
     }
 
     #[tokio::test]

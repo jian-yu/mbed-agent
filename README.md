@@ -9,6 +9,9 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
+- First-class generic Linux discovery using iproute2, native nftables/iptables,
+  systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
+  OpenWrt-only ubus/UCI probes.
 - A deterministic `diagnose wan` runbook that gathers bounded, read-only ubus,
   interface, route, resolver, and firewall-backend evidence, normalizes it into
   one stable WAN model, including the UCI WAN firewall zone, and reports the

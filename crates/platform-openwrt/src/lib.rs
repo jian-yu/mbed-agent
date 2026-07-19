@@ -62,6 +62,8 @@ pub struct FirewallCapabilities {
 pub enum FirewallBackend {
     Fw3,
     Fw4,
+    Iptables,
+    Nftables,
     Unknown,
 }
 
@@ -134,7 +136,15 @@ impl Discovery {
         let has = |name: &str| available_commands.iter().any(|command| command == name);
 
         let firewall_service = self.read("/etc/init.d/firewall");
-        let backend = select_firewall_backend(has("fw3"), has("fw4"), firewall_service.as_deref());
+        let backend = if kind == PlatformKind::OpenWrt {
+            select_openwrt_firewall_backend(has("fw3"), has("fw4"), firewall_service.as_deref())
+        } else if has("nft") {
+            FirewallBackend::Nftables
+        } else if has("iptables-save") {
+            FirewallBackend::Iptables
+        } else {
+            FirewallBackend::Unknown
+        };
         let device_model = if self.exists("/sys/class/net/br-lan/bridge/vlan_filtering") {
             NetworkDeviceModel::Dsa
         } else if has("swconfig") {
@@ -150,28 +160,17 @@ impl Discovery {
             PackageManager::Unknown
         };
 
-        let mut warnings = Vec::new();
-        if kind == PlatformKind::OpenWrt && !release_supported {
-            warnings.push(format!(
-                "OpenWrt {} is older than the minimum supported major version {MINIMUM_OPENWRT_MAJOR}",
-                release.as_deref().unwrap_or("unknown")
-            ));
-        }
-        if kind == PlatformKind::OpenWrt && backend == FirewallBackend::Unknown {
-            warnings.push("unable to identify the active fw3/fw4 firewall backend".into());
-        }
-        if has("fw3") && has("fw4") && firewall_service.is_none() {
-            warnings.push(
-                "both fw3 and fw4 were found without readable firewall service evidence; using fw4 fallback"
-                    .into(),
-            );
-        }
-        if backend == FirewallBackend::Fw4 && !has("nft") {
-            warnings.push("fw4 was found but nft is unavailable".into());
-        }
-        if backend == FirewallBackend::Fw3 && !has("iptables-save") {
-            warnings.push("fw3 was found but iptables-save is unavailable".into());
-        }
+        let warnings = capability_warnings(&WarningContext {
+            kind,
+            release: release.as_deref(),
+            release_supported,
+            backend,
+            has_fw3: has("fw3"),
+            has_fw4: has("fw4"),
+            has_nft: has("nft"),
+            has_iptables_save: has("iptables-save"),
+            has_firewall_service: firewall_service.is_some(),
+        });
 
         PlatformCapabilities {
             kind,
@@ -182,7 +181,8 @@ impl Discovery {
                 has_iptables_save: has("iptables-save"),
                 has_ip6tables_save: has("ip6tables-save"),
                 has_nft: has("nft"),
-                can_trace: has("nft") && backend == FirewallBackend::Fw4,
+                can_trace: has("nft")
+                    && matches!(backend, FirewallBackend::Fw4 | FirewallBackend::Nftables),
             },
             device_model,
             package_manager,
@@ -214,7 +214,54 @@ impl Discovery {
     }
 }
 
-fn select_firewall_backend(
+#[allow(clippy::struct_excessive_bools)]
+struct WarningContext<'a> {
+    kind: PlatformKind,
+    release: Option<&'a str>,
+    release_supported: bool,
+    backend: FirewallBackend,
+    has_fw3: bool,
+    has_fw4: bool,
+    has_nft: bool,
+    has_iptables_save: bool,
+    has_firewall_service: bool,
+}
+
+fn capability_warnings(context: &WarningContext<'_>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if context.kind == PlatformKind::OpenWrt && !context.release_supported {
+        warnings.push(format!(
+            "OpenWrt {} is older than the minimum supported major version {MINIMUM_OPENWRT_MAJOR}",
+            context.release.unwrap_or("unknown")
+        ));
+    }
+    if context.backend == FirewallBackend::Unknown {
+        warnings.push(if context.kind == PlatformKind::OpenWrt {
+            "unable to identify the active fw3/fw4 firewall backend".into()
+        } else {
+            "unable to identify an nftables/iptables firewall backend".into()
+        });
+    }
+    if context.has_fw3 && context.has_fw4 && !context.has_firewall_service {
+        warnings.push(
+            "both fw3 and fw4 were found without readable firewall service evidence; using fw4 fallback"
+                .into(),
+        );
+    }
+    if context.backend == FirewallBackend::Fw4 && !context.has_nft {
+        warnings.push("fw4 was found but nft is unavailable".into());
+    }
+    if matches!(
+        context.backend,
+        FirewallBackend::Fw3 | FirewallBackend::Iptables
+    ) && !context.has_iptables_save
+    {
+        warnings.push("iptables backend was found but iptables-save is unavailable".into());
+    }
+    warnings
+}
+
+fn select_openwrt_firewall_backend(
     has_fw3: bool,
     has_fw4: bool,
     service_script: Option<&str>,
@@ -263,7 +310,9 @@ fn release_major(release: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn parses_quoted_openwrt_release() {
@@ -311,18 +360,32 @@ mod tests {
         assert_eq!(capabilities.firewall.backend, FirewallBackend::Fw3);
     }
 
+    #[test]
+    fn generic_linux_detects_native_nftables_and_iptables() {
+        let nft_fixture = Fixture::new();
+        nft_fixture.write("etc/os-release", "ID=buildroot\n");
+        nft_fixture.write("usr/sbin/nft", "");
+        let nft = Discovery::new(&nft_fixture.root).discover();
+        assert_eq!(nft.kind, PlatformKind::GenericLinux);
+        assert_eq!(nft.firewall.backend, FirewallBackend::Nftables);
+
+        let iptables_fixture = Fixture::new();
+        iptables_fixture.write("etc/os-release", "ID=debian\n");
+        iptables_fixture.write("usr/sbin/iptables-save", "");
+        let iptables = Discovery::new(&iptables_fixture.root).discover();
+        assert_eq!(iptables.kind, PlatformKind::GenericLinux);
+        assert_eq!(iptables.firewall.backend, FirewallBackend::Iptables);
+    }
+
     struct Fixture {
         root: PathBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos();
+            let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "mbed-agent-platform-test-{}-{nonce}",
+                "mbed-agent-platform-test-{}-{fixture_id}",
                 std::process::id()
             ));
             fs::create_dir_all(&root).expect("create fixture root");
