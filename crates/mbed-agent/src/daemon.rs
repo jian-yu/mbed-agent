@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use agent_core::{AgentConfig, TmpBudget};
 use agent_protocol::{
-    ClientRequest, Command, ErrorCode, PROTOCOL_VERSION, ResponseData, ServerResponse,
-    StatusResponse, StoragePressure, StorageStatus,
+    ClientRequest, Command, DiagnosticHistoryEntry, ErrorCode, PROTOCOL_VERSION, ResponseData,
+    ServerResponse, StatusResponse, StoragePressure, StorageStatus,
 };
-use agent_store::Store;
+use agent_store::{DiagnosticRecord, Store};
 use agent_tools::ToolRunner;
 use platform_openwrt::PlatformCapabilities;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,7 +28,7 @@ struct AppState {
     config: AgentConfig,
     platform: PlatformCapabilities,
     budget: TmpBudget,
-    store: Store,
+    store: Arc<Store>,
     tools: ToolRunner,
     diagnostic_slots: Semaphore,
     started: Instant,
@@ -43,7 +43,10 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(budget.root().join("rollback"))?;
     fs::create_dir_all(budget.root().join("log"))?;
 
-    let store = Store::open(&config.storage.path, config.storage.max_database_bytes)?;
+    let store = Arc::new(Store::open(
+        &config.storage.path,
+        config.storage.max_database_bytes,
+    )?);
     store.health_check()?;
     let platform = PlatformCapabilities::discover();
     for warning in &platform.warnings {
@@ -218,38 +221,111 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             })
         }
         Command::DiagnoseWan { active } => {
-            let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
-                return ServerResponse::error(
-                    request.id,
-                    ErrorCode::ResourceExhausted,
-                    "the configured diagnostic task limit has been reached",
-                );
-            };
-            match tokio::time::timeout(
-                Duration::from_secs(state.config.runtime.task_timeout_secs),
-                state.tools.diagnose_wan(&state.platform, active),
-            )
-            .await
-            {
-                Ok(Ok(report)) => ResponseData::WanDiagnostic(report),
-                Ok(Err(error)) => {
-                    return ServerResponse::error(
-                        request.id,
-                        ErrorCode::Internal,
-                        format!("WAN diagnosis failed: {error}"),
-                    );
-                }
-                Err(_) => {
-                    return ServerResponse::error(
-                        request.id,
-                        ErrorCode::ResourceExhausted,
-                        "WAN diagnosis exceeded the configured task timeout",
-                    );
-                }
-            }
+            return handle_wan_diagnosis(request.id, active, state).await;
+        }
+        Command::DiagnosticHistory { limit } => {
+            return handle_diagnostic_history(request.id, limit, state).await;
         }
     };
     ServerResponse::success(request.id, result)
+}
+
+async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> ServerResponse {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_wan(&state.platform, active),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("WAN diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "WAN diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(&id, active, &report, state).await;
+    ServerResponse::success(id, ResponseData::WanDiagnostic(report))
+}
+
+async fn persist_diagnostic(
+    id: &str,
+    active: bool,
+    report: &agent_protocol::WanDiagnosticReport,
+    state: &AppState,
+) {
+    let record = DiagnosticRecord {
+        id: id.into(),
+        kind: "wan".into(),
+        active,
+        assessment: report.summary.assessment.as_str().into(),
+        payload: serde_json::to_vec(&report.summary).unwrap_or_default(),
+        created_at: 0,
+    };
+    let store = Arc::clone(&state.store);
+    let max_records = state.config.storage.max_diagnostic_records;
+    let max_payload =
+        usize::try_from(state.config.storage.max_diagnostic_record_bytes).unwrap_or(usize::MAX);
+    match tokio::task::spawn_blocking(move || {
+        store.record_diagnostic(&record, max_records, max_payload)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "failed to persist diagnostic audit"),
+        Err(error) => warn!(%error, "diagnostic audit worker failed"),
+    }
+}
+
+async fn handle_diagnostic_history(id: String, limit: u16, state: &AppState) -> ServerResponse {
+    let store = Arc::clone(&state.store);
+    let result =
+        tokio::task::spawn_blocking(move || store.diagnostic_history(limit.clamp(1, 100))).await;
+    match result {
+        Ok(Ok(records)) => ServerResponse::success(
+            id,
+            ResponseData::DiagnosticHistory(
+                records
+                    .into_iter()
+                    .map(|record| DiagnosticHistoryEntry {
+                        id: record.id,
+                        kind: record.kind,
+                        active: record.active,
+                        assessment: record.assessment,
+                        summary: serde_json::from_slice(&record.payload)
+                            .unwrap_or(serde_json::Value::Null),
+                        created_at: record.created_at,
+                    })
+                    .collect(),
+            ),
+        ),
+        Ok(Err(error)) => ServerResponse::error(
+            id,
+            ErrorCode::Internal,
+            format!("failed to read diagnostic history: {error}"),
+        ),
+        Err(error) => ServerResponse::error(
+            id,
+            ErrorCode::Internal,
+            format!("diagnostic history worker failed: {error}"),
+        ),
+    }
 }
 
 async fn read_frame<R>(reader: &mut R, max_bytes: usize) -> io::Result<Option<Vec<u8>>>

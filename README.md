@@ -42,6 +42,7 @@ cargo run -p mbed-agent -- status
 cargo run -p mbed-agent -- capabilities
 cargo run -p mbed-agent -- diagnose wan
 cargo run -p mbed-agent -- diagnose wan --active
+cargo run -p mbed-agent -- diagnose history --limit 20
 ```
 
 Diagnostic commands never invoke a shell. Their executable names and arguments
@@ -50,6 +51,10 @@ and retained output as well as the number and total duration of diagnostic tasks
 Active mode is explicit and runs only after passive WAN prerequisites pass. It
 uses a validated route gateway plus fixed public-IP and DNS canaries; an ICMP
 failure is reported as a failed probe, not asserted to be the root cause.
+
+Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
+probe output is not persisted. History is bounded by configurable record-count
+and per-record byte limits, and oldest entries are pruned transactionally.
 
 All generated runtime state is placed below `/tmp/mbed-agent` and may be discarded at reboot.
 

@@ -102,6 +102,14 @@ impl AgentConfig {
                 "storage limits must be greater than zero".into(),
             ));
         }
+        if self.storage.max_diagnostic_records == 0
+            || self.storage.max_diagnostic_record_bytes == 0
+            || self.storage.max_diagnostic_record_bytes > self.storage.max_database_bytes
+        {
+            return Err(ConfigError::Validation(
+                "diagnostic audit limits must be non-zero and fit the database budget".into(),
+            ));
+        }
         if self.storage.min_tmp_free_percent > 100 {
             return Err(ConfigError::Validation(
                 "storage.min_tmp_free_percent must be between 0 and 100".into(),
@@ -230,6 +238,8 @@ pub struct StorageConfig {
     pub min_tmp_free_bytes: u64,
     pub min_tmp_free_percent: u8,
     pub cleanup_interval_secs: u64,
+    pub max_diagnostic_records: u32,
+    pub max_diagnostic_record_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -244,6 +254,8 @@ impl Default for StorageConfig {
             min_tmp_free_bytes: 8 * 1024 * 1024,
             min_tmp_free_percent: 10,
             cleanup_interval_secs: 60,
+            max_diagnostic_records: 128,
+            max_diagnostic_record_bytes: 32 * 1024,
         }
     }
 }

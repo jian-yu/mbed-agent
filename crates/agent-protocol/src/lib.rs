@@ -17,6 +17,7 @@ pub enum Command {
     Status,
     Capabilities,
     DiagnoseWan { active: bool },
+    DiagnosticHistory { limit: u16 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +65,17 @@ pub enum ResponseData {
     Status(StatusResponse),
     Capabilities(Value),
     WanDiagnostic(WanDiagnosticReport),
+    DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiagnosticHistoryEntry {
+    pub id: String,
+    pub kind: String,
+    pub active: bool,
+    pub assessment: String,
+    pub summary: Value,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,6 +119,24 @@ pub enum WanAssessment {
     PublicIpProbeFailed,
     DnsProbeFailed,
     InsufficientEvidence,
+}
+
+impl WanAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrerequisitesReady => "prerequisites_ready",
+            Self::LinkDown => "link_down",
+            Self::InterfaceUnavailable => "interface_unavailable",
+            Self::AddressMissing => "address_missing",
+            Self::DefaultRouteMissing => "default_route_missing",
+            Self::DnsMissing => "dns_missing",
+            Self::GatewayProbeFailed => "gateway_probe_failed",
+            Self::PublicIpProbeFailed => "public_ip_probe_failed",
+            Self::DnsProbeFailed => "dns_probe_failed",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
