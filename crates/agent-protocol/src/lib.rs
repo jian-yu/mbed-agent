@@ -16,6 +16,7 @@ pub enum Command {
     Ping,
     Status,
     Capabilities,
+    DiagnoseWan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -62,6 +63,34 @@ pub enum ResponseData {
     Pong { daemon_version: String },
     Status(StatusResponse),
     Capabilities(Value),
+    WanDiagnostic(WanDiagnosticReport),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WanDiagnosticReport {
+    pub interface: String,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeEvidence {
+    pub probe: String,
+    pub source: String,
+    pub status: ProbeStatus,
+    pub output: String,
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeStatus {
+    Ok,
+    Unavailable,
+    Failed,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,7 +147,7 @@ mod tests {
         let request = ClientRequest {
             protocol_version: PROTOCOL_VERSION,
             id: "test-1".into(),
-            command: Command::Capabilities,
+            command: Command::DiagnoseWan,
         };
 
         let encoded = serde_json::to_string(&request).expect("serialize request");

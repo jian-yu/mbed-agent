@@ -9,6 +9,8 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
+- A deterministic `diagnose wan` runbook that gathers bounded, read-only ubus,
+  interface, route, resolver, and firewall-backend evidence.
 - OpenWrt procd and UCI configuration skeletons.
 
 LLM providers, typed network tools, MQTT, WeCom, WeChat ClawBot, administrator elevation, and configuration transactions are planned but are not implemented yet.
@@ -37,7 +39,12 @@ Use the example configuration so the daemon does not read `/etc`:
 cargo run -p mbed-agent -- daemon --config config/mbed-agent.example.toml
 cargo run -p mbed-agent -- status
 cargo run -p mbed-agent -- capabilities
+cargo run -p mbed-agent -- diagnose wan
 ```
+
+Diagnostic commands never invoke a shell. Their executable names and arguments
+are compiled into a typed allowlist, and configuration limits each probe's time
+and retained output as well as the number and total duration of diagnostic tasks.
 
 All generated runtime state is placed below `/tmp/mbed-agent` and may be discarded at reboot.
 

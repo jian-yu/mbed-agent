@@ -83,9 +83,13 @@ impl AgentConfig {
         validate_tmp_path(&self.storage.path, "storage.path")?;
         validate_tmp_path(&self.logging.path, "logging.path")?;
 
-        if self.runtime.max_active_tasks == 0 || self.runtime.max_request_bytes < 1024 {
+        if self.runtime.max_active_tasks == 0
+            || self.runtime.max_request_bytes < 1024
+            || self.runtime.tool_timeout_secs == 0
+            || self.runtime.max_tool_output_bytes < 1024
+        {
             return Err(ConfigError::Validation(
-                "runtime limits must allow at least one task and 1024 request bytes".into(),
+                "runtime limits must allow a task, a tool timeout, and 1024-byte buffers".into(),
             ));
         }
         if self.server.socket_mode > 0o777 {
@@ -182,6 +186,8 @@ pub struct RuntimeConfig {
     pub max_active_tasks: usize,
     pub max_request_bytes: usize,
     pub task_timeout_secs: u64,
+    pub tool_timeout_secs: u64,
+    pub max_tool_output_bytes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -190,6 +196,8 @@ impl Default for RuntimeConfig {
             max_active_tasks: 1,
             max_request_bytes: 64 * 1024,
             task_timeout_secs: 120,
+            tool_timeout_secs: 3,
+            max_tool_output_bytes: 64 * 1024,
         }
     }
 }

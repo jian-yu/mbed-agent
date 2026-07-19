@@ -39,6 +39,20 @@ enum CliCommand {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Run a deterministic, read-only diagnostic runbook.
+    Diagnose {
+        #[command(subcommand)]
+        target: DiagnoseTarget,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnoseTarget {
+    /// Collect WAN interface, route, DNS, and firewall evidence.
+    Wan {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -48,6 +62,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Ping { socket } => run_client(&socket, Command::Ping).await,
         CliCommand::Status { socket } => run_client(&socket, Command::Status).await,
         CliCommand::Capabilities { socket } => run_client(&socket, Command::Capabilities).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Wan { socket },
+        } => run_client(&socket, Command::DiagnoseWan).await,
     }
 }
 

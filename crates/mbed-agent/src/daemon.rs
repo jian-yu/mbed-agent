@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_core::{AgentConfig, TmpBudget};
 use agent_protocol::{
@@ -12,9 +12,11 @@ use agent_protocol::{
     StatusResponse, StoragePressure, StorageStatus,
 };
 use agent_store::Store;
+use agent_tools::ToolRunner;
 use platform_openwrt::PlatformCapabilities;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -27,6 +29,8 @@ struct AppState {
     platform: PlatformCapabilities,
     budget: TmpBudget,
     store: Store,
+    tools: ToolRunner,
+    diagnostic_slots: Semaphore,
     started: Instant,
 }
 
@@ -46,12 +50,19 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         warn!(warning = %warning, "platform capability warning");
     }
 
+    let tools = ToolRunner::system(
+        Duration::from_secs(config.runtime.tool_timeout_secs),
+        config.runtime.max_tool_output_bytes,
+    );
+    let diagnostic_slots = Semaphore::new(config.runtime.max_active_tasks);
     let listener = bind_socket(&config.server.socket_path, config.server.socket_mode)?;
     let state = Arc::new(AppState {
         config,
         platform,
         budget,
         store,
+        tools,
+        diagnostic_slots,
         started: Instant::now(),
     });
     info!(
@@ -137,7 +148,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<AppState>) -> io::Resul
 
     while let Some(frame) = read_frame(&mut reader, state.config.runtime.max_request_bytes).await? {
         let response = match serde_json::from_slice::<ClientRequest>(&frame) {
-            Ok(request) => handle_request(request, &state),
+            Ok(request) => handle_request(request, &state).await,
             Err(error) => ServerResponse::error(
                 "unknown",
                 ErrorCode::InvalidRequest,
@@ -151,7 +162,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<AppState>) -> io::Resul
     Ok(())
 }
 
-fn handle_request(request: ClientRequest, state: &AppState) -> ServerResponse {
+async fn handle_request(request: ClientRequest, state: &AppState) -> ServerResponse {
     if request.protocol_version != PROTOCOL_VERSION {
         return ServerResponse::error(
             request.id,
@@ -205,6 +216,37 @@ fn handle_request(request: ClientRequest, state: &AppState) -> ServerResponse {
                 platform_kind: state.platform.kind.as_str().into(),
                 degraded_reasons,
             })
+        }
+        Command::DiagnoseWan => {
+            let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+                return ServerResponse::error(
+                    request.id,
+                    ErrorCode::ResourceExhausted,
+                    "the configured diagnostic task limit has been reached",
+                );
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(state.config.runtime.task_timeout_secs),
+                state.tools.diagnose_wan(&state.platform),
+            )
+            .await
+            {
+                Ok(Ok(report)) => ResponseData::WanDiagnostic(report),
+                Ok(Err(error)) => {
+                    return ServerResponse::error(
+                        request.id,
+                        ErrorCode::Internal,
+                        format!("WAN diagnosis failed: {error}"),
+                    );
+                }
+                Err(_) => {
+                    return ServerResponse::error(
+                        request.id,
+                        ErrorCode::ResourceExhausted,
+                        "WAN diagnosis exceeded the configured task timeout",
+                    );
+                }
+            }
         }
     };
     ServerResponse::success(request.id, result)

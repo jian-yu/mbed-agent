@@ -3,6 +3,7 @@ members = [
     "crates/agent-core",
     "crates/agent-protocol",
     "crates/agent-store",
+    "crates/agent-tools",
     "crates/mbed-agent",
     "crates/platform-openwrt",
 ]
@@ -19,6 +20,7 @@ rust-version = "1.85"
 agent-core = { path = "crates/agent-core" }
 agent-protocol = { path = "crates/agent-protocol" }
 agent-store = { path = "crates/agent-store", default-features = false }
+agent-tools = { path = "crates/agent-tools" }
 platform-openwrt = { path = "crates/platform-openwrt" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
@@ -26,7 +28,7 @@ rusqlite = { version = "0.37", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

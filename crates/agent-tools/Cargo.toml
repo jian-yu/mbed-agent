@@ -1,0 +1,15 @@
+[package]
+name = "agent-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-protocol.workspace = true
+platform-openwrt.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

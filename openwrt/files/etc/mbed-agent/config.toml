@@ -5,6 +5,8 @@ profile = "tiny"
 max_active_tasks = 1
 max_request_bytes = 65536
 task_timeout_secs = 120
+tool_timeout_secs = 3
+max_tool_output_bytes = 65536
 
 [server]
 socket_path = "/tmp/mbed-agent/agent.sock"
@@ -31,4 +33,3 @@ max_file_bytes = 262144
 max_files = 8
 max_line_bytes = 4096
 rate_limit_per_target_per_sec = 20
-
