@@ -69,9 +69,46 @@ pub enum ResponseData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanDiagnosticReport {
     pub interface: String,
+    pub summary: WanSummary,
     pub evidence: Vec<ProbeEvidence>,
     pub findings: Vec<String>,
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WanSummary {
+    pub assessment: WanAssessment,
+    pub status_source: Option<String>,
+    pub up: Option<bool>,
+    pub available: Option<bool>,
+    pub pending: Option<bool>,
+    pub protocol: Option<String>,
+    pub device: Option<String>,
+    pub addresses: Vec<String>,
+    pub default_routes: Vec<WanRoute>,
+    pub dns_servers: Vec<String>,
+    pub firewall_backend: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WanAssessment {
+    PrerequisitesReady,
+    LinkDown,
+    InterfaceUnavailable,
+    AddressMissing,
+    DefaultRouteMissing,
+    DnsMissing,
+    InsufficientEvidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WanRoute {
+    pub family: String,
+    pub gateway: Option<String>,
+    pub device: Option<String>,
+    pub source: Option<String>,
+    pub metric: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
