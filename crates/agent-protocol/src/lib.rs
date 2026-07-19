@@ -16,7 +16,7 @@ pub enum Command {
     Ping,
     Status,
     Capabilities,
-    DiagnoseWan,
+    DiagnoseWan { active: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,6 +88,10 @@ pub struct WanSummary {
     pub default_routes: Vec<WanRoute>,
     pub dns_servers: Vec<String>,
     pub firewall_backend: String,
+    pub active_attempted: bool,
+    pub gateway_reachable: Option<bool>,
+    pub internet_reachable: Option<bool>,
+    pub dns_reachable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +103,9 @@ pub enum WanAssessment {
     AddressMissing,
     DefaultRouteMissing,
     DnsMissing,
+    GatewayProbeFailed,
+    PublicIpProbeFailed,
+    DnsProbeFailed,
     InsufficientEvidence,
 }
 
@@ -184,7 +191,7 @@ mod tests {
         let request = ClientRequest {
             protocol_version: PROTOCOL_VERSION,
             id: "test-1".into(),
-            command: Command::DiagnoseWan,
+            command: Command::DiagnoseWan { active: true },
         };
 
         let encoded = serde_json::to_string(&request).expect("serialize request");

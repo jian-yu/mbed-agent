@@ -217,7 +217,7 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 degraded_reasons,
             })
         }
-        Command::DiagnoseWan => {
+        Command::DiagnoseWan { active } => {
             let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
                 return ServerResponse::error(
                     request.id,
@@ -227,7 +227,7 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             };
             match tokio::time::timeout(
                 Duration::from_secs(state.config.runtime.task_timeout_secs),
-                state.tools.diagnose_wan(&state.platform),
+                state.tools.diagnose_wan(&state.platform, active),
             )
             .await
             {

@@ -50,6 +50,9 @@ enum CliCommand {
 enum DiagnoseTarget {
     /// Collect WAN interface, route, DNS, and firewall evidence.
     Wan {
+        /// Probe the gateway, a public IP, and DNS after passive checks pass.
+        #[arg(long)]
+        active: bool,
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
@@ -63,8 +66,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Status { socket } => run_client(&socket, Command::Status).await,
         CliCommand::Capabilities { socket } => run_client(&socket, Command::Capabilities).await,
         CliCommand::Diagnose {
-            target: DiagnoseTarget::Wan { socket },
-        } => run_client(&socket, Command::DiagnoseWan).await,
+            target: DiagnoseTarget::Wan { active, socket },
+        } => run_client(&socket, Command::DiagnoseWan { active }).await,
     }
 }
 

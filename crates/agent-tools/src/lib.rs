@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, Read};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -46,6 +47,7 @@ impl ToolRunner {
     pub async fn diagnose_wan(
         &self,
         platform: &PlatformCapabilities,
+        active: bool,
     ) -> io::Result<WanDiagnosticReport> {
         let mut evidence = Vec::with_capacity(8);
         for probe in [
@@ -60,6 +62,37 @@ impl ToolRunner {
         evidence.push(self.read_file("network.dns.openwrt", "/tmp/resolv.conf.d/resolv.conf.auto"));
         evidence.push(self.read_file("network.dns.system", "/etc/resolv.conf"));
         evidence.push(firewall_evidence(platform));
+
+        let passive_summary = normalize(&evidence, platform);
+        if active && passive_summary.assessment == WanAssessment::PrerequisitesReady {
+            if let Some(gateway) = passive_summary
+                .default_routes
+                .iter()
+                .filter_map(|route| route.gateway.as_deref())
+                .find(|gateway| gateway.parse::<IpAddr>().is_ok())
+            {
+                evidence.push(
+                    self.run_command(
+                        "network.connectivity.gateway",
+                        "ping",
+                        &["-c", "1", "-W", "2", gateway],
+                    )
+                    .await?,
+                );
+            }
+            evidence.push(
+                self.run_command(
+                    "network.connectivity.public_ip",
+                    "ping",
+                    &["-c", "1", "-W", "2", "1.1.1.1"],
+                )
+                .await?,
+            );
+            evidence.push(
+                self.run_command("network.connectivity.dns", "nslookup", &["example.com"])
+                    .await?,
+            );
+        }
 
         let summary = normalize(&evidence, platform);
         let findings = summarize(&summary, &evidence);
@@ -77,10 +110,20 @@ impl ToolRunner {
     }
 
     async fn run(&self, probe: Probe) -> io::Result<ProbeEvidence> {
-        let Some(executable) = self.resolve(probe.command()) else {
+        self.run_command(probe.name(), probe.command(), probe.args())
+            .await
+    }
+
+    async fn run_command(
+        &self,
+        probe: &str,
+        command: &str,
+        args: &[&str],
+    ) -> io::Result<ProbeEvidence> {
+        let Some(executable) = self.resolve(command) else {
             return Ok(ProbeEvidence {
-                probe: probe.name().into(),
-                source: probe.command().into(),
+                probe: probe.into(),
+                source: command.into(),
                 status: ProbeStatus::Unavailable,
                 output: String::new(),
                 truncated: false,
@@ -89,7 +132,7 @@ impl ToolRunner {
         };
         let started = Instant::now();
         let mut child = Command::new(&executable)
-            .args(probe.args())
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -132,7 +175,7 @@ impl ToolRunner {
             ProbeStatus::Failed
         };
         Ok(ProbeEvidence {
-            probe: probe.name().into(),
+            probe: probe.into(),
             source: executable.display().to_string(),
             status: probe_status,
             output,
@@ -277,6 +320,10 @@ fn normalize(evidence: &[ProbeEvidence], platform: &PlatformCapabilities) -> Wan
             FirewallBackend::Unknown => "unknown",
         }
         .into(),
+        active_attempted: false,
+        gateway_reachable: None,
+        internet_reachable: None,
+        dns_reachable: None,
     };
 
     if let Some(output) = successful_output(evidence, "openwrt.interface.wan") {
@@ -296,6 +343,12 @@ fn normalize(evidence: &[ProbeEvidence], platform: &PlatformCapabilities) -> Wan
             parse_resolvers(output, &mut summary.dns_servers);
         }
     }
+    summary.active_attempted = evidence
+        .iter()
+        .any(|item| item.probe.starts_with("network.connectivity."));
+    summary.gateway_reachable = probe_reachability(evidence, "network.connectivity.gateway");
+    summary.internet_reachable = probe_reachability(evidence, "network.connectivity.public_ip");
+    summary.dns_reachable = probe_reachability(evidence, "network.connectivity.dns");
     summary.assessment = assess(&summary);
     summary
 }
@@ -474,6 +527,17 @@ fn parse_resolvers(output: &str, servers: &mut Vec<String>) {
     }
 }
 
+fn probe_reachability(evidence: &[ProbeEvidence], probe: &str) -> Option<bool> {
+    evidence
+        .iter()
+        .find(|item| item.probe == probe)
+        .and_then(|item| match item.status {
+            ProbeStatus::Ok => Some(true),
+            ProbeStatus::Failed | ProbeStatus::TimedOut => Some(false),
+            ProbeStatus::Unavailable => None,
+        })
+}
+
 fn assess(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -487,6 +551,12 @@ fn assess(summary: &WanSummary) -> WanAssessment {
         WanAssessment::DefaultRouteMissing
     } else if summary.dns_servers.is_empty() {
         WanAssessment::DnsMissing
+    } else if summary.gateway_reachable == Some(false) {
+        WanAssessment::GatewayProbeFailed
+    } else if summary.internet_reachable == Some(false) {
+        WanAssessment::PublicIpProbeFailed
+    } else if summary.dns_reachable == Some(false) {
+        WanAssessment::DnsProbeFailed
     } else {
         WanAssessment::PrerequisitesReady
     }
@@ -522,6 +592,13 @@ fn summarize(summary: &WanSummary, evidence: &[ProbeEvidence]) -> Vec<String> {
         WanAssessment::AddressMissing => "WAN has no usable IP address",
         WanAssessment::DefaultRouteMissing => "WAN has no default route",
         WanAssessment::DnsMissing => "WAN has no configured DNS resolver",
+        WanAssessment::GatewayProbeFailed => {
+            "the configured gateway did not answer the active ICMP probe"
+        }
+        WanAssessment::PublicIpProbeFailed => {
+            "the public IP target did not answer the active ICMP probe"
+        }
+        WanAssessment::DnsProbeFailed => "the active DNS resolution probe failed",
         WanAssessment::InsufficientEvidence => "WAN evidence is insufficient for a conclusion",
     };
     findings.push(primary.into());
@@ -535,6 +612,13 @@ fn summarize(summary: &WanSummary, evidence: &[ProbeEvidence]) -> Vec<String> {
     if summary.firewall_backend == "unknown" {
         findings.push("active fw3/fw4 firewall backend could not be identified".into());
     }
+    if summary.active_attempted
+        && summary.gateway_reachable.is_none()
+        && summary.internet_reachable.is_none()
+        && summary.dns_reachable.is_none()
+    {
+        findings.push("active connectivity tools are unavailable on this image".into());
+    }
     if evidence.iter().any(|item| item.truncated) {
         findings.push("one or more probe outputs reached the configured byte limit".into());
     }
@@ -547,7 +631,10 @@ mod tests {
     use platform_openwrt::{
         FirewallCapabilities, NetworkDeviceModel, PackageManager, PlatformKind,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
     fn platform(backend: FirewallBackend) -> PlatformCapabilities {
         PlatformCapabilities {
@@ -615,6 +702,30 @@ mod tests {
     }
 
     #[test]
+    fn active_probe_failure_is_reported_without_claiming_root_cause() {
+        let evidence = vec![
+            ok_evidence(
+                "openwrt.interface.wan",
+                r#"{
+                    "up":true,"available":true,"l3_device":"wan0",
+                    "ipv4-address":[{"address":"192.0.2.10","mask":24}],
+                    "route":[{"target":"0.0.0.0","mask":0,"nexthop":"192.0.2.1"}],
+                    "dns-server":["192.0.2.53"]
+                }"#,
+            ),
+            status_evidence("network.connectivity.gateway", ProbeStatus::Failed),
+        ];
+        let summary = normalize(&evidence, &platform(FirewallBackend::Fw4));
+        assert_eq!(summary.assessment, WanAssessment::GatewayProbeFailed);
+        assert_eq!(summary.gateway_reachable, Some(false));
+        assert!(
+            summarize(&summary, &evidence)
+                .first()
+                .is_some_and(|finding| finding.contains("did not answer"))
+        );
+    }
+
+    #[test]
     fn normalizes_kernel_fallback_and_detects_missing_dns() {
         let evidence = vec![
             ok_evidence(
@@ -671,7 +782,7 @@ mod tests {
             max_output_bytes: 1024,
         };
         let report = runner
-            .diagnose_wan(&platform(FirewallBackend::Fw4))
+            .diagnose_wan(&platform(FirewallBackend::Fw4), false)
             .await
             .expect("fixture diagnosis");
         assert!(report.evidence.iter().any(|item| {
@@ -682,6 +793,38 @@ mod tests {
         }));
         assert_eq!(report.summary.dns_servers, ["192.0.2.53"]);
         assert_eq!(report.summary.firewall_backend, "fw4/nftables");
+    }
+
+    #[tokio::test]
+    async fn active_fixture_runs_only_typed_connectivity_commands() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ubus",
+            r#"#!/bin/sh
+printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"address":"192.0.2.10","mask":24}],"route":[{"target":"0.0.0.0","mask":0,"nexthop":"192.0.2.1"}],"dns-server":["192.0.2.53"]}'
+"#,
+        );
+        fixture.executable("bin/ip", "#!/bin/sh\nprintf '%s\\n' '[]'\n");
+        fixture.executable("bin/ping", "#!/bin/sh\nexit 0\n");
+        fixture.executable(
+            "bin/nslookup",
+            "#!/bin/sh\nprintf '%s\\n' 'Address: 93.184.216.34'\n",
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 4096,
+        };
+        let report = runner
+            .diagnose_wan(&platform(FirewallBackend::Fw4), true)
+            .await
+            .expect("active fixture diagnosis");
+        assert!(report.summary.active_attempted, "{report:#?}");
+        assert_eq!(report.summary.gateway_reachable, Some(true));
+        assert_eq!(report.summary.internet_reachable, Some(true));
+        assert_eq!(report.summary.dns_reachable, Some(true));
+        assert_eq!(report.summary.assessment, WanAssessment::PrerequisitesReady);
     }
 
     fn ok_evidence(probe: &str, output: &str) -> ProbeEvidence {
@@ -695,17 +838,28 @@ mod tests {
         }
     }
 
+    fn status_evidence(probe: &str, status: ProbeStatus) -> ProbeEvidence {
+        ProbeEvidence {
+            probe: probe.into(),
+            source: "fixture".into(),
+            status,
+            output: String::new(),
+            truncated: false,
+            duration_ms: 1,
+        }
+    }
+
     struct Fixture {
         root: PathBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock after epoch")
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!("mbed-agent-tools-test-{nonce}"));
+            let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "mbed-agent-tools-test-{}-{fixture_id}",
+                std::process::id()
+            ));
             fs::create_dir_all(&root).expect("create fixture root");
             Self { root }
         }
@@ -716,11 +870,18 @@ mod tests {
                 .expect("create fixture directory");
             fs::write(path, content).expect("write fixture file");
         }
+
+        fn executable(&self, relative: &str, content: &str) {
+            self.write(relative, content);
+            let path = self.root.join(relative);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("make fixture executable");
+        }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.root).expect("remove fixture root");
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 }
