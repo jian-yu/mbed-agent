@@ -8,6 +8,9 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
   subcommands act as its local CLI over a bounded Unix socket protocol.
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
+- A metadata-only `ask` task ledger with configurable retention. It records
+  outcomes, provider/model, token usage, duration, and error code, but never
+  prompts or model responses.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -56,6 +59,7 @@ cargo run -p mbed-agent -- capabilities
 cargo run -p mbed-agent -- diagnose wan
 cargo run -p mbed-agent -- diagnose wan --active
 cargo run -p mbed-agent -- diagnose history --limit 20
+cargo run -p mbed-agent -- task history --limit 20
 ```
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
@@ -73,7 +77,10 @@ returns one final completion to keep its protocol stable. Set `llm.streaming =
 false` for compatible endpoints that only implement JSON responses. HTTP
 redirects are disabled, and traffic is bounded by `llm.max_request_bytes`,
 `llm.max_response_bytes`, `llm.max_stream_event_bytes`, the configured timeouts,
-and the runtime task limit. Prompts and responses are not written to SQLite.
+the whole-Agent `runtime.task_timeout_secs`, and the runtime concurrency limit.
+Prompts and responses are not written to SQLite. `ask` task metadata is retained
+only up to `storage.max_task_records` and is discarded with the rest of `/tmp`
+state at reboot.
 When the model requests WAN evidence, the daemon runs only the passive typed
 diagnostic and sends the minimum normalized projection needed by the selected
 tool. Multiple WAN tools in one `ask` reuse the same in-memory snapshot. Raw

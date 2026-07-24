@@ -10,12 +10,13 @@ use agent_core::{AgentConfig, TmpBudget};
 use agent_protocol::{
     ClientRequest, Command, CompletionResponse, DiagnosticHistoryEntry, ErrorCode,
     PROTOCOL_VERSION, ResponseData, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
+    TaskHistoryEntry,
 };
 use agent_provider::{
     CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
     ToolDefinition,
 };
-use agent_store::{DiagnosticRecord, Store};
+use agent_store::{DiagnosticRecord, Store, TaskRecord};
 use agent_tools::ToolRunner;
 use platform_linux::PlatformCapabilities;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -223,6 +224,13 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             ),
         );
     }
+    if !valid_request_id(&request.id) {
+        return ServerResponse::error(
+            request.id,
+            ErrorCode::InvalidRequest,
+            "request id must contain 1-128 bytes without control characters",
+        );
+    }
 
     let result = match request.command {
         Command::Ping => ResponseData::Pong {
@@ -276,11 +284,18 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
+        Command::TaskHistory { limit } => {
+            return handle_task_history(request.id, limit, state).await;
+        }
         Command::Complete { prompt } => {
             return handle_completion(request.id, prompt, state).await;
         }
     };
     ServerResponse::success(request.id, result)
+}
+
+fn valid_request_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
 }
 
 async fn handle_completion(id: String, prompt: String, state: &AppState) -> ServerResponse {
@@ -301,15 +316,73 @@ async fn handle_completion(id: String, prompt: String, state: &AppState) -> Serv
             "the configured LLM task limit has been reached",
         );
     };
-    match run_read_only_agent(provider, prompt, &id, state).await {
-        Ok(completion) => ServerResponse::success(id, ResponseData::Completion(completion)),
-        Err(failure) => ServerResponse::error(id, failure.code, failure.message),
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        run_read_only_agent(provider, prompt, &id, state),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(completion)) => {
+            persist_task(
+                &id,
+                TaskAudit {
+                    status: "succeeded",
+                    model: &state.config.llm.model,
+                    prompt_tokens: completion.prompt_tokens,
+                    completion_tokens: completion.completion_tokens,
+                    duration: started.elapsed(),
+                    error_code: None,
+                },
+                state,
+            )
+            .await;
+            ServerResponse::success(id, ResponseData::Completion(completion))
+        }
+        Ok(Err(failure)) => {
+            persist_task(
+                &id,
+                TaskAudit {
+                    status: "failed",
+                    model: &state.config.llm.model,
+                    prompt_tokens: failure.prompt_tokens,
+                    completion_tokens: failure.completion_tokens,
+                    duration: started.elapsed(),
+                    error_code: Some(failure.code),
+                },
+                state,
+            )
+            .await;
+            ServerResponse::error(id, failure.code, failure.message)
+        }
+        Err(_) => {
+            persist_task(
+                &id,
+                TaskAudit {
+                    status: "timed_out",
+                    model: &state.config.llm.model,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    duration: started.elapsed(),
+                    error_code: Some(ErrorCode::ResourceExhausted),
+                },
+                state,
+            )
+            .await;
+            ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "Agent task exceeded the configured total task timeout",
+            )
+        }
     }
 }
 
 struct AgentLoopFailure {
     code: ErrorCode,
     message: String,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
 }
 
 impl AgentLoopFailure {
@@ -317,7 +390,15 @@ impl AgentLoopFailure {
         Self {
             code,
             message: message.into(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
+    }
+
+    fn with_usage(mut self, prompt_tokens: Option<u64>, completion_tokens: Option<u64>) -> Self {
+        self.prompt_tokens = prompt_tokens;
+        self.completion_tokens = completion_tokens;
+        self
     }
 }
 
@@ -350,7 +431,8 @@ async fn run_read_only_agent(
                 return Err(AgentLoopFailure::new(
                     ErrorCode::Upstream,
                     format!("LLM provider request failed: {error}"),
-                ));
+                )
+                .with_usage(prompt_tokens, completion_tokens));
             }
         };
         add_usage(&mut prompt_tokens, completion.prompt_tokens);
@@ -368,25 +450,32 @@ async fn run_read_only_agent(
             return Err(AgentLoopFailure::new(
                 ErrorCode::Upstream,
                 "model requested multiple tools in one step; this Agent profile permits one",
-            ));
+            )
+            .with_usage(prompt_tokens, completion_tokens));
         }
         if !tool_step_available(step, state.config.llm.max_agent_steps) {
             return Err(AgentLoopFailure::new(
                 ErrorCode::ResourceExhausted,
                 "Agent loop reached max_agent_steps before a final answer",
-            ));
+            )
+            .with_usage(prompt_tokens, completion_tokens));
         }
         let call = completion.tool_calls[0].clone();
         messages.push(ModelMessage::Assistant {
             content: completion.text,
             tool_calls: completion.tool_calls,
         });
-        messages.push(execute_agent_tool(&call, request_id, state, &mut wan_snapshot).await?);
+        messages.push(
+            execute_agent_tool(&call, request_id, state, &mut wan_snapshot)
+                .await
+                .map_err(|failure| failure.with_usage(prompt_tokens, completion_tokens))?,
+        );
     }
     Err(AgentLoopFailure::new(
         ErrorCode::ResourceExhausted,
         "Agent loop exhausted its configured step budget",
-    ))
+    )
+    .with_usage(prompt_tokens, completion_tokens))
 }
 
 const fn tool_step_available(step: u8, max_agent_steps: u8) -> bool {
@@ -753,6 +842,74 @@ async fn handle_diagnostic_history(id: String, limit: u16, state: &AppState) -> 
     }
 }
 
+struct TaskAudit<'a> {
+    status: &'a str,
+    model: &'a str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    duration: Duration,
+    error_code: Option<ErrorCode>,
+}
+
+async fn persist_task(id: &str, audit: TaskAudit<'_>, state: &AppState) {
+    let record = TaskRecord {
+        id: id.into(),
+        kind: "ask".into(),
+        status: audit.status.into(),
+        provider: state.config.llm.provider.as_str().into(),
+        model: audit.model.into(),
+        prompt_tokens: audit.prompt_tokens,
+        completion_tokens: audit.completion_tokens,
+        duration_ms: u64::try_from(audit.duration.as_millis()).unwrap_or(u64::MAX),
+        error_code: audit.error_code.map(|code| code.as_str().into()),
+        created_at: 0,
+    };
+    let store = Arc::clone(&state.store);
+    let max_records = state.config.storage.max_task_records;
+    match tokio::task::spawn_blocking(move || store.record_task(&record, max_records)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "failed to persist task audit"),
+        Err(error) => warn!(%error, "task audit worker failed"),
+    }
+}
+
+async fn handle_task_history(id: String, limit: u16, state: &AppState) -> ServerResponse {
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || store.task_history(limit.clamp(1, 100))).await;
+    match result {
+        Ok(Ok(records)) => ServerResponse::success(
+            id,
+            ResponseData::TaskHistory(
+                records
+                    .into_iter()
+                    .map(|record| TaskHistoryEntry {
+                        id: record.id,
+                        kind: record.kind,
+                        status: record.status,
+                        provider: record.provider,
+                        model: record.model,
+                        prompt_tokens: record.prompt_tokens,
+                        completion_tokens: record.completion_tokens,
+                        duration_ms: record.duration_ms,
+                        error_code: record.error_code,
+                        created_at: record.created_at,
+                    })
+                    .collect(),
+            ),
+        ),
+        Ok(Err(error)) => ServerResponse::error(
+            id,
+            ErrorCode::Internal,
+            format!("failed to read task history: {error}"),
+        ),
+        Err(error) => ServerResponse::error(
+            id,
+            ErrorCode::Internal,
+            format!("task history worker failed: {error}"),
+        ),
+    }
+}
+
 async fn read_frame<R>(reader: &mut R, max_bytes: usize) -> io::Result<Option<Vec<u8>>>
 where
     R: AsyncBufRead + Unpin,
@@ -873,6 +1030,14 @@ mod tests {
         assert!(!tool_step_available(0, 1));
     }
 
+    #[test]
+    fn request_ids_are_bounded_before_audit_storage() {
+        assert!(valid_request_id("cli-42-123"));
+        assert!(!valid_request_id(""));
+        assert!(!valid_request_id("line\nbreak"));
+        assert!(!valid_request_id(&"x".repeat(129)));
+    }
+
     #[tokio::test]
     async fn agent_loop_reuses_one_snapshot_across_multiple_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -919,6 +1084,7 @@ mod tests {
         ));
         let mut config = AgentConfig::default();
         config.storage.path = root.join("agent.db");
+        config.llm.model = "mock".into();
         config.llm.streaming = false;
         config.llm.max_agent_steps = 4;
         let budget = TmpBudget::new(config.storage.clone()).expect("budget");
@@ -963,7 +1129,92 @@ mod tests {
                 .len(),
             1
         );
+        let task_history = state.store.task_history(10).expect("task history");
+        assert_eq!(task_history.len(), 1);
+        assert_eq!(task_history[0].id, "agent-loop");
+        assert_eq!(task_history[0].status, "succeeded");
+        assert_eq!(task_history[0].prompt_tokens, Some(22));
+        assert_eq!(task_history[0].completion_tokens, Some(7));
+        assert_eq!(task_history[0].error_code, None);
         server.await.expect("server");
+        drop(state);
+        fs::remove_dir_all(root).expect("remove test runtime");
+    }
+
+    #[tokio::test]
+    async fn agent_total_timeout_is_audited_without_message_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/agent-timeout-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let mut config = AgentConfig::default();
+        config.storage.path = root.join("agent.db");
+        config.runtime.task_timeout_secs = 1;
+        config.llm.model = "mock".into();
+        config.llm.streaming = false;
+        let budget = TmpBudget::new(config.storage.clone()).expect("budget");
+        let store = Arc::new(
+            Store::open(&config.storage.path, config.storage.max_database_bytes).expect("store"),
+        );
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{address}/v1"),
+            api_key: "test-key".into(),
+            model: "mock".into(),
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(5),
+            max_request_bytes: config.llm.max_request_bytes,
+            max_response_bytes: config.llm.max_response_bytes,
+            max_stream_event_bytes: config.llm.max_stream_event_bytes,
+        })
+        .expect("provider");
+        let state = AppState {
+            platform: PlatformCapabilities::discover(),
+            budget,
+            store,
+            tools: ToolRunner::system(Duration::from_millis(100), 4096),
+            diagnostic_slots: Semaphore::new(1),
+            llm: Some(provider),
+            llm_slots: Semaphore::new(1),
+            started: Instant::now(),
+            config,
+        };
+
+        let secret_prompt = "private prompt must not be stored";
+        let response =
+            handle_completion("agent-timeout".into(), secret_prompt.into(), &state).await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.expect("timeout error").code,
+            ErrorCode::ResourceExhausted
+        );
+        let history = state.store.task_history(10).expect("task history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "timed_out");
+        assert_eq!(
+            history[0].error_code.as_deref(),
+            Some(ErrorCode::ResourceExhausted.as_str())
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", state.config.storage.path.display()));
+            if let Ok(database) = fs::read(path) {
+                assert!(
+                    !database
+                        .windows(secret_prompt.len())
+                        .any(|window| window == secret_prompt.as_bytes())
+                );
+            }
+        }
+
+        server.abort();
+        let _ = server.await;
         drop(state);
         fs::remove_dir_all(root).expect("remove test runtime");
     }

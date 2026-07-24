@@ -51,6 +51,11 @@ enum CliCommand {
         #[command(subcommand)]
         target: DiagnoseTarget,
     },
+    /// Inspect volatile task metadata from this boot.
+    Task {
+        #[command(subcommand)]
+        target: TaskTarget,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -64,6 +69,17 @@ enum DiagnoseTarget {
         socket: PathBuf,
     },
     /// Show volatile diagnostic summaries from this boot.
+    History {
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskTarget {
+    /// Show bounded task outcomes without prompt or response content.
     History {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
@@ -88,6 +104,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Diagnose {
             target: DiagnoseTarget::History { limit, socket },
         } => run_client(&socket, Command::DiagnosticHistory { limit }).await,
+        CliCommand::Task {
+            target: TaskTarget::History { limit, socket },
+        } => run_client(&socket, Command::TaskHistory { limit }).await,
     }
 }
 

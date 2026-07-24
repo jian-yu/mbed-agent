@@ -106,11 +106,13 @@ impl AgentConfig {
             ));
         }
         if self.storage.max_diagnostic_records == 0
+            || self.storage.max_task_records == 0
             || self.storage.max_diagnostic_record_bytes == 0
             || self.storage.max_diagnostic_record_bytes > self.storage.max_database_bytes
         {
             return Err(ConfigError::Validation(
-                "diagnostic audit limits must be non-zero and fit the database budget".into(),
+                "task and diagnostic audit limits must be non-zero and fit the database budget"
+                    .into(),
             ));
         }
         if self.storage.min_tmp_free_percent > 100 {
@@ -254,9 +256,10 @@ impl LlmConfig {
                     "enabled llm.base_url must be an HTTPS URL without whitespace".into(),
                 ));
             }
-            if self.api_key.is_empty() || self.model.trim().is_empty() {
+            if self.api_key.is_empty() || self.model.trim().is_empty() || self.model.len() > 128 {
                 return Err(ConfigError::Validation(
-                    "enabled LLM requires llm.api_key and llm.model".into(),
+                    "enabled LLM requires llm.api_key and a model name no longer than 128 bytes"
+                        .into(),
                 ));
             }
             if self.system_prompt.trim().is_empty() {
@@ -364,6 +367,7 @@ pub struct StorageConfig {
     pub min_tmp_free_bytes: u64,
     pub min_tmp_free_percent: u8,
     pub cleanup_interval_secs: u64,
+    pub max_task_records: u32,
     pub max_diagnostic_records: u32,
     pub max_diagnostic_record_bytes: u64,
 }
@@ -380,6 +384,7 @@ impl Default for StorageConfig {
             min_tmp_free_bytes: 8 * 1024 * 1024,
             min_tmp_free_percent: 10,
             cleanup_interval_secs: 60,
+            max_task_records: 256,
             max_diagnostic_records: 128,
             max_diagnostic_record_bytes: 32 * 1024,
         }
@@ -475,6 +480,10 @@ mod tests {
         config.llm.api_key = SecretString("secret".into());
         config.llm.model = "model".into();
         assert!(config.validate().is_err());
+
+        config.llm.base_url = "https://example.test/v1".into();
+        config.llm.model = "x".repeat(129);
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -498,6 +507,13 @@ mod tests {
 
         config.llm.max_agent_steps = 4;
         config.llm.max_tool_context_bytes = config.llm.max_request_bytes + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn volatile_task_history_must_retain_at_least_one_record() {
+        let mut config = AgentConfig::default();
+        config.storage.max_task_records = 0;
         assert!(config.validate().is_err());
     }
 }

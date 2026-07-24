@@ -18,6 +18,7 @@ pub enum Command {
     Capabilities,
     DiagnoseWan { active: bool },
     DiagnosticHistory { limit: u16 },
+    TaskHistory { limit: u16 },
     Complete { prompt: String },
 }
 
@@ -67,6 +68,7 @@ pub enum ResponseData {
     Capabilities(Value),
     WanDiagnostic(Box<WanDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
+    TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
 }
 
@@ -86,6 +88,20 @@ pub struct DiagnosticHistoryEntry {
     pub active: bool,
     pub assessment: String,
     pub summary: Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskHistoryEntry {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub duration_ms: u64,
+    pub error_code: Option<String>,
     pub created_at: i64,
 }
 
@@ -237,6 +253,20 @@ pub enum ErrorCode {
     ResourceExhausted,
     Unavailable,
     Upstream,
+}
+
+impl ErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::Internal => "internal",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::Unavailable => "unavailable",
+            Self::Upstream => "upstream",
+        }
+    }
 }
 
 #[cfg(test)]

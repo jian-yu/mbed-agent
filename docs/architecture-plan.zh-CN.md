@@ -466,6 +466,7 @@ min_tmp_free_bytes = 8388608
 min_tmp_free_percent = 10
 retention_hours = 24
 cleanup_interval_secs = 60
+max_task_records = 256
 max_diagnostic_records = 128
 max_diagnostic_record_bytes = 32768
 
