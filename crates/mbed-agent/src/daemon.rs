@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use agent_core::{AgentConfig, TmpBudget};
 use agent_protocol::{
-    ClientRequest, Command, DiagnosticHistoryEntry, ErrorCode, PROTOCOL_VERSION, ResponseData,
-    ServerResponse, StatusResponse, StoragePressure, StorageStatus,
+    ClientRequest, Command, CompletionResponse, DiagnosticHistoryEntry, ErrorCode,
+    PROTOCOL_VERSION, ResponseData, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
 };
+use agent_provider::{CompletionRequest, OpenAiCompatibleProvider};
 use agent_store::{DiagnosticRecord, Store};
 use agent_tools::ToolRunner;
 use platform_linux::PlatformCapabilities;
@@ -31,11 +32,14 @@ struct AppState {
     store: Arc<Store>,
     tools: ToolRunner,
     diagnostic_slots: Semaphore,
+    llm: Option<OpenAiCompatibleProvider>,
+    llm_slots: Semaphore,
     started: Instant,
 }
 
 pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config = AgentConfig::load_or_default(config_path)?;
+    ensure_secret_config_permissions(config_path, &config)?;
     init_logging(&config)?;
 
     let budget = TmpBudget::new(config.storage.clone())?;
@@ -58,6 +62,8 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         config.runtime.max_tool_output_bytes,
     );
     let diagnostic_slots = Semaphore::new(config.runtime.max_active_tasks);
+    let llm = build_llm_provider(&config)?;
+    let llm_slots = Semaphore::new(config.runtime.max_active_tasks);
     let listener = bind_socket(&config.server.socket_path, config.server.socket_mode)?;
     let state = Arc::new(AppState {
         config,
@@ -66,6 +72,8 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         store,
         tools,
         diagnostic_slots,
+        llm,
+        llm_slots,
         started: Instant::now(),
     });
     info!(
@@ -99,6 +107,41 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
 
     let _ = fs::remove_file(&state.config.server.socket_path);
     Ok(())
+}
+
+fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Result<()> {
+    if !config.llm.enabled || !path.exists() {
+        return Ok(());
+    }
+    let mode = fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "LLM credentials require {} to have mode 0600 or stricter",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn build_llm_provider(
+    config: &AgentConfig,
+) -> Result<Option<OpenAiCompatibleProvider>, Box<dyn Error>> {
+    if !config.llm.enabled {
+        return Ok(None);
+    }
+    let provider = OpenAiCompatibleProvider::new(
+        &config.llm.base_url,
+        config.llm.api_key.expose().to_owned(),
+        config.llm.model.clone(),
+        Duration::from_secs(config.llm.connect_timeout_secs),
+        Duration::from_secs(config.llm.request_timeout_secs),
+        config.llm.max_request_bytes,
+        config.llm.max_response_bytes,
+    )?;
+    Ok(Some(provider))
 }
 
 fn init_logging(config: &AgentConfig) -> io::Result<()> {
@@ -217,6 +260,8 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                     pressure,
                 },
                 platform_kind: state.platform.kind.as_str().into(),
+                llm_enabled: state.llm.is_some(),
+                llm_provider: state.config.llm.provider.as_str().into(),
                 degraded_reasons,
             })
         }
@@ -226,8 +271,56 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
+        Command::Complete { prompt } => {
+            return handle_completion(request.id, prompt, state).await;
+        }
     };
     ServerResponse::success(request.id, result)
+}
+
+async fn handle_completion(id: String, prompt: String, state: &AppState) -> ServerResponse {
+    let Some(provider) = &state.llm else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::Unavailable,
+            "LLM provider is not enabled in daemon configuration",
+        );
+    };
+    if prompt.trim().is_empty() {
+        return ServerResponse::error(id, ErrorCode::InvalidRequest, "prompt must not be empty");
+    }
+    let Ok(_permit) = state.llm_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured LLM task limit has been reached",
+        );
+    };
+    let request = CompletionRequest {
+        system_prompt: state.config.llm.system_prompt.clone(),
+        user_prompt: prompt,
+        max_output_tokens: state.config.llm.max_output_tokens,
+    };
+    match provider.complete(request).await {
+        Ok(completion) => ServerResponse::success(
+            id,
+            ResponseData::Completion(CompletionResponse {
+                text: completion.text,
+                model: completion.model,
+                finish_reason: completion.finish_reason,
+                prompt_tokens: completion.prompt_tokens,
+                completion_tokens: completion.completion_tokens,
+            }),
+        ),
+        Err(error) => {
+            warn!(%error, "LLM provider request failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Upstream,
+                format!("LLM provider request failed: {error}"),
+            )
+        }
+    }
 }
 
 async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> ServerResponse {

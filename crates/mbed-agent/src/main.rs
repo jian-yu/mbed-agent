@@ -39,6 +39,13 @@ enum CliCommand {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Ask the configured LLM through the local daemon.
+    Ask {
+        /// Prompt sent to the configured provider.
+        prompt: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Run a deterministic, read-only diagnostic runbook.
     Diagnose {
         #[command(subcommand)]
@@ -72,6 +79,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Ping { socket } => run_client(&socket, Command::Ping).await,
         CliCommand::Status { socket } => run_client(&socket, Command::Status).await,
         CliCommand::Capabilities { socket } => run_client(&socket, Command::Capabilities).await,
+        CliCommand::Ask { prompt, socket } => {
+            run_client(&socket, Command::Complete { prompt }).await
+        }
         CliCommand::Diagnose {
             target: DiagnoseTarget::Wan { active, socket },
         } => run_client(&socket, Command::DiagnoseWan { active }).await,

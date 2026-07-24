@@ -35,3 +35,16 @@ max_file_bytes = 262144
 max_files = 8
 max_line_bytes = 4096
 rate_limit_per_target_per_sec = 20
+
+[llm]
+enabled = false
+provider = "open-ai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = ""
+model = ""
+system_prompt = "You are a professional Linux networking and OpenWrt engineer. Be precise, evidence-driven, and conservative about device changes."
+connect_timeout_secs = 10
+request_timeout_secs = 60
+max_request_bytes = 32768
+max_response_bytes = 131072
+max_output_tokens = 1024

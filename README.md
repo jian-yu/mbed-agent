@@ -17,8 +17,13 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
   one stable WAN model, including the UCI WAN firewall zone, and reports the
   first failed network prerequisite.
 - OpenWrt procd and UCI configuration skeletons.
+- A bounded OpenAI-compatible HTTPS provider, invoked through
+  `mbed-agent ask`, with strict request/response limits, timeouts, disabled
+  redirects, and redacted API-key configuration.
 
-LLM providers, typed network tools, MQTT, WeCom, WeChat ClawBot, administrator elevation, and configuration transactions are planned but are not implemented yet.
+LLM tool calling and provider routing, additional typed network tools, MQTT,
+WeCom, WeChat ClawBot, administrator elevation, and configuration transactions
+are planned but are not implemented yet.
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -48,6 +53,20 @@ cargo run -p mbed-agent -- diagnose wan
 cargo run -p mbed-agent -- diagnose wan --active
 cargo run -p mbed-agent -- diagnose history --limit 20
 ```
+
+To exercise an OpenAI-compatible endpoint, copy the example configuration,
+enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart
+the daemon. A credential-bearing configuration must be mode `0600` (or stricter).
+Then run:
+
+```sh
+cargo run -p mbed-agent -- ask "Explain the likely WAN fault from this symptom"
+```
+
+The daemon owns the provider credentials; the CLI never reads them. LLM traffic
+is non-streaming in this first slice, allows no HTTP redirects, and is bounded by
+`llm.max_request_bytes`, `llm.max_response_bytes`, the configured timeouts, and
+the runtime task limit. Prompts and responses are not written to SQLite.
 
 Diagnostic commands never invoke a shell. Their executable names and arguments
 are compiled into a typed allowlist, and configuration limits each probe's time

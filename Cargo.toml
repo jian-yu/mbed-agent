@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agent-core",
+    "crates/agent-provider",
     "crates/agent-protocol",
     "crates/agent-store",
     "crates/agent-tools",
@@ -18,12 +19,15 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 agent-core = { path = "crates/agent-core" }
+agent-provider = { path = "crates/agent-provider" }
 agent-protocol = { path = "crates/agent-protocol" }
 agent-store = { path = "crates/agent-store", default-features = false }
 agent-tools = { path = "crates/agent-tools" }
 platform-linux = { path = "crates/platform-linux" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.37", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

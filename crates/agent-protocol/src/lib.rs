@@ -18,6 +18,7 @@ pub enum Command {
     Capabilities,
     DiagnoseWan { active: bool },
     DiagnosticHistory { limit: u16 },
+    Complete { prompt: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -66,6 +67,16 @@ pub enum ResponseData {
     Capabilities(Value),
     WanDiagnostic(Box<WanDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
+    Completion(CompletionResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionResponse {
+    pub text: String,
+    pub model: String,
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -186,6 +197,8 @@ pub struct StatusResponse {
     pub profile: String,
     pub storage: StorageStatus,
     pub platform_kind: String,
+    pub llm_enabled: bool,
+    pub llm_provider: String,
     pub degraded_reasons: Vec<String>,
 }
 
@@ -221,6 +234,8 @@ pub enum ErrorCode {
     UnsupportedProtocol,
     Internal,
     ResourceExhausted,
+    Unavailable,
+    Upstream,
 }
 
 #[cfg(test)]

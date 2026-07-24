@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ pub struct AgentConfig {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub logging: LoggingConfig,
+    pub llm: LlmConfig,
 }
 
 impl Default for AgentConfig {
@@ -27,6 +29,7 @@ impl Default for AgentConfig {
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
             logging: LoggingConfig::default(),
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -128,6 +131,8 @@ impl AgentConfig {
             )));
         }
 
+        self.llm.validate()?;
+
         let allocated = self
             .storage
             .max_database_bytes
@@ -156,6 +161,113 @@ impl AgentConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmConfig {
+    pub enabled: bool,
+    pub provider: LlmProviderKind,
+    pub base_url: String,
+    pub api_key: SecretString,
+    pub model: String,
+    pub system_prompt: String,
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_output_tokens: u32,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: LlmProviderKind::OpenAiCompatible,
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: SecretString::default(),
+            model: String::new(),
+            system_prompt: "You are a professional Linux networking and OpenWrt engineer. Be precise, evidence-driven, and conservative about device changes.".into(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 60,
+            max_request_bytes: 32 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_output_tokens: 1024,
+        }
+    }
+}
+
+impl LlmConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.connect_timeout_secs == 0
+            || self.request_timeout_secs == 0
+            || self.max_request_bytes < 1024
+            || self.max_response_bytes < 1024
+            || self.max_output_tokens == 0
+        {
+            return Err(ConfigError::Validation(
+                "llm timeouts, token limit, and 1024-byte buffers must be non-zero".into(),
+            ));
+        }
+        if self.enabled {
+            if !self.base_url.starts_with("https://")
+                || self.base_url.chars().any(char::is_whitespace)
+            {
+                return Err(ConfigError::Validation(
+                    "enabled llm.base_url must be an HTTPS URL without whitespace".into(),
+                ));
+            }
+            if self.api_key.is_empty() || self.model.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "enabled LLM requires llm.api_key and llm.model".into(),
+                ));
+            }
+            if self.system_prompt.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "enabled LLM requires a non-empty llm.system_prompt".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlmProviderKind {
+    #[default]
+    OpenAiCompatible,
+}
+
+impl LlmProviderKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "open-ai-compatible",
+        }
     }
 }
 
@@ -337,5 +449,23 @@ mod tests {
         let mut config = AgentConfig::default();
         config.storage.max_total_bytes = 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_llm_requires_https_and_credentials() {
+        let mut config = AgentConfig::default();
+        config.llm.enabled = true;
+        assert!(config.validate().is_err());
+
+        config.llm.base_url = "http://example.test/v1".into();
+        config.llm.api_key = SecretString("secret".into());
+        config.llm.model = "model".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn llm_key_is_redacted_from_debug_output() {
+        let secret = SecretString("do-not-log".into());
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
     }
 }
