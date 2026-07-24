@@ -459,6 +459,7 @@ backend = "sqlite"
 path = "/tmp/mbed-agent/agent.db"
 max_database_bytes = 8388608
 max_artifacts_bytes = 8388608
+max_artifact_files = 64
 max_rollback_bytes = 4194304
 max_total_bytes = 25165824
 runtime_headroom_bytes = 2097152

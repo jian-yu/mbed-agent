@@ -50,6 +50,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(budget.root().join("artifacts"))?;
     fs::create_dir_all(budget.root().join("rollback"))?;
     fs::create_dir_all(budget.root().join("log"))?;
+    match budget.cleanup_artifacts() {
+        Ok(report) if report.removed_files > 0 => info!(
+            removed_files = report.removed_files,
+            bytes_before = report.bytes_before,
+            bytes_after = report.bytes_after,
+            "pruned managed runtime artifacts during startup"
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "startup artifact cleanup failed"),
+    }
 
     let store = Arc::new(Store::open(
         &config.storage.path,
@@ -80,6 +90,10 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         llm_slots,
         started: Instant::now(),
     });
+    let mut cleanup_interval =
+        tokio::time::interval(Duration::from_secs(state.budget.cleanup_interval_secs()));
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cleanup_interval.tick().await;
     info!(
         socket = %state.config.server.socket_path.display(),
         platform = state.platform.kind.as_str(),
@@ -105,6 +119,9 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
                 signal?;
                 info!("shutdown requested");
                 break;
+            }
+            _ = cleanup_interval.tick() => {
+                run_artifact_cleanup(&state).await;
             }
         }
     }
@@ -147,6 +164,49 @@ fn build_llm_provider(
         max_stream_event_bytes: config.llm.max_stream_event_bytes,
     })?;
     Ok(Some(provider))
+}
+
+async fn ensure_task_storage(state: &AppState) -> Result<(), String> {
+    let mut pressure = inspect_storage_pressure(state).await?;
+    if matches!(
+        pressure,
+        StoragePressure::Critical | StoragePressure::Emergency
+    ) {
+        run_artifact_cleanup(state).await;
+        pressure = inspect_storage_pressure(state).await?;
+    }
+    match pressure {
+        StoragePressure::Normal | StoragePressure::Pressure => Ok(()),
+        StoragePressure::Critical | StoragePressure::Emergency => Err(format!(
+            "runtime storage pressure is {pressure:?}; refusing to start a new task"
+        )),
+    }
+}
+
+async fn inspect_storage_pressure(state: &AppState) -> Result<StoragePressure, String> {
+    let budget = state.budget.clone();
+    tokio::task::spawn_blocking(move || {
+        let managed = budget.managed_bytes()?;
+        budget.pressure(managed)
+    })
+    .await
+    .map_err(|error| format!("storage pressure worker failed: {error}"))?
+    .map_err(|error| format!("runtime storage pressure cannot be inspected: {error}"))
+}
+
+async fn run_artifact_cleanup(state: &AppState) {
+    let budget = state.budget.clone();
+    match tokio::task::spawn_blocking(move || budget.cleanup_artifacts()).await {
+        Ok(Ok(report)) if report.removed_files > 0 => info!(
+            removed_files = report.removed_files,
+            bytes_before = report.bytes_before,
+            bytes_after = report.bytes_after,
+            "pruned managed runtime artifacts"
+        ),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(%error, "managed artifact cleanup failed"),
+        Err(error) => warn!(%error, "managed artifact cleanup worker failed"),
+    }
 }
 
 fn init_logging(config: &AgentConfig) -> io::Result<()> {
@@ -317,6 +377,9 @@ async fn handle_completion(id: String, prompt: String, state: &AppState) -> Serv
     };
     if prompt.trim().is_empty() {
         return ServerResponse::error(id, ErrorCode::InvalidRequest, "prompt must not be empty");
+    }
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
     }
     let Ok(_permit) = state.llm_slots.try_acquire() else {
         return ServerResponse::error(
@@ -505,6 +568,9 @@ async fn execute_agent_tool(
         )
     })?;
     if wan_snapshot.is_none() {
+        ensure_task_storage(state)
+            .await
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
         let report = execute_agent_wan_diagnostic(state)
             .await
             .map_err(agent_tool_failure)?;
@@ -790,6 +856,9 @@ fn encode_tool_observation<T: serde::Serialize>(
 }
 
 async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
     let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
         return ServerResponse::error(
             id,
@@ -832,6 +901,9 @@ async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> Ser
 }
 
 async fn handle_dns_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
     let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
         return ServerResponse::error(
             id,
@@ -874,6 +946,9 @@ async fn handle_dns_diagnosis(id: String, state: &AppState) -> ServerResponse {
 }
 
 async fn handle_dhcp_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
     let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
         return ServerResponse::error(
             id,
@@ -916,6 +991,9 @@ async fn handle_dhcp_diagnosis(id: String, state: &AppState) -> ServerResponse {
 }
 
 async fn handle_route_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
     let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
         return ServerResponse::error(
             id,
@@ -1217,6 +1295,41 @@ mod tests {
         assert!(!valid_request_id(""));
         assert!(!valid_request_id("line\nbreak"));
         assert!(!valid_request_id(&"x".repeat(129)));
+    }
+
+    #[tokio::test]
+    async fn critical_managed_storage_rejects_new_tasks() {
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/storage-admission-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let mut config = AgentConfig::default();
+        config.storage.path = root.join("agent.db");
+        config.storage.max_total_bytes = 1;
+        let budget = TmpBudget::new(config.storage.clone()).expect("budget");
+        let store = Arc::new(
+            Store::open(&config.storage.path, config.storage.max_database_bytes).expect("store"),
+        );
+        let state = AppState {
+            platform: PlatformCapabilities::discover(),
+            budget,
+            store,
+            tools: ToolRunner::system(Duration::from_millis(100), 4096),
+            diagnostic_slots: Semaphore::new(1),
+            llm: None,
+            llm_slots: Semaphore::new(1),
+            started: Instant::now(),
+            config,
+        };
+
+        let error = ensure_task_storage(&state)
+            .await
+            .expect_err("storage admission must reject");
+        assert!(error.contains("Emergency"));
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove test runtime");
     }
 
     #[tokio::test]

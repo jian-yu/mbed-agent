@@ -11,6 +11,9 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - A metadata-only `ask` task ledger with configurable retention. It records
   outcomes, provider/model, token usage, duration, and error code, but never
   prompts or model responses.
+- Runtime `/tmp` pressure admission and a bounded artifact cleaner. Critical
+  pressure blocks new diagnostic/LLM tasks while status and history remain
+  available.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -107,6 +110,16 @@ dynamic, otherwise it returns insufficient evidence instead of guessing.
 Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
 probe output is not persisted. History is bounded by configurable record-count
 and per-record byte limits, and oldest entries are pruned transactionally.
+
+At startup and every `storage.cleanup_interval_secs`, the daemon prunes only
+direct regular-file children of its managed `artifacts/` directory to
+`storage.max_artifacts_bytes` and `storage.max_artifact_files`. It ignores
+symlinks, subdirectories, and non-regular files, and never cleans rollback
+state, SQLite, logs, sockets, or
+configuration. Before starting a diagnostic or LLM task, the daemon checks both
+managed usage and filesystem free-space reserves. Critical or emergency
+pressure triggers one cleanup attempt and then rejects the new task if pressure
+remains; `ping`, `status`, capabilities, and history queries remain usable.
 
 All generated runtime state is placed below `/tmp/mbed-agent` and may be discarded at reboot.
 

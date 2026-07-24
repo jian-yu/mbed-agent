@@ -105,6 +105,11 @@ impl AgentConfig {
                 "storage limits must be greater than zero".into(),
             ));
         }
+        if self.storage.max_artifact_files == 0 || self.storage.max_artifact_files > 4096 {
+            return Err(ConfigError::Validation(
+                "storage.max_artifact_files must be between 1 and 4096".into(),
+            ));
+        }
         if self.storage.max_diagnostic_records == 0
             || self.storage.max_task_records == 0
             || self.storage.max_diagnostic_record_bytes == 0
@@ -361,6 +366,7 @@ pub struct StorageConfig {
     pub path: PathBuf,
     pub max_database_bytes: u64,
     pub max_artifacts_bytes: u64,
+    pub max_artifact_files: u32,
     pub max_rollback_bytes: u64,
     pub max_total_bytes: u64,
     pub runtime_headroom_bytes: u64,
@@ -378,6 +384,7 @@ impl Default for StorageConfig {
             path: PathBuf::from("/tmp/mbed-agent/agent.db"),
             max_database_bytes: 8 * 1024 * 1024,
             max_artifacts_bytes: 8 * 1024 * 1024,
+            max_artifact_files: 64,
             max_rollback_bytes: 4 * 1024 * 1024,
             max_total_bytes: 24 * 1024 * 1024,
             runtime_headroom_bytes: 2 * 1024 * 1024,
@@ -514,6 +521,13 @@ mod tests {
     fn volatile_task_history_must_retain_at_least_one_record() {
         let mut config = AgentConfig::default();
         config.storage.max_task_records = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn artifact_file_count_has_an_embedded_memory_bound() {
+        let mut config = AgentConfig::default();
+        config.storage.max_artifact_files = 4097;
         assert!(config.validate().is_err());
     }
 }
