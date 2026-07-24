@@ -1,0 +1,23 @@
+[Unit]
+Description=Mbed Agent for embedded Linux
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/mbed-agent daemon --config /etc/mbed-agent/config.toml
+Restart=on-failure
+RestartSec=5s
+User=root
+Group=root
+UMask=0077
+LimitNOFILE=128
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp/mbed-agent
+ReadWritePaths=-/etc/mbed-agent
+
+[Install]
+WantedBy=multi-user.target

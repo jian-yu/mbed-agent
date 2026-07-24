@@ -13,7 +13,7 @@ use agent_protocol::{
 };
 use agent_store::{DiagnosticRecord, Store};
 use agent_tools::ToolRunner;
-use platform_openwrt::PlatformCapabilities;
+use platform_linux::PlatformCapabilities;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;

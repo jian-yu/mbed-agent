@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+name="mbed-agent"
+description="Mbed Agent for embedded Linux"
+command="/usr/sbin/mbed-agent"
+command_args="daemon --config /etc/mbed-agent/config.toml"
+command_user="root:root"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need net
+}
+
+start_pre() {
+	checkpath --directory --mode 0700 --owner root:root /tmp/mbed-agent
+}

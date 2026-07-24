@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 agent-protocol.workspace = true
-platform-openwrt.workspace = true
+platform-linux.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

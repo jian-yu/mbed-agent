@@ -138,7 +138,7 @@ mbed-agent/
 │   ├── agent-protocol/       # Provider/Channel/Tool 共享 DTO 与版本化协议
 │   ├── agent-policy/         # 风险、权限、审批、配额、脱敏
 │   ├── agent-tools/          # 工具注册表与通用 Linux 工具
-│   ├── platform-openwrt/     # ubus/UCI/netifd/procd/firewall4 适配
+│   ├── platform-linux/       # 通用 Linux 基线 + OpenWrt 专用适配
 │   ├── platform-linux/       # /proc、/sys、netlink、通用发行版适配
 │   ├── agent-providers/      # 各 LLM API 适配
 │   ├── agent-channels/       # MQTT/webhook/local channel 适配
@@ -599,13 +599,13 @@ mbed-agent storage prune [--artifacts|--history|--logs]
 
 ## 13. OpenWrt 集成与发布
 
-普通嵌入式 Linux 与 OpenWrt 是并列支持目标，不把前者当作 OpenWrt 能力缺失后的降级模式。普通 Linux 基线使用 `/etc/os-release`、procfs/sysfs、iproute2、原生 nftables/iptables，以及 systemd-resolved、NetworkManager 或 `/etc/resolv.conf`；不得调用 ubus/UCI。服务管理通过独立 adapter 适配 systemd、OpenRC、BusyBox init 或厂商 supervisor。OpenWrt adapter 在此 Linux 基线上增加 ubus、UCI、netifd、procd、fw3/fw4 与 DSA/swconfig 语义。
+普通嵌入式 Linux 与 OpenWrt 是并列支持目标，不把前者当作 OpenWrt 能力缺失后的降级模式。普通 Linux 基线使用 `/etc/os-release`、procfs/sysfs、iproute2、原生 nftables/iptables，以及 systemd-resolved、NetworkManager 或 `/etc/resolv.conf`；不得调用 ubus/UCI。服务管理通过独立 adapter 适配 systemd、OpenRC、BusyBox init 或厂商 supervisor，仓库提供对应的 systemd/OpenRC/BusyBox 安装骨架。OpenWrt adapter 在此 Linux 基线上增加 ubus、UCI、netifd、procd、fw3/fw4 与 DSA/swconfig 语义。
 
 ### 13.1 支持范围与兼容策略
 
 最低兼容版本确定为 **OpenWrt 21.02**，并支持其后的正式版本。这里的“支持”表示 Agent 可以安装、启动、诊断和执行该版本已具备的受控配置能力；21.02、22.03 等已结束 OpenWrt 上游安全维护的版本仍可做兼容测试，但 Agent 必须在状态页提示其 EOL 风险，不能把“Agent 可运行”表述为“系统仍安全受支持”。
 
-不能用单一新版实现兼容所有版本。`platform-openwrt` 在启动时生成 `PlatformCapabilities`，版本号只作提示，真正分派依据是已安装命令、ubus object/method、UCI schema、内核接口和服务探针。至少识别：
+不能用单一新版实现兼容所有版本。`platform-linux` 在启动时生成 `PlatformCapabilities`，版本号只作提示，真正分派依据是已安装命令、ubus object/method、UCI schema、内核接口和服务探针。至少识别：
 
 | 能力域 | OpenWrt 21.02 典型情况 | OpenWrt 22.03+ 典型情况 | Agent 策略 |
 |---|---|---|---|

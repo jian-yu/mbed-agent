@@ -9,7 +9,7 @@ use agent_protocol::{
     FirewallZoneSummary, ProbeEvidence, ProbeStatus, WanAssessment, WanDiagnosticReport, WanRoute,
     WanSummary,
 };
-use platform_openwrt::{FirewallBackend, PlatformCapabilities, PlatformKind};
+use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -760,8 +760,8 @@ fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platform_openwrt::{
-        FirewallCapabilities, NetworkDeviceModel, PackageManager, PlatformKind,
+    use platform_linux::{
+        FirewallCapabilities, InitSystem, NetworkDeviceModel, PackageManager, PlatformKind,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -788,6 +788,7 @@ mod tests {
             },
             device_model: NetworkDeviceModel::Unknown,
             package_manager: PackageManager::Opkg,
+            init_system: InitSystem::Procd,
             has_ubus: false,
             has_uci: false,
             has_procd: true,

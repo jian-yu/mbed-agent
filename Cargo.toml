@@ -5,7 +5,7 @@ members = [
     "crates/agent-store",
     "crates/agent-tools",
     "crates/mbed-agent",
-    "crates/platform-openwrt",
+    "crates/platform-linux",
 ]
 resolver = "2"
 
@@ -21,7 +21,7 @@ agent-core = { path = "crates/agent-core" }
 agent-protocol = { path = "crates/agent-protocol" }
 agent-store = { path = "crates/agent-store", default-features = false }
 agent-tools = { path = "crates/agent-tools" }
-platform-openwrt = { path = "crates/platform-openwrt" }
+platform-linux = { path = "crates/platform-linux" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 rusqlite = { version = "0.37", default-features = false }

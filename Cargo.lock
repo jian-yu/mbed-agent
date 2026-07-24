@@ -34,7 +34,7 @@ name = "agent-tools"
 version = "0.1.0"
 dependencies = [
  "agent-protocol",
- "platform-openwrt",
+ "platform-linux",
  "serde_json",
  "tokio",
 ]
@@ -321,7 +321,7 @@ dependencies = [
  "agent-store",
  "agent-tools",
  "clap",
- "platform-openwrt",
+ "platform-linux",
  "serde_json",
  "tokio",
  "tracing",
@@ -379,7 +379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "platform-openwrt"
+name = "platform-linux"
 version = "0.1.0"
 dependencies = [
  "serde",

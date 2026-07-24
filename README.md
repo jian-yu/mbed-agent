@@ -69,3 +69,11 @@ It targets OpenWrt 21.02 and later and does not assume either fw3 or fw4; runtim
 capability discovery selects the available firewall stack. A feed package
 Makefile and per-architecture `.ipk`/`.apk` artifacts will be added only after
 validation against real OpenWrt SDK images.
+
+## Generic Linux integration
+
+The `packaging/linux` tree contains service definitions for systemd, OpenRC, and
+BusyBox init. Runtime discovery reports the active init system and common package
+manager, but the agent never installs packages at runtime. The systemd unit
+restricts writable paths to `/tmp/mbed-agent` and the explicit agent
+configuration directory.

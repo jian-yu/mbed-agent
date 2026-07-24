@@ -14,6 +14,7 @@ pub struct PlatformCapabilities {
     pub firewall: FirewallCapabilities,
     pub device_model: NetworkDeviceModel,
     pub package_manager: PackageManager,
+    pub init_system: InitSystem,
     pub has_ubus: bool,
     pub has_uci: bool,
     pub has_procd: bool,
@@ -80,6 +81,19 @@ pub enum NetworkDeviceModel {
 pub enum PackageManager {
     Opkg,
     Apk,
+    Apt,
+    Dnf,
+    Pacman,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InitSystem {
+    Procd,
+    Systemd,
+    OpenRc,
+    BusyBox,
     Unknown,
 }
 
@@ -125,6 +139,11 @@ impl Discovery {
             "swconfig",
             "opkg",
             "apk",
+            "apt-get",
+            "dnf",
+            "pacman",
+            "systemctl",
+            "openrc",
             "iwinfo",
             "ip",
         ];
@@ -152,13 +171,8 @@ impl Discovery {
         } else {
             NetworkDeviceModel::Unknown
         };
-        let package_manager = if has("apk") {
-            PackageManager::Apk
-        } else if has("opkg") {
-            PackageManager::Opkg
-        } else {
-            PackageManager::Unknown
-        };
+        let package_manager = self.detect_package_manager();
+        let init_system = self.detect_init_system();
 
         let warnings = capability_warnings(&WarningContext {
             kind,
@@ -186,6 +200,7 @@ impl Discovery {
             },
             device_model,
             package_manager,
+            init_system,
             has_ubus: has("ubus"),
             has_uci: has("uci"),
             has_procd: self.exists("/sbin/procd"),
@@ -211,6 +226,36 @@ impl Discovery {
             .into_iter()
             .map(|directory| Path::new(directory).join(command))
             .any(|path| self.rooted(path.to_string_lossy().as_ref()).is_file())
+    }
+
+    fn detect_init_system(&self) -> InitSystem {
+        if self.exists("/sbin/procd") {
+            InitSystem::Procd
+        } else if self.exists("/run/systemd/system") || self.command_exists("systemctl") {
+            InitSystem::Systemd
+        } else if self.exists("/run/openrc") || self.command_exists("openrc") {
+            InitSystem::OpenRc
+        } else if self.exists("/etc/inittab") && self.exists("/bin/busybox") {
+            InitSystem::BusyBox
+        } else {
+            InitSystem::Unknown
+        }
+    }
+
+    fn detect_package_manager(&self) -> PackageManager {
+        if self.command_exists("apk") {
+            PackageManager::Apk
+        } else if self.command_exists("opkg") {
+            PackageManager::Opkg
+        } else if self.command_exists("apt-get") {
+            PackageManager::Apt
+        } else if self.command_exists("dnf") {
+            PackageManager::Dnf
+        } else if self.command_exists("pacman") {
+            PackageManager::Pacman
+        } else {
+            PackageManager::Unknown
+        }
     }
 }
 
@@ -372,9 +417,31 @@ mod tests {
         let iptables_fixture = Fixture::new();
         iptables_fixture.write("etc/os-release", "ID=debian\n");
         iptables_fixture.write("usr/sbin/iptables-save", "");
+        iptables_fixture.write("usr/bin/apt-get", "");
+        iptables_fixture.write("usr/bin/systemctl", "");
         let iptables = Discovery::new(&iptables_fixture.root).discover();
         assert_eq!(iptables.kind, PlatformKind::GenericLinux);
         assert_eq!(iptables.firewall.backend, FirewallBackend::Iptables);
+        assert_eq!(iptables.package_manager, PackageManager::Apt);
+        assert_eq!(iptables.init_system, InitSystem::Systemd);
+    }
+
+    #[test]
+    fn generic_linux_detects_openrc_and_busybox_init() {
+        let openrc_fixture = Fixture::new();
+        openrc_fixture.write("etc/os-release", "ID=alpine\n");
+        openrc_fixture.write("sbin/openrc", "");
+        openrc_fixture.write("sbin/apk", "");
+        let openrc = Discovery::new(&openrc_fixture.root).discover();
+        assert_eq!(openrc.init_system, InitSystem::OpenRc);
+        assert_eq!(openrc.package_manager, PackageManager::Apk);
+
+        let busybox_fixture = Fixture::new();
+        busybox_fixture.write("etc/os-release", "ID=buildroot\n");
+        busybox_fixture.write("etc/inittab", "::sysinit:/etc/init.d/rcS\n");
+        busybox_fixture.write("bin/busybox", "");
+        let busybox = Discovery::new(&busybox_fixture.root).discover();
+        assert_eq!(busybox.init_system, InitSystem::BusyBox);
     }
 
     struct Fixture {

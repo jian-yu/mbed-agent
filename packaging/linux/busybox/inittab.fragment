@@ -1,0 +1,2 @@
+# Install the launcher at /etc/init.d/mbed-agent, then merge this line into /etc/inittab.
+::respawn:/etc/init.d/mbed-agent

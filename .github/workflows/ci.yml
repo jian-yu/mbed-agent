@@ -24,3 +24,7 @@ jobs:
         run: cargo +1.85.1 build --release --locked -p mbed-agent
       - name: Validate OpenWrt service script
         run: sh -n openwrt/files/etc/init.d/mbed-agent
+      - name: Validate generic Linux service scripts
+        run: |
+          sh -n packaging/linux/openrc/mbed-agent
+          sh -n packaging/linux/busybox/mbed-agent.init
