@@ -199,6 +199,7 @@ pub struct StatusResponse {
     pub platform_kind: String,
     pub llm_enabled: bool,
     pub llm_provider: String,
+    pub llm_streaming: bool,
     pub degraded_reasons: Vec<String>,
 }
 

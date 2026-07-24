@@ -11,7 +11,7 @@ use agent_protocol::{
     ClientRequest, Command, CompletionResponse, DiagnosticHistoryEntry, ErrorCode,
     PROTOCOL_VERSION, ResponseData, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
 };
-use agent_provider::{CompletionRequest, OpenAiCompatibleProvider};
+use agent_provider::{CompletionRequest, OpenAiCompatibleConfig, OpenAiCompatibleProvider};
 use agent_store::{DiagnosticRecord, Store};
 use agent_tools::ToolRunner;
 use platform_linux::PlatformCapabilities;
@@ -132,15 +132,16 @@ fn build_llm_provider(
     if !config.llm.enabled {
         return Ok(None);
     }
-    let provider = OpenAiCompatibleProvider::new(
-        &config.llm.base_url,
-        config.llm.api_key.expose().to_owned(),
-        config.llm.model.clone(),
-        Duration::from_secs(config.llm.connect_timeout_secs),
-        Duration::from_secs(config.llm.request_timeout_secs),
-        config.llm.max_request_bytes,
-        config.llm.max_response_bytes,
-    )?;
+    let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+        base_url: config.llm.base_url.clone(),
+        api_key: config.llm.api_key.expose().to_owned(),
+        model: config.llm.model.clone(),
+        connect_timeout: Duration::from_secs(config.llm.connect_timeout_secs),
+        request_timeout: Duration::from_secs(config.llm.request_timeout_secs),
+        max_request_bytes: config.llm.max_request_bytes,
+        max_response_bytes: config.llm.max_response_bytes,
+        max_stream_event_bytes: config.llm.max_stream_event_bytes,
+    })?;
     Ok(Some(provider))
 }
 
@@ -262,6 +263,7 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 platform_kind: state.platform.kind.as_str().into(),
                 llm_enabled: state.llm.is_some(),
                 llm_provider: state.config.llm.provider.as_str().into(),
+                llm_streaming: state.config.llm.streaming,
                 degraded_reasons,
             })
         }
@@ -300,6 +302,7 @@ async fn handle_completion(id: String, prompt: String, state: &AppState) -> Serv
         system_prompt: state.config.llm.system_prompt.clone(),
         user_prompt: prompt,
         max_output_tokens: state.config.llm.max_output_tokens,
+        streaming: state.config.llm.streaming,
     };
     match provider.complete(request).await {
         Ok(completion) => ServerResponse::success(

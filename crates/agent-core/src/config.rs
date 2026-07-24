@@ -199,7 +199,9 @@ pub struct LlmConfig {
     pub request_timeout_secs: u64,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
+    pub max_stream_event_bytes: usize,
     pub max_output_tokens: u32,
+    pub streaming: bool,
 }
 
 impl Default for LlmConfig {
@@ -215,7 +217,9 @@ impl Default for LlmConfig {
             request_timeout_secs: 60,
             max_request_bytes: 32 * 1024,
             max_response_bytes: 128 * 1024,
+            max_stream_event_bytes: 16 * 1024,
             max_output_tokens: 1024,
+            streaming: true,
         }
     }
 }
@@ -226,10 +230,12 @@ impl LlmConfig {
             || self.request_timeout_secs == 0
             || self.max_request_bytes < 1024
             || self.max_response_bytes < 1024
+            || self.max_stream_event_bytes < 1024
+            || self.max_stream_event_bytes > self.max_response_bytes
             || self.max_output_tokens == 0
         {
             return Err(ConfigError::Validation(
-                "llm timeouts, token limit, and 1024-byte buffers must be non-zero".into(),
+                "llm timeouts, token limit, and 1024-byte buffers must be non-zero; stream events must fit the response limit".into(),
             ));
         }
         if self.enabled {
@@ -467,5 +473,12 @@ mod tests {
     fn llm_key_is_redacted_from_debug_output() {
         let secret = SecretString("do-not-log".into());
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn stream_event_must_fit_response_budget() {
+        let mut config = AgentConfig::default();
+        config.llm.max_stream_event_bytes = config.llm.max_response_bytes + 1;
+        assert!(config.validate().is_err());
     }
 }

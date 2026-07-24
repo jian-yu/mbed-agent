@@ -63,10 +63,13 @@ Then run:
 cargo run -p mbed-agent -- ask "Explain the likely WAN fault from this symptom"
 ```
 
-The daemon owns the provider credentials; the CLI never reads them. LLM traffic
-is non-streaming in this first slice, allows no HTTP redirects, and is bounded by
-`llm.max_request_bytes`, `llm.max_response_bytes`, the configured timeouts, and
-the runtime task limit. Prompts and responses are not written to SQLite.
+The daemon owns the provider credentials; the CLI never reads them. Provider
+traffic uses bounded SSE streaming by default, although the current local IPC
+returns one final completion to keep its protocol stable. Set `llm.streaming =
+false` for compatible endpoints that only implement JSON responses. HTTP
+redirects are disabled, and traffic is bounded by `llm.max_request_bytes`,
+`llm.max_response_bytes`, `llm.max_stream_event_bytes`, the configured timeouts,
+and the runtime task limit. Prompts and responses are not written to SQLite.
 
 Diagnostic commands never invoke a shell. Their executable names and arguments
 are compiled into a typed allowlist, and configuration limits each probe's time
