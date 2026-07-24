@@ -331,7 +331,8 @@ async fn run_read_only_agent(
         ModelMessage::Instruction(state.config.llm.system_prompt.clone()),
         ModelMessage::User(prompt),
     ];
-    let tools = vec![wan_diagnostic_tool()];
+    let tools = read_only_agent_tools();
+    let mut wan_snapshot = None;
     let mut prompt_tokens = None;
     let mut completion_tokens = None;
 
@@ -380,7 +381,7 @@ async fn run_read_only_agent(
             content: completion.text,
             tool_calls: completion.tool_calls,
         });
-        messages.push(execute_agent_tool(&call, request_id, step, state).await?);
+        messages.push(execute_agent_tool(&call, request_id, state, &mut wan_snapshot).await?);
     }
     Err(AgentLoopFailure::new(
         ErrorCode::ResourceExhausted,
@@ -395,22 +396,35 @@ const fn tool_step_available(step: u8, max_agent_steps: u8) -> bool {
 async fn execute_agent_tool(
     call: &ToolCall,
     request_id: &str,
-    step: u8,
     state: &AppState,
+    wan_snapshot: &mut Option<agent_protocol::WanDiagnosticReport>,
 ) -> Result<ModelMessage, AgentLoopFailure> {
-    if let Err(reason) = validate_wan_tool_call(call) {
+    let tool = validate_read_only_tool_call(call).map_err(|reason| {
         warn!(tool = %call.name, %reason, "model requested a rejected tool call");
-        return Err(AgentLoopFailure::new(
+        AgentLoopFailure::new(
             ErrorCode::Upstream,
             format!("model tool call was rejected: {reason}"),
-        ));
+        )
+    })?;
+    if wan_snapshot.is_none() {
+        let report = execute_agent_wan_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-tool-snapshot"),
+            false,
+            &report,
+            state,
+        )
+        .await;
+        *wan_snapshot = Some(report);
     }
-    let report = execute_agent_wan_diagnostic(state)
-        .await
-        .map_err(agent_tool_failure)?;
-    persist_diagnostic(&format!("{request_id}-tool-{step}"), false, &report, state).await;
-    let content = bounded_wan_observation(&report, state.config.llm.max_tool_context_bytes)
-        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    let report = wan_snapshot.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(ErrorCode::Internal, "WAN snapshot cache is unavailable")
+    })?;
+    let content =
+        bounded_tool_observation(tool, report, state.config.llm.max_tool_context_bytes)
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
     Ok(ModelMessage::Tool {
         tool_call_id: call.id.clone(),
         content,
@@ -434,22 +448,71 @@ fn agent_tool_failure(error: AgentToolError) -> AgentLoopFailure {
     }
 }
 
-fn wan_diagnostic_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "diagnose_wan".into(),
-        description: "Collect bounded, read-only WAN link, address, route, DNS, and firewall evidence. This tool never changes device state and never performs active network probes.".into(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOnlyAgentTool {
+    DiagnoseWan,
+    InspectDefaultRoutes,
+    InspectDns,
+    InspectWanFirewall,
+}
+
+impl ReadOnlyAgentTool {
+    const ALL: [Self; 4] = [
+        Self::DiagnoseWan,
+        Self::InspectDefaultRoutes,
+        Self::InspectDns,
+        Self::InspectWanFirewall,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DiagnoseWan => "diagnose_wan",
+            Self::InspectDefaultRoutes => "inspect_default_routes",
+            Self::InspectDns => "inspect_dns",
+            Self::InspectWanFirewall => "inspect_wan_firewall",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::DiagnoseWan => {
+                "Collect a bounded, passive WAN diagnosis covering link, address, routes, DNS, and firewall."
+            }
+            Self::InspectDefaultRoutes => {
+                "Inspect normalized IPv4 and IPv6 WAN default routes without changing the routing table."
+            }
+            Self::InspectDns => {
+                "Inspect normalized WAN DNS servers and passive DNS readiness without sending network probes."
+            }
+            Self::InspectWanFirewall => {
+                "Inspect the detected firewall backend and normalized WAN zone policies without changing rules."
+            }
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.name() == name)
     }
 }
 
-fn validate_wan_tool_call(call: &ToolCall) -> Result<(), &'static str> {
-    if call.name != "diagnose_wan" {
-        return Err("tool name is not in the local allowlist");
-    }
+fn read_only_agent_tools() -> Vec<ToolDefinition> {
+    ReadOnlyAgentTool::ALL
+        .into_iter()
+        .map(|tool| ToolDefinition {
+            name: tool.name().into(),
+            description: tool.description().into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        })
+        .collect()
+}
+
+fn validate_read_only_tool_call(call: &ToolCall) -> Result<ReadOnlyAgentTool, &'static str> {
+    let tool = ReadOnlyAgentTool::from_name(&call.name)
+        .ok_or("tool name is not in the local allowlist")?;
     if call.arguments.len() > 256 {
         return Err("tool arguments exceed the local 256-byte limit");
     }
@@ -459,9 +522,9 @@ fn validate_wan_tool_call(call: &ToolCall) -> Result<(), &'static str> {
         return Err("arguments must be a JSON object");
     };
     if !arguments.is_empty() {
-        return Err("diagnose_wan accepts no arguments");
+        return Err("read-only inspection tools accept no arguments");
     }
-    Ok(())
+    Ok(tool)
 }
 
 fn add_usage(total: &mut Option<u64>, value: Option<u64>) {
@@ -494,33 +557,102 @@ async fn execute_agent_wan_diagnostic(
     }
 }
 
-fn bounded_wan_observation(
+#[derive(serde::Serialize)]
+struct WanObservation<'a> {
+    interface: &'a str,
+    summary: &'a agent_protocol::WanSummary,
+    findings: &'a [String],
+    complete: bool,
+}
+
+#[derive(serde::Serialize)]
+struct RouteObservation<'a> {
+    interface: &'a str,
+    assessment: agent_protocol::WanAssessment,
+    status_source: &'a Option<String>,
+    default_routes: &'a [agent_protocol::WanRoute],
+}
+
+#[derive(serde::Serialize)]
+struct DnsObservation<'a> {
+    interface: &'a str,
+    assessment: agent_protocol::WanAssessment,
+    dns_servers: &'a [String],
+    dns_reachable: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct FirewallObservation<'a> {
+    interface: &'a str,
+    assessment: agent_protocol::WanAssessment,
+    firewall_backend: &'a str,
+    firewall_zone: &'a Option<agent_protocol::FirewallZoneSummary>,
+}
+
+fn bounded_tool_observation(
+    tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
     limit: usize,
 ) -> Result<String, String> {
-    #[derive(serde::Serialize)]
-    struct WanObservation<'a> {
-        interface: &'a str,
-        summary: &'a agent_protocol::WanSummary,
-        findings: &'a [String],
-        complete: bool,
+    match tool {
+        ReadOnlyAgentTool::DiagnoseWan => encode_tool_observation(
+            tool.name(),
+            &WanObservation {
+                interface: &report.interface,
+                summary: &report.summary,
+                findings: &report.findings,
+                complete: report.complete,
+            },
+            limit,
+        ),
+        ReadOnlyAgentTool::InspectDefaultRoutes => encode_tool_observation(
+            tool.name(),
+            &RouteObservation {
+                interface: &report.interface,
+                assessment: report.summary.assessment,
+                status_source: &report.summary.status_source,
+                default_routes: &report.summary.default_routes,
+            },
+            limit,
+        ),
+        ReadOnlyAgentTool::InspectDns => encode_tool_observation(
+            tool.name(),
+            &DnsObservation {
+                interface: &report.interface,
+                assessment: report.summary.assessment,
+                dns_servers: &report.summary.dns_servers,
+                dns_reachable: report.summary.dns_reachable,
+            },
+            limit,
+        ),
+        ReadOnlyAgentTool::InspectWanFirewall => encode_tool_observation(
+            tool.name(),
+            &FirewallObservation {
+                interface: &report.interface,
+                assessment: report.summary.assessment,
+                firewall_backend: &report.summary.firewall_backend,
+                firewall_zone: &report.summary.firewall_zone,
+            },
+            limit,
+        ),
     }
-    let observation = WanObservation {
-        interface: &report.interface,
-        summary: &report.summary,
-        findings: &report.findings,
-        complete: report.complete,
-    };
-    let encoded = serde_json::to_vec(&observation)
-        .map_err(|error| format!("failed to encode WAN observation: {error}"))?;
+}
+
+fn encode_tool_observation<T: serde::Serialize>(
+    tool_name: &str,
+    observation: &T,
+    limit: usize,
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(observation)
+        .map_err(|error| format!("failed to encode {tool_name} observation: {error}"))?;
     if encoded.len() > limit {
         return Err(format!(
-            "WAN observation is {} bytes, exceeding llm.max_tool_context_bytes {limit}",
+            "{tool_name} observation is {} bytes, exceeding llm.max_tool_context_bytes {limit}",
             encoded.len()
         ));
     }
     String::from_utf8(encoded)
-        .map_err(|error| format!("WAN observation was not valid UTF-8: {error}"))
+        .map_err(|error| format!("{tool_name} observation was not valid UTF-8: {error}"))
 }
 
 async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> ServerResponse {
@@ -681,33 +813,48 @@ mod tests {
     }
 
     #[test]
-    fn wan_tool_call_requires_allowlisted_name_and_empty_object() {
-        let valid = ToolCall {
+    fn read_only_tool_calls_require_allowlisted_names_and_empty_objects() {
+        for tool in ReadOnlyAgentTool::ALL {
+            let valid = ToolCall {
+                id: "call-1".into(),
+                name: tool.name().into(),
+                arguments: "{}".into(),
+            };
+            assert_eq!(validate_read_only_tool_call(&valid), Ok(tool));
+        }
+
+        let mut invalid = ToolCall {
             id: "call-1".into(),
-            name: "diagnose_wan".into(),
+            name: "shell".into(),
             arguments: "{}".into(),
         };
-        assert!(validate_wan_tool_call(&valid).is_ok());
-
-        let mut invalid = valid.clone();
-        invalid.name = "shell".into();
         assert_eq!(
-            validate_wan_tool_call(&invalid),
+            validate_read_only_tool_call(&invalid),
             Err("tool name is not in the local allowlist")
         );
 
-        invalid.name = "diagnose_wan".into();
+        invalid.name = "inspect_dns".into();
         invalid.arguments = r#"{"active":true}"#.into();
         assert_eq!(
-            validate_wan_tool_call(&invalid),
-            Err("diagnose_wan accepts no arguments")
+            validate_read_only_tool_call(&invalid),
+            Err("read-only inspection tools accept no arguments")
         );
 
         invalid.arguments = format!(r#"{{"padding":"{}"}}"#, "x".repeat(300));
         assert_eq!(
-            validate_wan_tool_call(&invalid),
+            validate_read_only_tool_call(&invalid),
             Err("tool arguments exceed the local 256-byte limit")
         );
+    }
+
+    #[test]
+    fn read_only_registry_exposes_closed_schemas() {
+        let tools = read_only_agent_tools();
+        assert_eq!(tools.len(), ReadOnlyAgentTool::ALL.len());
+        for tool in tools {
+            assert_eq!(tool.parameters["type"], "object");
+            assert_eq!(tool.parameters["additionalProperties"], false);
+        }
     }
 
     #[test]
@@ -727,16 +874,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_executes_one_passive_wan_tool() {
+    async fn agent_loop_reuses_one_snapshot_across_multiple_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let server = tokio::spawn(async move {
             let (mut first, _) = listener.accept().await.expect("first accept");
             let first_request = read_http_request(&mut first).await;
             assert!(first_request.contains("\"name\":\"diagnose_wan\""));
+            assert!(first_request.contains("\"name\":\"inspect_default_routes\""));
+            assert!(first_request.contains("\"name\":\"inspect_dns\""));
+            assert!(first_request.contains("\"name\":\"inspect_wan_firewall\""));
             write_json_response(
                 &mut first,
-                r#"{"model":"mock","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"diagnose_wan","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":2}}"#,
+                r#"{"model":"mock","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"inspect_dns","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":2}}"#,
             )
             .await;
 
@@ -744,9 +894,20 @@ mod tests {
             let second_request = read_http_request(&mut second).await;
             assert!(second_request.contains("\"role\":\"tool\""));
             assert!(second_request.contains("\"tool_call_id\":\"call_1\""));
+            assert!(second_request.contains("dns_servers"));
             write_json_response(
                 &mut second,
-                r#"{"model":"mock","choices":[{"message":{"content":"WAN analyzed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}}"#,
+                r#"{"model":"mock","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_2","type":"function","function":{"name":"inspect_default_routes","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":2}}"#,
+            )
+            .await;
+
+            let (mut third, _) = listener.accept().await.expect("third accept");
+            let third_request = read_http_request(&mut third).await;
+            assert!(third_request.contains("\"tool_call_id\":\"call_2\""));
+            assert!(third_request.contains("default_routes"));
+            write_json_response(
+                &mut third,
+                r#"{"model":"mock","choices":[{"message":{"content":"WAN analyzed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#,
             )
             .await;
         });
@@ -759,7 +920,7 @@ mod tests {
         let mut config = AgentConfig::default();
         config.storage.path = root.join("agent.db");
         config.llm.streaming = false;
-        config.llm.max_agent_steps = 3;
+        config.llm.max_agent_steps = 4;
         let budget = TmpBudget::new(config.storage.clone()).expect("budget");
         let store = Arc::new(
             Store::open(&config.storage.path, config.storage.max_database_bytes).expect("store"),
@@ -792,8 +953,16 @@ mod tests {
             panic!("expected completion");
         };
         assert_eq!(completion.text, "WAN analyzed");
-        assert_eq!(completion.prompt_tokens, Some(12));
-        assert_eq!(completion.completion_tokens, Some(5));
+        assert_eq!(completion.prompt_tokens, Some(22));
+        assert_eq!(completion.completion_tokens, Some(7));
+        assert_eq!(
+            state
+                .store
+                .diagnostic_history(10)
+                .expect("diagnostic history")
+                .len(),
+            1
+        );
         server.await.expect("server");
         drop(state);
         fs::remove_dir_all(root).expect("remove test runtime");
