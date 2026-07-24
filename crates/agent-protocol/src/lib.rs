@@ -18,6 +18,7 @@ pub enum Command {
     Capabilities,
     DiagnoseWan { active: bool },
     DiagnoseDns,
+    DiagnoseDhcp,
     DiagnoseRoutes,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
@@ -70,6 +71,7 @@ pub enum ResponseData {
     Capabilities(Value),
     WanDiagnostic(Box<WanDiagnosticReport>),
     DnsDiagnostic(Box<DnsDiagnosticReport>),
+    DhcpDiagnostic(Box<DhcpDiagnosticReport>),
     RouteDiagnostic(Box<RouteDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
@@ -136,6 +138,52 @@ pub struct DnsSummary {
     pub default_routes: Vec<WanRoute>,
     pub dns_servers: Vec<String>,
     pub dns_reachable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DhcpDiagnosticReport {
+    pub interface: String,
+    pub summary: DhcpSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DhcpSummary {
+    pub assessment: DhcpAssessment,
+    pub status_source: Option<String>,
+    pub protocol: Option<String>,
+    pub pending: Option<bool>,
+    pub device: Option<String>,
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DhcpAssessment {
+    LeaseReady,
+    Negotiating,
+    LeaseMissing,
+    NotDhcp,
+    LinkDown,
+    InterfaceUnavailable,
+    InsufficientEvidence,
+}
+
+impl DhcpAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseReady => "lease_ready",
+            Self::Negotiating => "negotiating",
+            Self::LeaseMissing => "lease_missing",
+            Self::NotDhcp => "not_dhcp",
+            Self::LinkDown => "link_down",
+            Self::InterfaceUnavailable => "interface_unavailable",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -320,6 +368,7 @@ mod tests {
         for command in [
             Command::DiagnoseWan { active: true },
             Command::DiagnoseDns,
+            Command::DiagnoseDhcp,
             Command::DiagnoseRoutes,
         ] {
             let request = ClientRequest {

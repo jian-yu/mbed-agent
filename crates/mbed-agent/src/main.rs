@@ -73,6 +73,11 @@ enum DiagnoseTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Inspect passive DHCP protocol, negotiation, and address state.
+    Dhcp {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Inspect WAN addressing and normalized IPv4/IPv6 default routes.
     Routes {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
@@ -114,6 +119,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Diagnose {
             target: DiagnoseTarget::Dns { socket },
         } => run_client(&socket, Command::DiagnoseDns).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Dhcp { socket },
+        } => run_client(&socket, Command::DiagnoseDhcp).await,
         CliCommand::Diagnose {
             target: DiagnoseTarget::Routes { socket },
         } => run_client(&socket, Command::DiagnoseRoutes).await,

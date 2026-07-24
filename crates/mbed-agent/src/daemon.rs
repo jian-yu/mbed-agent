@@ -284,6 +284,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseDns => {
             return handle_dns_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseDhcp => {
+            return handle_dhcp_diagnosis(request.id, state).await;
+        }
         Command::DiagnoseRoutes => {
             return handle_route_diagnosis(request.id, state).await;
         }
@@ -509,7 +512,7 @@ async fn execute_agent_tool(
             &format!("{request_id}-tool-snapshot"),
             "wan",
             false,
-            report.summary.assessment,
+            report.summary.assessment.as_str(),
             &report.summary,
             state,
         )
@@ -550,14 +553,16 @@ enum ReadOnlyAgentTool {
     DiagnoseWan,
     InspectDefaultRoutes,
     InspectDns,
+    InspectDhcp,
     InspectWanFirewall,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
+        Self::InspectDhcp,
         Self::InspectWanFirewall,
     ];
 
@@ -566,6 +571,7 @@ impl ReadOnlyAgentTool {
             Self::DiagnoseWan => "diagnose_wan",
             Self::InspectDefaultRoutes => "inspect_default_routes",
             Self::InspectDns => "inspect_dns",
+            Self::InspectDhcp => "inspect_dhcp",
             Self::InspectWanFirewall => "inspect_wan_firewall",
         }
     }
@@ -580,6 +586,9 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectDns => {
                 "Inspect normalized WAN DNS servers and passive DNS readiness without sending network probes."
+            }
+            Self::InspectDhcp => {
+                "Inspect normalized WAN protocol, DHCP negotiation state, and address evidence without renewing a lease."
             }
             Self::InspectWanFirewall => {
                 "Inspect the detected firewall backend and normalized WAN zone policies without changing rules."
@@ -679,6 +688,19 @@ struct DnsObservation<'a> {
 }
 
 #[derive(serde::Serialize)]
+struct DhcpObservation<'a> {
+    interface: &'a str,
+    wan_assessment: agent_protocol::WanAssessment,
+    status_source: &'a Option<String>,
+    protocol: &'a Option<String>,
+    pending: Option<bool>,
+    up: Option<bool>,
+    available: Option<bool>,
+    device: &'a Option<String>,
+    addresses: &'a [String],
+}
+
+#[derive(serde::Serialize)]
 struct FirewallObservation<'a> {
     interface: &'a str,
     assessment: agent_protocol::WanAssessment,
@@ -719,6 +741,21 @@ fn bounded_tool_observation(
                 assessment: report.summary.assessment,
                 dns_servers: &report.summary.dns_servers,
                 dns_reachable: report.summary.dns_reachable,
+            },
+            limit,
+        ),
+        ReadOnlyAgentTool::InspectDhcp => encode_tool_observation(
+            tool.name(),
+            &DhcpObservation {
+                interface: &report.interface,
+                wan_assessment: report.summary.assessment,
+                status_source: &report.summary.status_source,
+                protocol: &report.summary.protocol,
+                pending: report.summary.pending,
+                up: report.summary.up,
+                available: report.summary.available,
+                device: &report.summary.device,
+                addresses: &report.summary.addresses,
             },
             limit,
         ),
@@ -786,7 +823,7 @@ async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> Ser
         &id,
         "wan",
         active,
-        report.summary.assessment,
+        report.summary.assessment.as_str(),
         &report.summary,
         state,
     )
@@ -828,12 +865,54 @@ async fn handle_dns_diagnosis(id: String, state: &AppState) -> ServerResponse {
         &id,
         "dns",
         false,
-        report.summary.assessment,
+        report.summary.assessment.as_str(),
         &report.summary,
         state,
     )
     .await;
     ServerResponse::success(id, ResponseData::DnsDiagnostic(Box::new(report)))
+}
+
+async fn handle_dhcp_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_dhcp(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("DHCP diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "DHCP diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "dhcp",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::DhcpDiagnostic(Box::new(report)))
 }
 
 async fn handle_route_diagnosis(id: String, state: &AppState) -> ServerResponse {
@@ -870,7 +949,7 @@ async fn handle_route_diagnosis(id: String, state: &AppState) -> ServerResponse 
         &id,
         "routes",
         false,
-        report.summary.assessment,
+        report.summary.assessment.as_str(),
         &report.summary,
         state,
     )
@@ -882,7 +961,7 @@ async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
     active: bool,
-    assessment: agent_protocol::WanAssessment,
+    assessment: &str,
     summary: &T,
     state: &AppState,
 ) {
@@ -890,7 +969,7 @@ async fn persist_diagnostic<T: serde::Serialize>(
         id: id.into(),
         kind: kind.into(),
         active,
-        assessment: assessment.as_str().into(),
+        assessment: assessment.into(),
         payload: serde_json::to_vec(summary).unwrap_or_default(),
         created_at: 0,
     };
@@ -1150,6 +1229,7 @@ mod tests {
             assert!(first_request.contains("\"name\":\"diagnose_wan\""));
             assert!(first_request.contains("\"name\":\"inspect_default_routes\""));
             assert!(first_request.contains("\"name\":\"inspect_dns\""));
+            assert!(first_request.contains("\"name\":\"inspect_dhcp\""));
             assert!(first_request.contains("\"name\":\"inspect_wan_firewall\""));
             write_json_response(
                 &mut first,

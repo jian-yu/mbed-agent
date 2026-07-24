@@ -6,8 +6,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use agent_protocol::{
-    DnsDiagnosticReport, DnsSummary, FirewallZoneSummary, ProbeEvidence, ProbeStatus,
-    RouteDiagnosticReport, RouteSummary, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
+    DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
+    FirewallZoneSummary, ProbeEvidence, ProbeStatus, RouteDiagnosticReport, RouteSummary,
+    WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -98,6 +99,21 @@ impl ToolRunner {
         Ok(build_dns_report(evidence, platform))
     }
 
+    /// Runs the deterministic, passive DHCP state runbook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_dhcp(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<DhcpDiagnosticReport> {
+        let evidence = self
+            .collect_passive(platform, DiagnosticScope::Dhcp)
+            .await?;
+        Ok(build_dhcp_report(evidence, platform))
+    }
+
     /// Runs the deterministic, passive default-route prerequisite runbook.
     ///
     /// # Errors
@@ -125,13 +141,13 @@ impl ToolRunner {
         for probe in [Probe::IpLink, Probe::IpAddress, Probe::IpRoute] {
             evidence.push(self.run(probe).await?);
         }
-        if scope != DiagnosticScope::Dns {
+        if matches!(scope, DiagnosticScope::Wan | DiagnosticScope::Routes) {
             evidence.push(self.run(Probe::IpRule).await?);
         }
         if scope == DiagnosticScope::Wan && platform.kind == PlatformKind::OpenWrt {
             evidence.push(self.run(Probe::UciFirewall).await?);
         }
-        if scope != DiagnosticScope::Routes {
+        if matches!(scope, DiagnosticScope::Wan | DiagnosticScope::Dns) {
             evidence
                 .push(self.read_file("network.dns.openwrt", "/tmp/resolv.conf.d/resolv.conf.auto"));
             evidence.push(self.read_file(
@@ -279,6 +295,7 @@ enum Probe {
 enum DiagnosticScope {
     Wan,
     Dns,
+    Dhcp,
     Routes,
 }
 
@@ -553,6 +570,22 @@ fn parse_ip_addresses(output: &str, summary: &mut WanSummary) {
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or_else(|| if local.contains(':') { 128 } else { 32 });
             push_unique(&mut summary.addresses, format!("{local}/{prefix}"));
+            let dynamic = address
+                .get("dynamic")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || address
+                    .get("flags")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|flags| {
+                        flags.iter().any(|flag| {
+                            flag.as_str()
+                                .is_some_and(|flag| flag.eq_ignore_ascii_case("dynamic"))
+                        })
+                    });
+            if dynamic && summary.protocol.is_none() {
+                summary.protocol = Some("dhcp-inferred".into());
+            }
         }
     }
 }
@@ -845,6 +878,67 @@ fn build_dns_report(
     }
 }
 
+fn build_dhcp_report(
+    evidence: Vec<ProbeEvidence>,
+    platform: &PlatformCapabilities,
+) -> DhcpDiagnosticReport {
+    let wan = normalize(&evidence, platform);
+    let assessment = assess_dhcp(&wan);
+    let summary = DhcpSummary {
+        assessment,
+        status_source: wan.status_source,
+        protocol: wan.protocol,
+        pending: wan.pending,
+        device: wan.device,
+        addresses: wan.addresses,
+    };
+    let primary = match assessment {
+        DhcpAssessment::LeaseReady => {
+            "a DHCP-derived WAN address is present; lease renewal was not attempted"
+        }
+        DhcpAssessment::Negotiating => "the WAN DHCP client is still negotiating a lease",
+        DhcpAssessment::LeaseMissing => "the WAN is configured for DHCP but has no leased address",
+        DhcpAssessment::NotDhcp => "the WAN protocol is not DHCP",
+        DhcpAssessment::LinkDown => "the WAN link or logical interface is down",
+        DhcpAssessment::InterfaceUnavailable => "the WAN interface is unavailable",
+        DhcpAssessment::InsufficientEvidence => {
+            "DHCP state evidence is insufficient for a conclusion"
+        }
+    };
+    let mut findings = vec![primary.into()];
+    match (platform.kind, summary.status_source.as_deref()) {
+        (PlatformKind::OpenWrt, Some("kernel")) => {
+            findings.push("OpenWrt WAN status is unavailable; kernel evidence was used".into());
+        }
+        (PlatformKind::OpenWrt, None) => {
+            findings.push("OpenWrt and kernel WAN status evidence are unavailable".into());
+        }
+        (_, None) if summary.protocol.is_none() => findings
+            .push("kernel evidence does not identify a dynamic address or WAN protocol".into()),
+        (_, None) => findings.push(
+            "WAN status source is unavailable; DHCP was inferred from kernel address metadata"
+                .into(),
+        ),
+        _ => {}
+    }
+    if summary.protocol.as_deref() == Some("dhcp-inferred") {
+        findings.push(
+            "DHCP was inferred from a kernel dynamic-address flag; no client lease file was read"
+                .into(),
+        );
+    }
+    if evidence.iter().any(|item| item.truncated) {
+        findings.push("one or more probe outputs reached the configured byte limit".into());
+    }
+    DhcpDiagnosticReport {
+        interface: WAN_INTERFACE.into(),
+        summary,
+        evidence,
+        findings,
+        complete: assessment != DhcpAssessment::InsufficientEvidence,
+    }
+}
+
 fn build_route_report(
     evidence: Vec<ProbeEvidence>,
     platform: &PlatformCapabilities,
@@ -903,6 +997,26 @@ fn assess_dns(summary: &WanSummary) -> WanAssessment {
         WanAssessment::DnsProbeFailed
     } else {
         WanAssessment::PrerequisitesReady
+    }
+}
+
+fn assess_dhcp(summary: &WanSummary) -> DhcpAssessment {
+    if summary.available == Some(false) {
+        return DhcpAssessment::InterfaceUnavailable;
+    }
+    match summary.protocol.as_deref() {
+        Some("dhcp" | "dhcpv6" | "dhcp-inferred") => {
+            if summary.pending == Some(true) {
+                DhcpAssessment::Negotiating
+            } else if summary.addresses.is_empty() {
+                DhcpAssessment::LeaseMissing
+            } else {
+                DhcpAssessment::LeaseReady
+            }
+        }
+        Some(_) => DhcpAssessment::NotDhcp,
+        None if summary.up == Some(false) => DhcpAssessment::LinkDown,
+        None => DhcpAssessment::InsufficientEvidence,
     }
 }
 
@@ -1056,6 +1170,19 @@ mod tests {
         );
         assert_eq!(summary.dns_servers, ["192.0.2.53"]);
         assert_eq!(summary.firewall_backend, "fw3/iptables");
+    }
+
+    #[test]
+    fn dhcp_assessment_does_not_misclassify_pppoe() {
+        let evidence = vec![ok_evidence(
+            "openwrt.interface.wan",
+            r#"{
+                "up":true,"available":true,"pending":false,"proto":"pppoe",
+                "l3_device":"pppoe-wan","ipv4-address":[{"address":"192.0.2.10","mask":32}]
+            }"#,
+        )];
+        let summary = normalize(&evidence, &platform(FirewallBackend::Fw4));
+        assert_eq!(assess_dhcp(&summary), DhcpAssessment::NotDhcp);
     }
 
     #[test]
@@ -1250,6 +1377,69 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
         assert!(!report.evidence.iter().any(|item| {
             item.probe.starts_with("network.dns.") || item.probe.starts_with("openwrt.firewall.")
         }));
+    }
+
+    #[tokio::test]
+    async fn openwrt_dhcp_runbook_reports_negotiation_without_renewing() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ubus",
+            r#"#!/bin/sh
+printf '%s\n' '{"up":false,"available":true,"pending":true,"proto":"dhcp","l3_device":"wan0","ipv4-address":[],"route":[]}'
+"#,
+        );
+        fixture.executable("bin/ip", "#!/bin/sh\nprintf '%s\\n' '[]'\n");
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(3),
+            max_output_bytes: 4096,
+        };
+        let report = runner
+            .diagnose_dhcp(&platform(FirewallBackend::Fw4))
+            .await
+            .expect("OpenWrt DHCP diagnosis");
+        assert_eq!(report.summary.assessment, DhcpAssessment::Negotiating);
+        assert_eq!(report.summary.protocol.as_deref(), Some("dhcp"));
+        assert_eq!(report.summary.pending, Some(true));
+        assert!(report.complete);
+        assert!(!report.evidence.iter().any(|item| {
+            item.probe.starts_with("network.dns.")
+                || item.probe == "network.route.rules"
+                || item.probe.starts_with("openwrt.firewall.")
+        }));
+    }
+
+    #[tokio::test]
+    async fn generic_linux_dhcp_runbook_infers_dynamic_kernel_address() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ip",
+            r#"#!/bin/sh
+printf '%s\n' '[{"dst":"default","gateway":"198.51.100.1","dev":"eth0","ifname":"eth0","operstate":"UP","addr_info":[{"local":"198.51.100.20","prefixlen":24,"dynamic":true}]}]'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(3),
+            max_output_bytes: 4096,
+        };
+        let mut generic = platform(FirewallBackend::Nftables);
+        generic.kind = PlatformKind::GenericLinux;
+        let report = runner
+            .diagnose_dhcp(&generic)
+            .await
+            .expect("generic DHCP diagnosis");
+        assert_eq!(report.summary.assessment, DhcpAssessment::LeaseReady);
+        assert_eq!(report.summary.protocol.as_deref(), Some("dhcp-inferred"));
+        assert_eq!(report.summary.addresses, ["198.51.100.20/24"]);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("inferred"))
+        );
     }
 
     #[tokio::test]
