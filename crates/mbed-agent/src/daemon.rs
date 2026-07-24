@@ -281,6 +281,12 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseWan { active } => {
             return handle_wan_diagnosis(request.id, active, state).await;
         }
+        Command::DiagnoseDns => {
+            return handle_dns_diagnosis(request.id, state).await;
+        }
+        Command::DiagnoseRoutes => {
+            return handle_route_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -501,8 +507,10 @@ async fn execute_agent_tool(
             .map_err(agent_tool_failure)?;
         persist_diagnostic(
             &format!("{request_id}-tool-snapshot"),
+            "wan",
             false,
-            &report,
+            report.summary.assessment,
+            &report.summary,
             state,
         )
         .await;
@@ -774,22 +782,116 @@ async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> Ser
             );
         }
     };
-    persist_diagnostic(&id, active, &report, state).await;
+    persist_diagnostic(
+        &id,
+        "wan",
+        active,
+        report.summary.assessment,
+        &report.summary,
+        state,
+    )
+    .await;
     ServerResponse::success(id, ResponseData::WanDiagnostic(Box::new(report)))
 }
 
-async fn persist_diagnostic(
+async fn handle_dns_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_dns(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("DNS diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "DNS diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "dns",
+        false,
+        report.summary.assessment,
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::DnsDiagnostic(Box::new(report)))
+}
+
+async fn handle_route_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_routes(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("route diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "route diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "routes",
+        false,
+        report.summary.assessment,
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::RouteDiagnostic(Box::new(report)))
+}
+
+async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
+    kind: &str,
     active: bool,
-    report: &agent_protocol::WanDiagnosticReport,
+    assessment: agent_protocol::WanAssessment,
+    summary: &T,
     state: &AppState,
 ) {
     let record = DiagnosticRecord {
         id: id.into(),
-        kind: "wan".into(),
+        kind: kind.into(),
         active,
-        assessment: report.summary.assessment.as_str().into(),
-        payload: serde_json::to_vec(&report.summary).unwrap_or_default(),
+        assessment: assessment.as_str().into(),
+        payload: serde_json::to_vec(summary).unwrap_or_default(),
         created_at: 0,
     };
     let store = Arc::clone(&state.store);

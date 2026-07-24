@@ -68,6 +68,16 @@ enum DiagnoseTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Inspect DNS configuration and its passive network prerequisites.
+    Dns {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Inspect WAN addressing and normalized IPv4/IPv6 default routes.
+    Routes {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Show volatile diagnostic summaries from this boot.
     History {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
@@ -101,6 +111,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Diagnose {
             target: DiagnoseTarget::Wan { active, socket },
         } => run_client(&socket, Command::DiagnoseWan { active }).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Dns { socket },
+        } => run_client(&socket, Command::DiagnoseDns).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Routes { socket },
+        } => run_client(&socket, Command::DiagnoseRoutes).await,
         CliCommand::Diagnose {
             target: DiagnoseTarget::History { limit, socket },
         } => run_client(&socket, Command::DiagnosticHistory { limit }).await,

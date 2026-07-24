@@ -15,10 +15,10 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
   OpenWrt-only ubus/UCI probes.
-- A deterministic `diagnose wan` runbook that gathers bounded, read-only ubus,
-  interface, route, resolver, and firewall-backend evidence, normalizes it into
-  one stable WAN model, including the UCI WAN firewall zone, and reports the
-  first failed network prerequisite.
+- Deterministic `diagnose wan`, `diagnose dns`, and `diagnose routes` runbooks.
+  They gather bounded, read-only evidence and normalize it across OpenWrt and
+  generic Linux. Focused DNS and route runs execute only their required
+  collectors; the WAN run also includes firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
@@ -58,6 +58,8 @@ cargo run -p mbed-agent -- status
 cargo run -p mbed-agent -- capabilities
 cargo run -p mbed-agent -- diagnose wan
 cargo run -p mbed-agent -- diagnose wan --active
+cargo run -p mbed-agent -- diagnose dns
+cargo run -p mbed-agent -- diagnose routes
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 ```
@@ -93,6 +95,9 @@ and retained output as well as the number and total duration of diagnostic tasks
 Active mode is explicit and runs only after passive WAN prerequisites pass. It
 uses a validated route gateway plus fixed public-IP and DNS canaries; an ICMP
 failure is reported as a failed probe, not asserted to be the root cause.
+The focused DNS and route commands are passive: `diagnose dns` reports resolver
+configuration and its link/address/route prerequisites but does not claim that
+an external DNS query succeeded.
 
 Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
 probe output is not persisted. History is bounded by configurable record-count

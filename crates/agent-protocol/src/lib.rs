@@ -17,6 +17,8 @@ pub enum Command {
     Status,
     Capabilities,
     DiagnoseWan { active: bool },
+    DiagnoseDns,
+    DiagnoseRoutes,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -67,6 +69,8 @@ pub enum ResponseData {
     Status(StatusResponse),
     Capabilities(Value),
     WanDiagnostic(Box<WanDiagnosticReport>),
+    DnsDiagnostic(Box<DnsDiagnosticReport>),
+    RouteDiagnostic(Box<RouteDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -112,6 +116,44 @@ pub struct WanDiagnosticReport {
     pub evidence: Vec<ProbeEvidence>,
     pub findings: Vec<String>,
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsDiagnosticReport {
+    pub interface: String,
+    pub summary: DnsSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsSummary {
+    pub assessment: WanAssessment,
+    pub status_source: Option<String>,
+    pub device: Option<String>,
+    pub addresses: Vec<String>,
+    pub default_routes: Vec<WanRoute>,
+    pub dns_servers: Vec<String>,
+    pub dns_reachable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteDiagnosticReport {
+    pub interface: String,
+    pub summary: RouteSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteSummary {
+    pub assessment: WanAssessment,
+    pub status_source: Option<String>,
+    pub device: Option<String>,
+    pub addresses: Vec<String>,
+    pub default_routes: Vec<WanRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,14 +317,20 @@ mod tests {
 
     #[test]
     fn command_round_trip_is_stable() {
-        let request = ClientRequest {
-            protocol_version: PROTOCOL_VERSION,
-            id: "test-1".into(),
-            command: Command::DiagnoseWan { active: true },
-        };
-
-        let encoded = serde_json::to_string(&request).expect("serialize request");
-        let decoded: ClientRequest = serde_json::from_str(&encoded).expect("deserialize request");
-        assert_eq!(decoded, request);
+        for command in [
+            Command::DiagnoseWan { active: true },
+            Command::DiagnoseDns,
+            Command::DiagnoseRoutes,
+        ] {
+            let request = ClientRequest {
+                protocol_version: PROTOCOL_VERSION,
+                id: "test-1".into(),
+                command,
+            };
+            let encoded = serde_json::to_string(&request).expect("serialize request");
+            let decoded: ClientRequest =
+                serde_json::from_str(&encoded).expect("deserialize request");
+            assert_eq!(decoded, request);
+        }
     }
 }

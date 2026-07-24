@@ -6,8 +6,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use agent_protocol::{
-    FirewallZoneSummary, ProbeEvidence, ProbeStatus, WanAssessment, WanDiagnosticReport, WanRoute,
-    WanSummary,
+    DnsDiagnosticReport, DnsSummary, FirewallZoneSummary, ProbeEvidence, ProbeStatus,
+    RouteDiagnosticReport, RouteSummary, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -50,33 +50,7 @@ impl ToolRunner {
         platform: &PlatformCapabilities,
         active: bool,
     ) -> io::Result<WanDiagnosticReport> {
-        let mut evidence = Vec::with_capacity(12);
-        if platform.kind == PlatformKind::OpenWrt {
-            evidence.push(self.run(Probe::UbusWan).await?);
-        }
-        for probe in [
-            Probe::IpLink,
-            Probe::IpAddress,
-            Probe::IpRoute,
-            Probe::IpRule,
-        ] {
-            evidence.push(self.run(probe).await?);
-        }
-        if platform.kind == PlatformKind::OpenWrt {
-            evidence.push(self.run(Probe::UciFirewall).await?);
-        }
-        evidence.push(self.read_file("network.dns.openwrt", "/tmp/resolv.conf.d/resolv.conf.auto"));
-        evidence.push(self.read_file(
-            "network.dns.systemd_resolved",
-            "/run/systemd/resolve/resolv.conf",
-        ));
-        evidence.push(self.read_file(
-            "network.dns.network_manager",
-            "/run/NetworkManager/resolv.conf",
-        ));
-        evidence.push(self.read_file("network.dns.system", "/etc/resolv.conf"));
-        evidence.push(firewall_evidence(platform));
-
+        let mut evidence = self.collect_passive(platform, DiagnosticScope::Wan).await?;
         let passive_summary = normalize(&evidence, platform);
         if active && passive_summary.assessment == WanAssessment::PrerequisitesReady {
             if let Some(gateway) = passive_summary
@@ -108,19 +82,72 @@ impl ToolRunner {
             );
         }
 
-        let summary = normalize(&evidence, platform);
-        let findings = summarize(&summary, &evidence, platform.kind);
-        let complete = summary.status_source.is_some()
-            && !summary.addresses.is_empty()
-            && !summary.default_routes.is_empty()
-            && !summary.dns_servers.is_empty();
-        Ok(WanDiagnosticReport {
-            interface: WAN_INTERFACE.into(),
-            summary,
-            evidence,
-            findings,
-            complete,
-        })
+        Ok(build_wan_report(evidence, platform))
+    }
+
+    /// Runs the deterministic, passive DNS prerequisite runbook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_dns(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<DnsDiagnosticReport> {
+        let evidence = self.collect_passive(platform, DiagnosticScope::Dns).await?;
+        Ok(build_dns_report(evidence, platform))
+    }
+
+    /// Runs the deterministic, passive default-route prerequisite runbook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_routes(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<RouteDiagnosticReport> {
+        let evidence = self
+            .collect_passive(platform, DiagnosticScope::Routes)
+            .await?;
+        Ok(build_route_report(evidence, platform))
+    }
+
+    async fn collect_passive(
+        &self,
+        platform: &PlatformCapabilities,
+        scope: DiagnosticScope,
+    ) -> io::Result<Vec<ProbeEvidence>> {
+        let mut evidence = Vec::with_capacity(12);
+        if platform.kind == PlatformKind::OpenWrt {
+            evidence.push(self.run(Probe::UbusWan).await?);
+        }
+        for probe in [Probe::IpLink, Probe::IpAddress, Probe::IpRoute] {
+            evidence.push(self.run(probe).await?);
+        }
+        if scope != DiagnosticScope::Dns {
+            evidence.push(self.run(Probe::IpRule).await?);
+        }
+        if scope == DiagnosticScope::Wan && platform.kind == PlatformKind::OpenWrt {
+            evidence.push(self.run(Probe::UciFirewall).await?);
+        }
+        if scope != DiagnosticScope::Routes {
+            evidence
+                .push(self.read_file("network.dns.openwrt", "/tmp/resolv.conf.d/resolv.conf.auto"));
+            evidence.push(self.read_file(
+                "network.dns.systemd_resolved",
+                "/run/systemd/resolve/resolv.conf",
+            ));
+            evidence.push(self.read_file(
+                "network.dns.network_manager",
+                "/run/NetworkManager/resolv.conf",
+            ));
+            evidence.push(self.read_file("network.dns.system", "/etc/resolv.conf"));
+        }
+        if scope == DiagnosticScope::Wan {
+            evidence.push(firewall_evidence(platform));
+        }
+        Ok(evidence)
     }
 
     async fn run(&self, probe: Probe) -> io::Result<ProbeEvidence> {
@@ -246,6 +273,13 @@ enum Probe {
     IpAddress,
     IpRoute,
     IpRule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticScope {
+    Wan,
+    Dns,
+    Routes,
 }
 
 impl Probe {
@@ -757,6 +791,157 @@ fn summarize(
     findings
 }
 
+fn build_wan_report(
+    evidence: Vec<ProbeEvidence>,
+    platform: &PlatformCapabilities,
+) -> WanDiagnosticReport {
+    let summary = normalize(&evidence, platform);
+    let findings = summarize(&summary, &evidence, platform.kind);
+    let complete = summary.status_source.is_some()
+        && !summary.addresses.is_empty()
+        && !summary.default_routes.is_empty()
+        && !summary.dns_servers.is_empty();
+    WanDiagnosticReport {
+        interface: WAN_INTERFACE.into(),
+        summary,
+        evidence,
+        findings,
+        complete,
+    }
+}
+
+fn build_dns_report(
+    evidence: Vec<ProbeEvidence>,
+    platform: &PlatformCapabilities,
+) -> DnsDiagnosticReport {
+    let wan = normalize(&evidence, platform);
+    let assessment = assess_dns(&wan);
+    let summary = DnsSummary {
+        assessment,
+        status_source: wan.status_source,
+        device: wan.device,
+        addresses: wan.addresses,
+        default_routes: wan.default_routes,
+        dns_servers: wan.dns_servers,
+        dns_reachable: wan.dns_reachable,
+    };
+    let complete = summary.status_source.is_some()
+        && !summary.addresses.is_empty()
+        && !summary.default_routes.is_empty()
+        && !summary.dns_servers.is_empty();
+    let findings = focused_findings(
+        assessment,
+        &evidence,
+        platform.kind,
+        summary.status_source.as_deref(),
+        "DNS resolver configuration prerequisites are present; no active DNS query was sent",
+    );
+    DnsDiagnosticReport {
+        interface: WAN_INTERFACE.into(),
+        summary,
+        evidence,
+        findings,
+        complete,
+    }
+}
+
+fn build_route_report(
+    evidence: Vec<ProbeEvidence>,
+    platform: &PlatformCapabilities,
+) -> RouteDiagnosticReport {
+    let wan = normalize(&evidence, platform);
+    let assessment = assess_routes(&wan);
+    let summary = RouteSummary {
+        assessment,
+        status_source: wan.status_source,
+        device: wan.device,
+        addresses: wan.addresses,
+        default_routes: wan.default_routes,
+    };
+    let complete = summary.status_source.is_some()
+        && !summary.addresses.is_empty()
+        && !summary.default_routes.is_empty();
+    let findings = focused_findings(
+        assessment,
+        &evidence,
+        platform.kind,
+        summary.status_source.as_deref(),
+        "WAN address and default-route prerequisites are present",
+    );
+    RouteDiagnosticReport {
+        interface: WAN_INTERFACE.into(),
+        summary,
+        evidence,
+        findings,
+        complete,
+    }
+}
+
+fn assess_routes(summary: &WanSummary) -> WanAssessment {
+    if summary.status_source.is_none() {
+        WanAssessment::InsufficientEvidence
+    } else if summary.available == Some(false) {
+        WanAssessment::InterfaceUnavailable
+    } else if summary.up == Some(false) {
+        WanAssessment::LinkDown
+    } else if summary.addresses.is_empty() {
+        WanAssessment::AddressMissing
+    } else if summary.default_routes.is_empty() {
+        WanAssessment::DefaultRouteMissing
+    } else {
+        WanAssessment::PrerequisitesReady
+    }
+}
+
+fn assess_dns(summary: &WanSummary) -> WanAssessment {
+    let route_assessment = assess_routes(summary);
+    if route_assessment != WanAssessment::PrerequisitesReady {
+        route_assessment
+    } else if summary.dns_servers.is_empty() {
+        WanAssessment::DnsMissing
+    } else if summary.dns_reachable == Some(false) {
+        WanAssessment::DnsProbeFailed
+    } else {
+        WanAssessment::PrerequisitesReady
+    }
+}
+
+fn focused_findings(
+    assessment: WanAssessment,
+    evidence: &[ProbeEvidence],
+    platform_kind: PlatformKind,
+    status_source: Option<&str>,
+    ready: &str,
+) -> Vec<String> {
+    let primary = match assessment {
+        WanAssessment::PrerequisitesReady => ready,
+        WanAssessment::LinkDown => "WAN link or logical interface is down",
+        WanAssessment::InterfaceUnavailable => "WAN interface is unavailable",
+        WanAssessment::AddressMissing => "WAN has no usable IP address",
+        WanAssessment::DefaultRouteMissing => "WAN has no default route",
+        WanAssessment::DnsMissing => "WAN has no configured DNS resolver",
+        WanAssessment::DnsProbeFailed => "the active DNS resolution probe failed",
+        WanAssessment::GatewayProbeFailed => "the active gateway probe failed",
+        WanAssessment::PublicIpProbeFailed => "the active public-IP probe failed",
+        WanAssessment::InsufficientEvidence => "network evidence is insufficient for a conclusion",
+    };
+    let mut findings = vec![primary.into()];
+    match (platform_kind, status_source) {
+        (PlatformKind::OpenWrt, Some("kernel")) => {
+            findings.push("OpenWrt WAN status is unavailable; kernel evidence was used".into());
+        }
+        (PlatformKind::OpenWrt, None) => {
+            findings.push("OpenWrt and kernel WAN status evidence are unavailable".into());
+        }
+        (_, None) => findings.push("kernel WAN status evidence is unavailable".into()),
+        _ => {}
+    }
+    if evidence.iter().any(|item| item.truncated) {
+        findings.push("one or more probe outputs reached the configured byte limit".into());
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1182,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_linux_dns_runbook_collects_only_required_passive_evidence() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "run/systemd/resolve/resolv.conf",
+            "nameserver 2001:db8::53\n",
+        );
+        fixture.executable(
+            "bin/ip",
+            r#"#!/bin/sh
+printf '%s\n' '[{"dst":"default","gateway":"198.51.100.1","dev":"eth0","prefsrc":"198.51.100.20","ifname":"eth0","operstate":"UP","addr_info":[{"local":"198.51.100.20","prefixlen":24}]}]'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(3),
+            max_output_bytes: 4096,
+        };
+        let mut generic = platform(FirewallBackend::Nftables);
+        generic.kind = PlatformKind::GenericLinux;
+        let report = runner
+            .diagnose_dns(&generic)
+            .await
+            .expect("generic DNS diagnosis");
+        assert_eq!(report.summary.assessment, WanAssessment::PrerequisitesReady);
+        assert_eq!(report.summary.status_source.as_deref(), Some("kernel"));
+        assert_eq!(report.summary.dns_servers, ["2001:db8::53"]);
+        assert!(report.complete);
+        assert!(!report.evidence.iter().any(|item| {
+            matches!(
+                item.probe.as_str(),
+                "network.route.rules" | "openwrt.firewall.uci" | "openwrt.firewall.backend"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn openwrt_route_runbook_excludes_dns_and_firewall_collectors() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ubus",
+            r#"#!/bin/sh
+printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"address":"192.0.2.10","mask":24}],"route":[{"target":"0.0.0.0","mask":0,"nexthop":"192.0.2.1"}]}'
+"#,
+        );
+        fixture.executable("bin/ip", "#!/bin/sh\nprintf '%s\\n' '[]'\n");
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(3),
+            max_output_bytes: 4096,
+        };
+        let report = runner
+            .diagnose_routes(&platform(FirewallBackend::Fw3))
+            .await
+            .expect("OpenWrt route diagnosis");
+        assert_eq!(report.summary.assessment, WanAssessment::PrerequisitesReady);
+        assert_eq!(report.summary.status_source.as_deref(), Some("ubus"));
+        assert!(report.complete);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.probe == "network.route.rules")
+        );
+        assert!(!report.evidence.iter().any(|item| {
+            item.probe.starts_with("network.dns.") || item.probe.starts_with("openwrt.firewall.")
+        }));
+    }
+
+    #[tokio::test]
     async fn active_fixture_runs_only_typed_connectivity_commands() {
         let fixture = Fixture::new();
         fixture.executable(
@@ -1014,7 +1270,7 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(3),
             max_output_bytes: 4096,
         };
         let report = runner
