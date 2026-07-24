@@ -137,6 +137,11 @@ impl AgentConfig {
                 LOG_LEVELS.join(", ")
             )));
         }
+        if self.logging.rate_limit_per_target_per_sec == 0 {
+            return Err(ConfigError::Validation(
+                "logging.rate_limit_per_target_per_sec must be greater than zero".into(),
+            ));
+        }
 
         self.llm.validate()?;
 
@@ -528,6 +533,13 @@ mod tests {
     fn artifact_file_count_has_an_embedded_memory_bound() {
         let mut config = AgentConfig::default();
         config.storage.max_artifact_files = 4097;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn log_rate_limit_cannot_disable_all_runtime_logging() {
+        let mut config = AgentConfig::default();
+        config.logging.rate_limit_per_target_per_sec = 0;
         assert!(config.validate().is_err());
     }
 }

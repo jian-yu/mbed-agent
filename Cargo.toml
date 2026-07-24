@@ -26,6 +26,7 @@ agent-tools = { path = "crates/agent-tools" }
 platform-linux = { path = "crates/platform-linux" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
+libc = "0.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.37", default-features = false }

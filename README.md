@@ -121,6 +121,13 @@ managed usage and filesystem free-space reserves. Critical or emergency
 pressure triggers one cleanup attempt and then rejects the new task if pressure
 remains; `ping`, `status`, capabilities, and history queries remain usable.
 
+Logging is bounded by level/filter, line bytes, file bytes, rotated file count,
+total bytes, and `logging.rate_limit_per_target_per_sec`. The rate limiter keeps
+at most 64 target counters and uses one shared overflow bucket. Dropped records
+never allocate a line buffer or write a recursive warning; their cumulative
+count is exposed as `logging_dropped_records` in `mbed-agent status`. Log files
+are created as mode `0600` with `O_NOFOLLOW`, and non-regular paths are rejected.
+
 All generated runtime state is placed below `/tmp/mbed-agent` and may be discarded at reboot.
 
 ## OpenWrt integration

@@ -721,6 +721,12 @@ Agent 运行时不得自行下载或写入软件包、二进制、Skill/Runbook 
 
 轮转使用固定目录、`O_NOFOLLOW`/等价安全打开方式和原子 rename；日志压缩默认关闭，避免弱 CPU 上为少量易失日志增加成本。删除/轮转失败不能递归产生日志风暴，只更新内存计数并降级到 stderr 的单条 rate-limited 告警。
 
+当前 Tiny 运行时先实现无额外 burst 的一秒固定窗口，每个 target
+`rate_limit_per_target_per_sec` 条；最多保留 64 个 target 计数器，其余
+target 共用溢出桶。被抑制总数通过本地 `status` 返回，不在限速器内部
+再写告警，避免递归日志风暴。后续 Channel 长稳测试再决定是否增加独立
+burst 配置。
+
 支持运行时查看与临时调级：
 
 ```text

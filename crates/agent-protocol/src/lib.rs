@@ -306,6 +306,7 @@ pub struct StatusResponse {
     pub llm_enabled: bool,
     pub llm_provider: String,
     pub llm_streaming: bool,
+    pub logging_dropped_records: u64,
     pub degraded_reasons: Vec<String>,
 }
 

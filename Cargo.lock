@@ -713,6 +713,7 @@ dependencies = [
  "agent-store",
  "agent-tools",
  "clap",
+ "libc",
  "platform-linux",
  "serde",
  "serde_json",

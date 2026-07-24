@@ -38,13 +38,14 @@ struct AppState {
     diagnostic_slots: Semaphore,
     llm: Option<OpenAiCompatibleProvider>,
     llm_slots: Semaphore,
+    log_writer: logging::BoundedMakeWriter,
     started: Instant,
 }
 
 pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config = AgentConfig::load_or_default(config_path)?;
     ensure_secret_config_permissions(config_path, &config)?;
-    init_logging(&config)?;
+    let log_writer = init_logging(&config)?;
 
     let budget = TmpBudget::new(config.storage.clone())?;
     fs::create_dir_all(budget.root().join("artifacts"))?;
@@ -88,6 +89,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         diagnostic_slots,
         llm,
         llm_slots,
+        log_writer,
         started: Instant::now(),
     });
     let mut cleanup_interval =
@@ -209,7 +211,7 @@ async fn run_artifact_cleanup(state: &AppState) {
     }
 }
 
-fn init_logging(config: &AgentConfig) -> io::Result<()> {
+fn init_logging(config: &AgentConfig) -> io::Result<logging::BoundedMakeWriter> {
     let mut filter = config.logging.level.clone();
     if !config.logging.directives.is_empty() {
         filter.push(',');
@@ -221,17 +223,17 @@ fn init_logging(config: &AgentConfig) -> io::Result<()> {
         agent_core::config::LogFormat::Compact => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
-            .with_writer(writer)
+            .with_writer(writer.clone())
             .compact()
             .init(),
         agent_core::config::LogFormat::JsonLines => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
-            .with_writer(writer)
+            .with_writer(writer.clone())
             .json()
             .init(),
     }
-    Ok(())
+    Ok(writer)
 }
 
 fn bind_socket(path: &Path, mode: u32) -> io::Result<UnixListener> {
@@ -318,6 +320,12 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             if pressure != StoragePressure::Normal {
                 degraded_reasons.push(format!("runtime storage pressure is {pressure:?}"));
             }
+            let logging_dropped_records = state.log_writer.dropped_records();
+            if logging_dropped_records > 0 {
+                degraded_reasons.push(format!(
+                    "logging rate limit dropped {logging_dropped_records} records"
+                ));
+            }
             ResponseData::Status(StatusResponse {
                 daemon_version: AGENT_VERSION.into(),
                 protocol_version: PROTOCOL_VERSION,
@@ -335,6 +343,7 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 llm_enabled: state.llm.is_some(),
                 llm_provider: state.config.llm.provider.as_str().into(),
                 llm_streaming: state.config.llm.streaming,
+                logging_dropped_records,
                 degraded_reasons,
             })
         }
@@ -1319,6 +1328,7 @@ mod tests {
             diagnostic_slots: Semaphore::new(1),
             llm: None,
             llm_slots: Semaphore::new(1),
+            log_writer: test_log_writer(&root),
             started: Instant::now(),
             config,
         };
@@ -1405,6 +1415,7 @@ mod tests {
             diagnostic_slots: Semaphore::new(1),
             llm: Some(provider),
             llm_slots: Semaphore::new(1),
+            log_writer: test_log_writer(&root),
             started: Instant::now(),
             config,
         };
@@ -1478,6 +1489,7 @@ mod tests {
             diagnostic_slots: Semaphore::new(1),
             llm: Some(provider),
             llm_slots: Semaphore::new(1),
+            log_writer: test_log_writer(&root),
             started: Instant::now(),
             config,
         };
@@ -1546,5 +1558,13 @@ mod tests {
             .write_all(response.as_bytes())
             .await
             .expect("write response");
+    }
+
+    fn test_log_writer(root: &Path) -> logging::BoundedMakeWriter {
+        let config = agent_core::config::LoggingConfig {
+            path: root.join("test.log"),
+            ..agent_core::config::LoggingConfig::default()
+        };
+        logging::BoundedMakeWriter::new(&config).expect("test log writer")
     }
 }
