@@ -11,7 +11,10 @@ use agent_protocol::{
     ClientRequest, Command, CompletionResponse, DiagnosticHistoryEntry, ErrorCode,
     PROTOCOL_VERSION, ResponseData, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
 };
-use agent_provider::{CompletionRequest, OpenAiCompatibleConfig, OpenAiCompatibleProvider};
+use agent_provider::{
+    CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
+    ToolDefinition,
+};
 use agent_store::{DiagnosticRecord, Store};
 use agent_tools::ToolRunner;
 use platform_linux::PlatformCapabilities;
@@ -298,32 +301,226 @@ async fn handle_completion(id: String, prompt: String, state: &AppState) -> Serv
             "the configured LLM task limit has been reached",
         );
     };
-    let request = CompletionRequest {
-        system_prompt: state.config.llm.system_prompt.clone(),
-        user_prompt: prompt,
-        max_output_tokens: state.config.llm.max_output_tokens,
-        streaming: state.config.llm.streaming,
-    };
-    match provider.complete(request).await {
-        Ok(completion) => ServerResponse::success(
-            id,
-            ResponseData::Completion(CompletionResponse {
+    match run_read_only_agent(provider, prompt, &id, state).await {
+        Ok(completion) => ServerResponse::success(id, ResponseData::Completion(completion)),
+        Err(failure) => ServerResponse::error(id, failure.code, failure.message),
+    }
+}
+
+struct AgentLoopFailure {
+    code: ErrorCode,
+    message: String,
+}
+
+impl AgentLoopFailure {
+    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+async fn run_read_only_agent(
+    provider: &OpenAiCompatibleProvider,
+    prompt: String,
+    request_id: &str,
+    state: &AppState,
+) -> Result<CompletionResponse, AgentLoopFailure> {
+    let mut messages = vec![
+        ModelMessage::Instruction(state.config.llm.system_prompt.clone()),
+        ModelMessage::User(prompt),
+    ];
+    let tools = vec![wan_diagnostic_tool()];
+    let mut prompt_tokens = None;
+    let mut completion_tokens = None;
+
+    for step in 0..state.config.llm.max_agent_steps {
+        let request = CompletionRequest {
+            messages: messages.clone(),
+            tools: tools.clone(),
+            max_output_tokens: state.config.llm.max_output_tokens,
+            streaming: state.config.llm.streaming,
+        };
+        let completion = match provider.complete(request).await {
+            Ok(completion) => completion,
+            Err(error) => {
+                warn!(%error, step, "LLM provider request failed");
+                return Err(AgentLoopFailure::new(
+                    ErrorCode::Upstream,
+                    format!("LLM provider request failed: {error}"),
+                ));
+            }
+        };
+        add_usage(&mut prompt_tokens, completion.prompt_tokens);
+        add_usage(&mut completion_tokens, completion.completion_tokens);
+        if completion.tool_calls.is_empty() {
+            return Ok(CompletionResponse {
                 text: completion.text,
                 model: completion.model,
                 finish_reason: completion.finish_reason,
-                prompt_tokens: completion.prompt_tokens,
-                completion_tokens: completion.completion_tokens,
-            }),
-        ),
-        Err(error) => {
-            warn!(%error, "LLM provider request failed");
-            ServerResponse::error(
-                id,
-                ErrorCode::Upstream,
-                format!("LLM provider request failed: {error}"),
-            )
+                prompt_tokens,
+                completion_tokens,
+            });
         }
+        if completion.tool_calls.len() != 1 {
+            return Err(AgentLoopFailure::new(
+                ErrorCode::Upstream,
+                "model requested multiple tools in one step; this Agent profile permits one",
+            ));
+        }
+        if !tool_step_available(step, state.config.llm.max_agent_steps) {
+            return Err(AgentLoopFailure::new(
+                ErrorCode::ResourceExhausted,
+                "Agent loop reached max_agent_steps before a final answer",
+            ));
+        }
+        let call = completion.tool_calls[0].clone();
+        messages.push(ModelMessage::Assistant {
+            content: completion.text,
+            tool_calls: completion.tool_calls,
+        });
+        messages.push(execute_agent_tool(&call, request_id, step, state).await?);
     }
+    Err(AgentLoopFailure::new(
+        ErrorCode::ResourceExhausted,
+        "Agent loop exhausted its configured step budget",
+    ))
+}
+
+const fn tool_step_available(step: u8, max_agent_steps: u8) -> bool {
+    step.saturating_add(1) < max_agent_steps
+}
+
+async fn execute_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    step: u8,
+    state: &AppState,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    if let Err(reason) = validate_wan_tool_call(call) {
+        warn!(tool = %call.name, %reason, "model requested a rejected tool call");
+        return Err(AgentLoopFailure::new(
+            ErrorCode::Upstream,
+            format!("model tool call was rejected: {reason}"),
+        ));
+    }
+    let report = execute_agent_wan_diagnostic(state)
+        .await
+        .map_err(agent_tool_failure)?;
+    persist_diagnostic(&format!("{request_id}-tool-{step}"), false, &report, state).await;
+    let content = bounded_wan_observation(&report, state.config.llm.max_tool_context_bytes)
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
+fn agent_tool_failure(error: AgentToolError) -> AgentLoopFailure {
+    match error {
+        AgentToolError::Busy => AgentLoopFailure::new(
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        ),
+        AgentToolError::TimedOut => AgentLoopFailure::new(
+            ErrorCode::ResourceExhausted,
+            "Agent WAN diagnosis exceeded the configured task timeout",
+        ),
+        AgentToolError::Failed(error) => AgentLoopFailure::new(
+            ErrorCode::Internal,
+            format!("Agent WAN diagnosis failed: {error}"),
+        ),
+    }
+}
+
+fn wan_diagnostic_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "diagnose_wan".into(),
+        description: "Collect bounded, read-only WAN link, address, route, DNS, and firewall evidence. This tool never changes device state and never performs active network probes.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn validate_wan_tool_call(call: &ToolCall) -> Result<(), &'static str> {
+    if call.name != "diagnose_wan" {
+        return Err("tool name is not in the local allowlist");
+    }
+    if call.arguments.len() > 256 {
+        return Err("tool arguments exceed the local 256-byte limit");
+    }
+    let arguments: serde_json::Value =
+        serde_json::from_str(&call.arguments).map_err(|_| "arguments are not valid JSON")?;
+    let Some(arguments) = arguments.as_object() else {
+        return Err("arguments must be a JSON object");
+    };
+    if !arguments.is_empty() {
+        return Err("diagnose_wan accepts no arguments");
+    }
+    Ok(())
+}
+
+fn add_usage(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+}
+
+enum AgentToolError {
+    Busy,
+    TimedOut,
+    Failed(io::Error),
+}
+
+async fn execute_agent_wan_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::WanDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_wan(&state.platform, false),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
+fn bounded_wan_observation(
+    report: &agent_protocol::WanDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct WanObservation<'a> {
+        interface: &'a str,
+        summary: &'a agent_protocol::WanSummary,
+        findings: &'a [String],
+        complete: bool,
+    }
+    let observation = WanObservation {
+        interface: &report.interface,
+        summary: &report.summary,
+        findings: &report.findings,
+        complete: report.complete,
+    };
+    let encoded = serde_json::to_vec(&observation)
+        .map_err(|error| format!("failed to encode WAN observation: {error}"))?;
+    if encoded.len() > limit {
+        return Err(format!(
+            "WAN observation is {} bytes, exceeding llm.max_tool_context_bytes {limit}",
+            encoded.len()
+        ));
+    }
+    String::from_utf8(encoded)
+        .map_err(|error| format!("WAN observation was not valid UTF-8: {error}"))
 }
 
 async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> ServerResponse {
@@ -457,6 +654,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
     async fn bounded_frame_reader_accepts_one_line() {
@@ -474,5 +678,158 @@ mod tests {
         let data = b"123456789\n";
         let mut reader = BufReader::new(&data[..]);
         assert!(read_frame(&mut reader, 4).await.is_err());
+    }
+
+    #[test]
+    fn wan_tool_call_requires_allowlisted_name_and_empty_object() {
+        let valid = ToolCall {
+            id: "call-1".into(),
+            name: "diagnose_wan".into(),
+            arguments: "{}".into(),
+        };
+        assert!(validate_wan_tool_call(&valid).is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.name = "shell".into();
+        assert_eq!(
+            validate_wan_tool_call(&invalid),
+            Err("tool name is not in the local allowlist")
+        );
+
+        invalid.name = "diagnose_wan".into();
+        invalid.arguments = r#"{"active":true}"#.into();
+        assert_eq!(
+            validate_wan_tool_call(&invalid),
+            Err("diagnose_wan accepts no arguments")
+        );
+
+        invalid.arguments = format!(r#"{{"padding":"{}"}}"#, "x".repeat(300));
+        assert_eq!(
+            validate_wan_tool_call(&invalid),
+            Err("tool arguments exceed the local 256-byte limit")
+        );
+    }
+
+    #[test]
+    fn usage_is_accumulated_safely() {
+        let mut total = None;
+        add_usage(&mut total, None);
+        add_usage(&mut total, Some(u64::MAX));
+        add_usage(&mut total, Some(1));
+        assert_eq!(total, Some(u64::MAX));
+    }
+
+    #[test]
+    fn last_agent_step_cannot_start_an_unanswered_tool_call() {
+        assert!(tool_step_available(0, 2));
+        assert!(!tool_step_available(1, 2));
+        assert!(!tool_step_available(0, 1));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_executes_one_passive_wan_tool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("first accept");
+            let first_request = read_http_request(&mut first).await;
+            assert!(first_request.contains("\"name\":\"diagnose_wan\""));
+            write_json_response(
+                &mut first,
+                r#"{"model":"mock","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"diagnose_wan","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":2}}"#,
+            )
+            .await;
+
+            let (mut second, _) = listener.accept().await.expect("second accept");
+            let second_request = read_http_request(&mut second).await;
+            assert!(second_request.contains("\"role\":\"tool\""));
+            assert!(second_request.contains("\"tool_call_id\":\"call_1\""));
+            write_json_response(
+                &mut second,
+                r#"{"model":"mock","choices":[{"message":{"content":"WAN analyzed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}}"#,
+            )
+            .await;
+        });
+
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/agent-loop-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let mut config = AgentConfig::default();
+        config.storage.path = root.join("agent.db");
+        config.llm.streaming = false;
+        config.llm.max_agent_steps = 3;
+        let budget = TmpBudget::new(config.storage.clone()).expect("budget");
+        let store = Arc::new(
+            Store::open(&config.storage.path, config.storage.max_database_bytes).expect("store"),
+        );
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{address}/v1"),
+            api_key: "test-key".into(),
+            model: "mock".into(),
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(5),
+            max_request_bytes: config.llm.max_request_bytes,
+            max_response_bytes: config.llm.max_response_bytes,
+            max_stream_event_bytes: config.llm.max_stream_event_bytes,
+        })
+        .expect("provider");
+        let state = AppState {
+            platform: PlatformCapabilities::discover(),
+            budget,
+            store,
+            tools: ToolRunner::system(Duration::from_millis(100), 4096),
+            diagnostic_slots: Semaphore::new(1),
+            llm: Some(provider),
+            llm_slots: Semaphore::new(1),
+            started: Instant::now(),
+            config,
+        };
+        let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
+        assert!(response.ok);
+        let Some(ResponseData::Completion(completion)) = response.result else {
+            panic!("expected completion");
+        };
+        assert_eq!(completion.text, "WAN analyzed");
+        assert_eq!(completion.prompt_tokens, Some(12));
+        assert_eq!(completion.completion_tokens, Some(5));
+        server.await.expect("server");
+        drop(state);
+        fs::remove_dir_all(root).expect("remove test runtime");
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.expect("read request");
+            assert!(read > 0, "request ended before body");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content length");
+            if request.len() >= header_end.saturating_add(content_length) {
+                return String::from_utf8(request).expect("UTF-8 request");
+            }
+        }
+    }
+
+    async fn write_json_response(stream: &mut tokio::net::TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
     }
 }

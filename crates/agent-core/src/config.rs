@@ -202,6 +202,8 @@ pub struct LlmConfig {
     pub max_stream_event_bytes: usize,
     pub max_output_tokens: u32,
     pub streaming: bool,
+    pub max_agent_steps: u8,
+    pub max_tool_context_bytes: usize,
 }
 
 impl Default for LlmConfig {
@@ -220,6 +222,8 @@ impl Default for LlmConfig {
             max_stream_event_bytes: 16 * 1024,
             max_output_tokens: 1024,
             streaming: true,
+            max_agent_steps: 4,
+            max_tool_context_bytes: 16 * 1024,
         }
     }
 }
@@ -233,9 +237,13 @@ impl LlmConfig {
             || self.max_stream_event_bytes < 1024
             || self.max_stream_event_bytes > self.max_response_bytes
             || self.max_output_tokens == 0
+            || self.max_agent_steps == 0
+            || self.max_agent_steps > 16
+            || self.max_tool_context_bytes < 1024
+            || self.max_tool_context_bytes > self.max_request_bytes
         {
             return Err(ConfigError::Validation(
-                "llm timeouts, token limit, and 1024-byte buffers must be non-zero; stream events must fit the response limit".into(),
+                "llm limits are inconsistent: buffers and steps must be non-zero, stream events must fit the response limit, tool context must fit a request, and agent steps must not exceed 16".into(),
             ));
         }
         if self.enabled {
@@ -479,6 +487,17 @@ mod tests {
     fn stream_event_must_fit_response_budget() {
         let mut config = AgentConfig::default();
         config.llm.max_stream_event_bytes = config.llm.max_response_bytes + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn agent_loop_limits_are_bounded() {
+        let mut config = AgentConfig::default();
+        config.llm.max_agent_steps = 17;
+        assert!(config.validate().is_err());
+
+        config.llm.max_agent_steps = 4;
+        config.llm.max_tool_context_bytes = config.llm.max_request_bytes + 1;
         assert!(config.validate().is_err());
     }
 }

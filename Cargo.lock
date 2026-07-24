@@ -714,6 +714,7 @@ dependencies = [
  "agent-tools",
  "clap",
  "platform-linux",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

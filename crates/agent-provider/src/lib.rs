@@ -2,14 +2,43 @@ use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
-    pub system_prompt: String,
-    pub user_prompt: String,
+    pub messages: Vec<ModelMessage>,
+    pub tools: Vec<ToolDefinition>,
     pub max_output_tokens: u32,
     pub streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelMessage {
+    Instruction(String),
+    User(String),
+    Assistant {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +48,7 @@ pub struct Completion {
     pub finish_reason: Option<String>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 pub struct OpenAiCompatibleConfig {
@@ -106,18 +136,17 @@ impl OpenAiCompatibleProvider {
     ///
     /// Returns a typed error for transport, size, HTTP, or response-shape failures.
     pub async fn complete(&self, request: CompletionRequest) -> Result<Completion, ProviderError> {
+        if request.messages.is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "at least one model message is required".into(),
+            ));
+        }
+        let messages = request.messages.iter().map(ApiMessage::from).collect();
+        let tools = request.tools.iter().map(ApiToolDefinition::from).collect();
         let payload = ApiRequest {
             model: &self.model,
-            messages: [
-                ApiMessage {
-                    role: "system",
-                    content: &request.system_prompt,
-                },
-                ApiMessage {
-                    role: "user",
-                    content: &request.user_prompt,
-                },
-            ],
+            messages,
+            tools,
             max_tokens: request.max_output_tokens,
             stream: request.streaming,
             stream_options: request.streaming.then_some(ApiStreamOptions {
@@ -159,8 +188,9 @@ impl OpenAiCompatibleProvider {
             .into_iter()
             .next()
             .ok_or(ProviderError::MissingChoice)?;
+        let tool_calls = validate_api_tool_calls(choice.message.tool_calls)?;
         Ok(Completion {
-            text: choice.message.content,
+            text: choice.message.content.unwrap_or_default(),
             model: response.model,
             finish_reason: choice.finish_reason,
             prompt_tokens: response
@@ -171,6 +201,7 @@ impl OpenAiCompatibleProvider {
                 .usage
                 .as_ref()
                 .and_then(|usage| usage.completion_tokens),
+            tool_calls,
         })
     }
 
@@ -249,7 +280,9 @@ fn error_message(body: &[u8]) -> String {
 #[derive(Serialize)]
 struct ApiRequest<'a> {
     model: &'a str,
-    messages: [ApiMessage<'a>; 2],
+    messages: Vec<ApiMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ApiToolDefinition<'a>>,
     max_tokens: u32,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,9 +295,101 @@ struct ApiStreamOptions {
 }
 
 #[derive(Serialize)]
-struct ApiMessage<'a> {
-    role: &'static str,
-    content: &'a str,
+#[serde(tag = "role", rename_all = "lowercase")]
+enum ApiMessage<'a> {
+    #[serde(rename = "system")]
+    Instruction {
+        content: &'a str,
+    },
+    User {
+        content: &'a str,
+    },
+    Assistant {
+        content: Option<&'a str>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ApiToolCallRef<'a>>,
+    },
+    Tool {
+        tool_call_id: &'a str,
+        content: &'a str,
+    },
+}
+
+impl<'a> From<&'a ModelMessage> for ApiMessage<'a> {
+    fn from(message: &'a ModelMessage) -> Self {
+        match message {
+            ModelMessage::Instruction(content) => Self::Instruction { content },
+            ModelMessage::User(content) => Self::User { content },
+            ModelMessage::Assistant {
+                content,
+                tool_calls,
+            } => Self::Assistant {
+                content: (!content.is_empty()).then_some(content),
+                tool_calls: tool_calls.iter().map(ApiToolCallRef::from).collect(),
+            },
+            ModelMessage::Tool {
+                tool_call_id,
+                content,
+            } => Self::Tool {
+                tool_call_id,
+                content,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ApiToolDefinition<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ApiFunctionDefinition<'a>,
+}
+
+impl<'a> From<&'a ToolDefinition> for ApiToolDefinition<'a> {
+    fn from(tool: &'a ToolDefinition) -> Self {
+        Self {
+            kind: "function",
+            function: ApiFunctionDefinition {
+                name: &tool.name,
+                description: &tool.description,
+                parameters: &tool.parameters,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ApiFunctionDefinition<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+}
+
+#[derive(Serialize)]
+struct ApiToolCallRef<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ApiFunctionCallRef<'a>,
+}
+
+impl<'a> From<&'a ToolCall> for ApiToolCallRef<'a> {
+    fn from(call: &'a ToolCall) -> Self {
+        Self {
+            id: &call.id,
+            kind: "function",
+            function: ApiFunctionCallRef {
+                name: &call.name,
+                arguments: &call.arguments,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ApiFunctionCallRef<'a> {
+    name: &'a str,
+    arguments: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -284,7 +409,24 @@ struct ApiChoice {
 
 #[derive(Deserialize)]
 struct ApiResponseMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ApiToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ApiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ApiFunctionCall,
+}
+
+#[derive(Deserialize)]
+struct ApiFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -318,6 +460,27 @@ struct ApiStreamChoice {
 struct ApiStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ApiStreamToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ApiStreamToolCall {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<ApiStreamFunctionCall>,
+}
+
+#[derive(Deserialize)]
+struct ApiStreamFunctionCall {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 struct StreamAggregate {
@@ -326,6 +489,7 @@ struct StreamAggregate {
     finish_reason: Option<String>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    tool_calls: Vec<ToolCallBuilder>,
     saw_choice: bool,
     done: bool,
 }
@@ -338,6 +502,7 @@ impl StreamAggregate {
             finish_reason: None,
             prompt_tokens: None,
             completion_tokens: None,
+            tool_calls: Vec::new(),
             saw_choice: false,
             done: false,
         }
@@ -366,8 +531,44 @@ impl StreamAggregate {
             if let Some(content) = choice.delta.content {
                 self.text.push_str(&content);
             }
+            for tool_call in choice.delta.tool_calls {
+                self.consume_tool_call(tool_call)?;
+            }
             if choice.finish_reason.is_some() {
                 self.finish_reason = choice.finish_reason;
+            }
+        }
+        Ok(())
+    }
+
+    fn consume_tool_call(&mut self, delta: ApiStreamToolCall) -> Result<(), ProviderError> {
+        if delta.index >= MAX_PROVIDER_TOOL_CALLS {
+            return Err(ProviderError::InvalidToolCall(format!(
+                "tool-call index {} exceeds provider limit {}",
+                delta.index, MAX_PROVIDER_TOOL_CALLS
+            )));
+        }
+        while self.tool_calls.len() <= delta.index {
+            self.tool_calls.push(ToolCallBuilder::default());
+        }
+        let builder = &mut self.tool_calls[delta.index];
+        if let Some(kind) = delta.kind {
+            if kind != "function" {
+                return Err(ProviderError::InvalidToolCall(format!(
+                    "unsupported tool-call type {kind}"
+                )));
+            }
+            builder.saw_function_type = true;
+        }
+        if let Some(id) = delta.id {
+            builder.id.push_str(&id);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                builder.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                builder.arguments.push_str(&arguments);
             }
         }
         Ok(())
@@ -380,14 +581,86 @@ impl StreamAggregate {
         if !self.saw_choice {
             return Err(ProviderError::MissingChoice);
         }
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(ToolCallBuilder::finish)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Completion {
             text: self.text,
             model: self.model,
             finish_reason: self.finish_reason,
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            tool_calls,
         })
     }
+}
+
+const MAX_PROVIDER_TOOL_CALLS: usize = 8;
+const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+const MAX_TOOL_NAME_BYTES: usize = 128;
+
+#[derive(Default)]
+struct ToolCallBuilder {
+    id: String,
+    name: String,
+    arguments: String,
+    saw_function_type: bool,
+}
+
+impl ToolCallBuilder {
+    fn finish(self) -> Result<ToolCall, ProviderError> {
+        validate_tool_call(self.id, self.name, self.arguments, self.saw_function_type)
+    }
+}
+
+fn validate_api_tool_calls(calls: Vec<ApiToolCall>) -> Result<Vec<ToolCall>, ProviderError> {
+    if calls.len() > MAX_PROVIDER_TOOL_CALLS {
+        return Err(ProviderError::InvalidToolCall(format!(
+            "response contains {} tool calls; limit is {MAX_PROVIDER_TOOL_CALLS}",
+            calls.len()
+        )));
+    }
+    calls
+        .into_iter()
+        .map(|call| {
+            validate_tool_call(
+                call.id,
+                call.function.name,
+                call.function.arguments,
+                call.kind == "function",
+            )
+        })
+        .collect()
+}
+
+fn validate_tool_call(
+    id: String,
+    name: String,
+    arguments: String,
+    is_function: bool,
+) -> Result<ToolCall, ProviderError> {
+    if !is_function {
+        return Err(ProviderError::InvalidToolCall(
+            "only function tool calls are supported".into(),
+        ));
+    }
+    if id.is_empty() || id.len() > MAX_TOOL_CALL_ID_BYTES {
+        return Err(ProviderError::InvalidToolCall(
+            "tool-call ID is empty or too long".into(),
+        ));
+    }
+    if name.is_empty() || name.len() > MAX_TOOL_NAME_BYTES {
+        return Err(ProviderError::InvalidToolCall(
+            "tool name is empty or too long".into(),
+        ));
+    }
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+    })
 }
 
 struct SseDecoder {
@@ -487,6 +760,8 @@ struct ApiError {
 pub enum ProviderError {
     #[error("invalid provider configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("invalid provider request: {0}")]
+    InvalidRequest(String),
     #[error("failed to construct HTTP client: {0}")]
     Client(reqwest::Error),
     #[error("failed to encode provider request: {0}")]
@@ -503,6 +778,8 @@ pub enum ProviderError {
     IncompleteStream,
     #[error("invalid provider stream: {0}")]
     StreamProtocol(String),
+    #[error("invalid provider tool call: {0}")]
+    InvalidToolCall(String),
     #[error("provider returned HTTP {status}: {message}")]
     Http { status: StatusCode, message: String },
     #[error("failed to decode provider response: {0}")]
@@ -527,6 +804,8 @@ mod tests {
             let read = stream.read(&mut request).await.expect("read");
             let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
             assert!(request.contains("authorization: bearer test-key"));
+            assert!(request.contains("\"name\":\"diagnose_wan\""));
+            assert!(request.contains("\"additionalproperties\":false"));
             let body = r#"{"model":"mock-model","choices":[{"message":{"content":"ready"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -547,8 +826,19 @@ mod tests {
         .expect("provider");
         let completion = provider
             .complete(CompletionRequest {
-                system_prompt: "system".into(),
-                user_prompt: "status".into(),
+                messages: vec![
+                    ModelMessage::Instruction("system".into()),
+                    ModelMessage::User("status".into()),
+                ],
+                tools: vec![ToolDefinition {
+                    name: "diagnose_wan".into(),
+                    description: "Read WAN state".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                }],
                 max_output_tokens: 32,
                 streaming: false,
             })
@@ -585,8 +875,11 @@ mod tests {
         .expect("provider");
         let error = provider
             .complete(CompletionRequest {
-                system_prompt: "system".into(),
-                user_prompt: "status".into(),
+                messages: vec![
+                    ModelMessage::Instruction("system".into()),
+                    ModelMessage::User("status".into()),
+                ],
+                tools: vec![],
                 max_output_tokens: 32,
                 streaming: false,
             })
@@ -666,8 +959,11 @@ mod tests {
         .expect("provider");
         let completion = provider
             .complete(CompletionRequest {
-                system_prompt: "system".into(),
-                user_prompt: "status".into(),
+                messages: vec![
+                    ModelMessage::Instruction("system".into()),
+                    ModelMessage::User("status".into()),
+                ],
+                tools: vec![],
                 max_output_tokens: 32,
                 streaming: true,
             })
@@ -693,5 +989,37 @@ mod tests {
             aggregate.finish(),
             Err(ProviderError::IncompleteStream)
         ));
+    }
+
+    #[test]
+    fn aggregates_fragmented_stream_tool_call() {
+        let mut aggregate = StreamAggregate::new("model".into());
+        aggregate
+            .consume(
+                br#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_","type":"function","function":{"name":"diagnose_","arguments":"{"}}]},"finish_reason":null}]}"#,
+            )
+            .expect("first tool delta");
+        aggregate
+            .consume(
+                br#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"wan","arguments":"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .expect("second tool delta");
+        aggregate.consume(b"[DONE]").expect("done");
+        let completion = aggregate.finish().expect("completion");
+        assert_eq!(
+            completion.tool_calls,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "diagnose_wan".into(),
+                arguments: "{}".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_non_function_tool_call() {
+        let error = validate_tool_call("call_1".into(), "tool".into(), "{}".into(), false)
+            .expect_err("custom tool rejected");
+        assert!(matches!(error, ProviderError::InvalidToolCall(_)));
     }
 }

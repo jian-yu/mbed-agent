@@ -20,10 +20,14 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
   redirects, and redacted API-key configuration.
+- A bounded read-only Agent loop that lets the model request one locally
+  allowlisted `diagnose_wan` tool per step. Tool arguments are parsed and
+  validated on-device, and the model can never request active probes or shell
+  commands.
 
-LLM tool calling and provider routing, additional typed network tools, MQTT,
-WeCom, WeChat ClawBot, administrator elevation, and configuration transactions
-are planned but are not implemented yet.
+Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
+administrator elevation, and configuration transactions are planned but are not
+implemented yet.
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -70,6 +74,10 @@ false` for compatible endpoints that only implement JSON responses. HTTP
 redirects are disabled, and traffic is bounded by `llm.max_request_bytes`,
 `llm.max_response_bytes`, `llm.max_stream_event_bytes`, the configured timeouts,
 and the runtime task limit. Prompts and responses are not written to SQLite.
+When the model requests WAN evidence, the daemon runs only the passive typed
+diagnostic and sends its normalized summary and findings back to the model. Raw
+probe output is excluded from model context; the bounded diagnostic summary is
+still retained in volatile SQLite for local audit history.
 
 Diagnostic commands never invoke a shell. Their executable names and arguments
 are compiled into a typed allowlist, and configuration limits each probe's time
