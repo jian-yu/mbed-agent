@@ -93,6 +93,11 @@ enum DiagnoseTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Inspect bounded fw3/fw4, iptables, or nftables runtime state.
+    Firewall {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Show volatile diagnostic summaries from this boot.
     History {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
@@ -141,6 +146,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Diagnose {
             target: DiagnoseTarget::Neighbors { socket },
         } => run_client(&socket, Command::DiagnoseNeighbors).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Firewall { socket },
+        } => run_client(&socket, Command::DiagnoseFirewall).await,
         CliCommand::Diagnose {
             target: DiagnoseTarget::History { limit, socket },
         } => run_client(&socket, Command::DiagnosticHistory { limit }).await,

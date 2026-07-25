@@ -20,9 +20,10 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
   OpenWrt-only ubus/UCI probes.
 - Deterministic `diagnose wan`, `diagnose dns`, `diagnose dhcp`,
   `diagnose routes`, `diagnose interfaces`, and `diagnose neighbors` runbooks.
-  They gather bounded, read-only evidence and normalize it across OpenWrt and
-  generic Linux. Focused runs execute only their required collectors; the WAN
-  run also includes firewall-backend and UCI zone evidence.
+  The additional `diagnose firewall` runbook normalizes runtime fw3/fw4,
+  iptables, and nftables counts. All gather bounded, read-only evidence across
+  OpenWrt and generic Linux. Focused runs execute only their required
+  collectors; the WAN run also includes firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
@@ -30,8 +31,9 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - A bounded read-only Agent loop with locally allowlisted `diagnose_wan`,
   `inspect_default_routes`, `inspect_dns`, `inspect_dhcp`,
   `inspect_wan_firewall`, `inspect_interfaces`, and `inspect_neighbors` tools.
-  Tool arguments are parsed and validated on-device, and the model can never
-  request active probes or shell commands.
+  Runtime firewall totals and base-chain policies are exposed through two more
+  expression-free tools. Tool arguments are parsed and validated on-device, and
+  the model can never request active probes or shell commands.
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
 administrator elevation, and configuration transactions are planned but are not
@@ -68,6 +70,7 @@ cargo run -p mbed-agent -- diagnose dhcp
 cargo run -p mbed-agent -- diagnose routes
 cargo run -p mbed-agent -- diagnose interfaces
 cargo run -p mbed-agent -- diagnose neighbors
+cargo run -p mbed-agent -- diagnose firewall
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 ```
@@ -117,6 +120,10 @@ not run route, DNS, firewall, or active-connectivity probes.
 64 validated entries, and distinguishes incomplete/failed resolution without
 claiming a root cause. Link-layer addresses remain available to the local CLI
 but are removed before an observation is sent to an LLM.
+`diagnose firewall` selects nftables for fw4/native nft systems and
+iptables-save/ip6tables-save for fw3/native iptables systems. It normalizes only
+bounded table, chain, rule, counter, hook, and policy metadata. Raw rule
+expressions remain local evidence and are never persisted or sent to an LLM.
 
 Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
 probe output is not persisted. History is bounded by configurable record-count

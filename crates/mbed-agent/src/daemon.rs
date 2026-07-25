@@ -327,6 +327,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseNeighbors => {
             return handle_neighbor_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseFirewall => {
+            return handle_firewall_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -576,6 +579,7 @@ struct AgentSnapshots {
     wan: Option<agent_protocol::WanDiagnosticReport>,
     interfaces: Option<agent_protocol::InterfaceDiagnosticReport>,
     neighbors: Option<agent_protocol::NeighborDiagnosticReport>,
+    firewall: Option<agent_protocol::FirewallDiagnosticReport>,
 }
 
 async fn execute_agent_tool(
@@ -597,6 +601,10 @@ async fn execute_agent_tool(
         }
         ReadOnlyAgentTool::InspectNeighbors => {
             execute_neighbor_agent_tool(call, request_id, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectFirewallRuntime
+        | ReadOnlyAgentTool::InspectFirewallBaseChains => {
+            execute_firewall_agent_tool(call, request_id, tool, state, snapshots).await
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
@@ -678,6 +686,46 @@ async fn execute_neighbor_agent_tool(
     })
 }
 
+async fn execute_firewall_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.firewall.is_none() {
+        let report = execute_agent_firewall_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-firewall-tool-snapshot"),
+            "firewall",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.firewall = Some(report);
+    }
+    let report = snapshots.firewall.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "firewall snapshot cache is unavailable",
+        )
+    })?;
+    let content =
+        bounded_firewall_observation(tool, report, state.config.llm.max_tool_context_bytes)
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
 async fn execute_wan_agent_tool(
     call: &ToolCall,
     request_id: &str,
@@ -741,10 +789,12 @@ enum ReadOnlyAgentTool {
     InspectWanFirewall,
     InspectInterfaces,
     InspectNeighbors,
+    InspectFirewallRuntime,
+    InspectFirewallBaseChains,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
@@ -752,6 +802,8 @@ impl ReadOnlyAgentTool {
         Self::InspectWanFirewall,
         Self::InspectInterfaces,
         Self::InspectNeighbors,
+        Self::InspectFirewallRuntime,
+        Self::InspectFirewallBaseChains,
     ];
 
     const fn name(self) -> &'static str {
@@ -763,6 +815,8 @@ impl ReadOnlyAgentTool {
             Self::InspectWanFirewall => "inspect_wan_firewall",
             Self::InspectInterfaces => "inspect_interfaces",
             Self::InspectNeighbors => "inspect_neighbors",
+            Self::InspectFirewallRuntime => "inspect_firewall_runtime",
+            Self::InspectFirewallBaseChains => "inspect_firewall_base_chains",
         }
     }
 
@@ -788,6 +842,12 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectNeighbors => {
                 "Inspect bounded ARP and IPv6 NDP neighbor state without generating traffic; link-layer addresses are withheld from model context."
+            }
+            Self::InspectFirewallRuntime => {
+                "Inspect bounded runtime firewall backend, table, chain, rule, and counter totals without exposing rule expressions."
+            }
+            Self::InspectFirewallBaseChains => {
+                "Inspect bounded firewall base-chain hooks, policies, and rule counts without exposing individual rules."
             }
         }
     }
@@ -895,6 +955,24 @@ async fn execute_agent_neighbor_diagnostic(
     }
 }
 
+async fn execute_agent_firewall_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::FirewallDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_firewall(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -968,6 +1046,28 @@ struct NeighborObservation<'a> {
     context_truncated: bool,
 }
 
+#[derive(serde::Serialize)]
+struct FirewallRuntimeObservation<'a> {
+    assessment: agent_protocol::FirewallAssessment,
+    backend: &'a str,
+    tables: u32,
+    chains: u32,
+    rules: u32,
+    rules_with_counters: u32,
+    truncated: bool,
+    complete: bool,
+}
+
+#[derive(serde::Serialize)]
+struct FirewallBaseChainObservation<'a> {
+    assessment: agent_protocol::FirewallAssessment,
+    backend: &'a str,
+    base_chains: &'a [agent_protocol::FirewallBaseChain],
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
 fn bounded_tool_observation(
     tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
@@ -1035,7 +1135,55 @@ fn bounded_tool_observation(
         ReadOnlyAgentTool::InspectNeighbors => {
             Err("neighbor observations require a neighbor snapshot".into())
         }
+        ReadOnlyAgentTool::InspectFirewallRuntime
+        | ReadOnlyAgentTool::InspectFirewallBaseChains => {
+            Err("firewall observations require a firewall snapshot".into())
+        }
     }
+}
+
+fn bounded_firewall_observation(
+    tool: ReadOnlyAgentTool,
+    report: &agent_protocol::FirewallDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    if tool == ReadOnlyAgentTool::InspectFirewallRuntime {
+        return encode_tool_observation(
+            tool.name(),
+            &FirewallRuntimeObservation {
+                assessment: report.summary.assessment,
+                backend: &report.summary.backend,
+                tables: report.summary.tables,
+                chains: report.summary.chains,
+                rules: report.summary.rules,
+                rules_with_counters: report.summary.rules_with_counters,
+                truncated: report.summary.truncated,
+                complete: report.complete,
+            },
+            limit,
+        );
+    }
+    for retained in (0..=report.summary.base_chains.len()).rev() {
+        let result = encode_tool_observation(
+            tool.name(),
+            &FirewallBaseChainObservation {
+                assessment: report.summary.assessment,
+                backend: &report.summary.backend,
+                base_chains: &report.summary.base_chains[..retained],
+                truncated: report.summary.truncated,
+                complete: report.complete,
+                context_truncated: retained < report.summary.base_chains.len(),
+            },
+            limit,
+        );
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        tool.name()
+    ))
 }
 
 fn bounded_neighbor_observation(
@@ -1389,6 +1537,51 @@ async fn handle_neighbor_diagnosis(id: String, state: &AppState) -> ServerRespon
     ServerResponse::success(id, ResponseData::NeighborDiagnostic(Box::new(report)))
 }
 
+async fn handle_firewall_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_firewall(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("firewall diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "firewall diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "firewall",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::FirewallDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -1693,6 +1886,45 @@ mod tests {
                 .as_array()
                 .is_some_and(|entries| entries.len() < 20)
         );
+    }
+
+    #[test]
+    fn firewall_base_chain_observation_shrinks_without_rule_expressions() {
+        let base_chains = (0..32)
+            .map(|index| agent_protocol::FirewallBaseChain {
+                family: "inet".into(),
+                table: "fw4".into(),
+                name: format!("input_{index}"),
+                hook: Some("input".into()),
+                policy: Some("DROP".into()),
+                rules: 20,
+            })
+            .collect();
+        let report = agent_protocol::FirewallDiagnosticReport {
+            summary: agent_protocol::FirewallRuntimeSummary {
+                assessment: agent_protocol::FirewallAssessment::RuntimeRulesPresent,
+                backend: "fw4/nftables".into(),
+                tables: 1,
+                chains: 40,
+                rules: 640,
+                rules_with_counters: 640,
+                base_chains,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            complete: true,
+        };
+        let encoded = bounded_firewall_observation(
+            ReadOnlyAgentTool::InspectFirewallBaseChains,
+            &report,
+            1024,
+        )
+        .expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        assert!(!encoded.contains("expr"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["context_truncated"], true);
     }
 
     #[test]

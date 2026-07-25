@@ -22,6 +22,7 @@ pub enum Command {
     DiagnoseRoutes,
     DiagnoseInterfaces,
     DiagnoseNeighbors,
+    DiagnoseFirewall,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -77,6 +78,7 @@ pub enum ResponseData {
     RouteDiagnostic(Box<RouteDiagnosticReport>),
     InterfaceDiagnostic(Box<InterfaceDiagnosticReport>),
     NeighborDiagnostic(Box<NeighborDiagnosticReport>),
+    FirewallDiagnostic(Box<FirewallDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -304,6 +306,57 @@ impl NeighborAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallDiagnosticReport {
+    pub summary: FirewallRuntimeSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallRuntimeSummary {
+    pub assessment: FirewallAssessment,
+    pub backend: String,
+    pub tables: u32,
+    pub chains: u32,
+    pub rules: u32,
+    pub rules_with_counters: u32,
+    pub base_chains: Vec<FirewallBaseChain>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallBaseChain {
+    pub family: String,
+    pub table: String,
+    pub name: String,
+    pub hook: Option<String>,
+    pub policy: Option<String>,
+    pub rules: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallAssessment {
+    RuntimeRulesPresent,
+    EmptyRuleset,
+    BackendUnavailable,
+    InsufficientEvidence,
+}
+
+impl FirewallAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeRulesPresent => "runtime_rules_present",
+            Self::EmptyRuleset => "empty_ruleset",
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -472,6 +525,7 @@ mod tests {
             Command::DiagnoseRoutes,
             Command::DiagnoseInterfaces,
             Command::DiagnoseNeighbors,
+            Command::DiagnoseFirewall,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,

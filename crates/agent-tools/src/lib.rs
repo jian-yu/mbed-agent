@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use agent_protocol::{
     DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
+    FirewallAssessment, FirewallBaseChain, FirewallDiagnosticReport, FirewallRuntimeSummary,
     FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceSummary,
     NeighborAssessment, NeighborDiagnosticReport, NeighborEntry, NeighborSummary,
     NetworkInterfaceSummary, ProbeEvidence, ProbeStatus, RouteDiagnosticReport, RouteSummary,
@@ -22,6 +23,7 @@ const MAX_INTERFACES: usize = 32;
 const MAX_ADDRESSES_PER_INTERFACE: usize = 8;
 const MAX_NEIGHBORS: usize = 64;
 const MAX_NEIGHBOR_STATES: usize = 4;
+const MAX_FIREWALL_BASE_CHAINS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -163,6 +165,47 @@ impl ToolRunner {
             .collect_passive(platform, DiagnosticScope::Neighbors)
             .await?;
         Ok(build_neighbor_report(evidence))
+    }
+
+    /// Inspects the active firewall ruleset without exposing rule expressions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_firewall(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<FirewallDiagnosticReport> {
+        let evidence = match platform.firewall.backend {
+            FirewallBackend::Fw4 | FirewallBackend::Nftables => vec![
+                self.run_command(
+                    "network.firewall.nftables",
+                    "nft",
+                    &["-j", "list", "ruleset"],
+                )
+                .await?,
+            ],
+            FirewallBackend::Fw3 | FirewallBackend::Iptables => {
+                let mut evidence = vec![
+                    self.run_command("network.firewall.iptables_ipv4", "iptables-save", &["-c"])
+                        .await?,
+                ];
+                evidence.push(
+                    self.run_command("network.firewall.iptables_ipv6", "ip6tables-save", &["-c"])
+                        .await?,
+                );
+                evidence
+            }
+            FirewallBackend::Unknown => vec![ProbeEvidence {
+                probe: "network.firewall.runtime".into(),
+                source: "capability-discovery".into(),
+                status: ProbeStatus::Unavailable,
+                output: String::new(),
+                truncated: false,
+                duration_ms: 0,
+            }],
+        };
+        Ok(build_firewall_report(evidence, platform.firewall.backend))
     }
 
     async fn collect_passive(
@@ -1352,6 +1395,208 @@ fn valid_link_address(address: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'-' | b'.'))
 }
 
+fn build_firewall_report(
+    evidence: Vec<ProbeEvidence>,
+    backend: FirewallBackend,
+) -> FirewallDiagnosticReport {
+    let mut summary = FirewallRuntimeSummary {
+        assessment: FirewallAssessment::InsufficientEvidence,
+        backend: firewall_backend_name(backend).into(),
+        tables: 0,
+        chains: 0,
+        rules: 0,
+        rules_with_counters: 0,
+        base_chains: Vec::new(),
+        truncated: false,
+    };
+    if let Some(output) = successful_output(&evidence, "network.firewall.nftables") {
+        parse_nft_ruleset(output, &mut summary);
+    }
+    for (probe, family) in [
+        ("network.firewall.iptables_ipv4", "ipv4"),
+        ("network.firewall.iptables_ipv6", "ipv6"),
+    ] {
+        if let Some(output) = successful_output(&evidence, probe) {
+            parse_iptables_save(output, family, &mut summary);
+        }
+    }
+    let has_runtime_evidence = evidence.iter().any(|item| item.status == ProbeStatus::Ok);
+    summary.assessment = if backend == FirewallBackend::Unknown || !has_runtime_evidence {
+        FirewallAssessment::BackendUnavailable
+    } else if summary.rules == 0 {
+        FirewallAssessment::EmptyRuleset
+    } else {
+        FirewallAssessment::RuntimeRulesPresent
+    };
+    let mut findings = vec![match summary.assessment {
+        FirewallAssessment::RuntimeRulesPresent => {
+            "runtime firewall tables, chains, and rules are present; rule expressions were not normalized"
+        }
+        FirewallAssessment::EmptyRuleset => {
+            "the detected firewall backend returned no runtime rules"
+        }
+        FirewallAssessment::BackendUnavailable => {
+            "the runtime firewall backend or its read-only inspection command is unavailable"
+        }
+        FirewallAssessment::InsufficientEvidence => {
+            "runtime firewall evidence is insufficient"
+        }
+    }
+    .into()];
+    if summary.truncated || evidence.iter().any(|item| item.truncated) {
+        findings
+            .push("firewall inspection reached a configured byte or normalized-entry limit".into());
+    }
+    FirewallDiagnosticReport {
+        complete: has_runtime_evidence
+            && !summary.truncated
+            && !evidence.iter().any(|item| item.truncated),
+        summary,
+        evidence,
+        findings,
+    }
+}
+
+fn parse_nft_ruleset(output: &str, summary: &mut FirewallRuntimeSummary) {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(output) else {
+        return;
+    };
+    let Some(objects) = root.get("nftables").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for object in objects {
+        if object.get("table").is_some() {
+            summary.tables = summary.tables.saturating_add(1);
+        }
+        let Some(chain) = object.get("chain") else {
+            continue;
+        };
+        summary.chains = summary.chains.saturating_add(1);
+        let hook = bounded_json_string(chain, "hook", 32);
+        if hook.is_none() {
+            continue;
+        }
+        push_firewall_base_chain(
+            summary,
+            FirewallBaseChain {
+                family: bounded_json_string(chain, "family", 16)
+                    .unwrap_or_else(|| "unknown".into()),
+                table: bounded_json_string(chain, "table", 64).unwrap_or_else(|| "unknown".into()),
+                name: bounded_json_string(chain, "name", 64).unwrap_or_else(|| "unknown".into()),
+                hook,
+                policy: bounded_json_string(chain, "policy", 16)
+                    .map(|policy| policy.to_ascii_uppercase()),
+                rules: 0,
+            },
+        );
+    }
+    for object in objects {
+        let Some(rule) = object.get("rule") else {
+            continue;
+        };
+        summary.rules = summary.rules.saturating_add(1);
+        let has_counter = rule
+            .get("expr")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|expressions| {
+                expressions
+                    .iter()
+                    .any(|expression| expression.get("counter").is_some())
+            });
+        if has_counter {
+            summary.rules_with_counters = summary.rules_with_counters.saturating_add(1);
+        }
+        let family = bounded_json_string(rule, "family", 16);
+        let table = bounded_json_string(rule, "table", 64);
+        let chain = bounded_json_string(rule, "chain", 64);
+        if let Some(base) = summary.base_chains.iter_mut().find(|base| {
+            Some(base.family.as_str()) == family.as_deref()
+                && Some(base.table.as_str()) == table.as_deref()
+                && Some(base.name.as_str()) == chain.as_deref()
+        }) {
+            base.rules = base.rules.saturating_add(1);
+        }
+    }
+}
+
+fn parse_iptables_save(output: &str, family: &str, summary: &mut FirewallRuntimeSummary) {
+    let mut table = None;
+    for line in output.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('*').filter(|name| {
+            !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
+        }) {
+            table = Some(name.to_owned());
+            summary.tables = summary.tables.saturating_add(1);
+            continue;
+        }
+        if let Some(chain) = line.strip_prefix(':') {
+            let mut fields = chain.split_whitespace();
+            let Some(name) = fields.next().filter(|name| name.len() <= 64) else {
+                continue;
+            };
+            let policy = fields
+                .next()
+                .filter(|policy| *policy != "-")
+                .map(str::to_ascii_uppercase);
+            summary.chains = summary.chains.saturating_add(1);
+            if policy.is_some() {
+                push_firewall_base_chain(
+                    summary,
+                    FirewallBaseChain {
+                        family: family.into(),
+                        table: table.clone().unwrap_or_else(|| "unknown".into()),
+                        name: name.into(),
+                        hook: Some(name.to_ascii_lowercase()),
+                        policy,
+                        rules: 0,
+                    },
+                );
+            }
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let mut appended_chain = None;
+        while let Some(field) = fields.next() {
+            if field == "-A" {
+                appended_chain = fields.next();
+                break;
+            }
+        }
+        let Some(chain) = appended_chain.filter(|chain| chain.len() <= 64) else {
+            continue;
+        };
+        summary.rules = summary.rules.saturating_add(1);
+        if line.starts_with('[') {
+            summary.rules_with_counters = summary.rules_with_counters.saturating_add(1);
+        }
+        if let Some(base) = summary.base_chains.iter_mut().find(|base| {
+            base.family == family
+                && Some(base.table.as_str()) == table.as_deref()
+                && base.name == chain
+        }) {
+            base.rules = base.rules.saturating_add(1);
+        }
+    }
+}
+
+fn push_firewall_base_chain(summary: &mut FirewallRuntimeSummary, chain: FirewallBaseChain) {
+    if summary.base_chains.len() >= MAX_FIREWALL_BASE_CHAINS {
+        summary.truncated = true;
+    } else if !summary.base_chains.contains(&chain) {
+        summary.base_chains.push(chain);
+    }
+}
+
+const fn firewall_backend_name(backend: FirewallBackend) -> &'static str {
+    match backend {
+        FirewallBackend::Fw3 => "fw3/iptables",
+        FirewallBackend::Fw4 => "fw4/nftables",
+        FirewallBackend::Iptables => "iptables",
+        FirewallBackend::Nftables => "nftables",
+        FirewallBackend::Unknown => "unknown",
+    }
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -1922,6 +2167,68 @@ printf '%s\n' '[{"dst":"192.0.2.1","dev":"eth0","lladdr":"00:11:22:AA:BB:CC","st
         assert_eq!(report.summary.entries.len(), MAX_NEIGHBORS);
         assert!(report.summary.truncated);
         assert!(!report.complete);
+    }
+
+    #[test]
+    fn normalizes_nftables_runtime_counts_and_base_chains() {
+        let output = serde_json::json!({
+            "nftables": [
+                {"metainfo": {"version": "1.0"}},
+                {"table": {"family": "inet", "name": "fw4"}},
+                {"chain": {"family": "inet", "table": "fw4", "name": "input", "hook": "input", "policy": "drop"}},
+                {"chain": {"family": "inet", "table": "fw4", "name": "helper"}},
+                {"rule": {"family": "inet", "table": "fw4", "chain": "input", "expr": [{"counter": {"packets": 2, "bytes": 128}}]}},
+                {"rule": {"family": "inet", "table": "fw4", "chain": "helper", "expr": [{"accept": null}]}}
+            ]
+        });
+        let report = build_firewall_report(
+            vec![ok_evidence(
+                "network.firewall.nftables",
+                &serde_json::to_string(&output).expect("nft JSON"),
+            )],
+            FirewallBackend::Fw4,
+        );
+        assert_eq!(
+            report.summary.assessment,
+            FirewallAssessment::RuntimeRulesPresent
+        );
+        assert_eq!(report.summary.backend, "fw4/nftables");
+        assert_eq!(report.summary.tables, 1);
+        assert_eq!(report.summary.chains, 2);
+        assert_eq!(report.summary.rules, 2);
+        assert_eq!(report.summary.rules_with_counters, 1);
+        assert_eq!(report.summary.base_chains.len(), 1);
+        assert_eq!(
+            report.summary.base_chains[0].policy.as_deref(),
+            Some("DROP")
+        );
+        assert_eq!(report.summary.base_chains[0].rules, 1);
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn normalizes_fw3_ipv4_and_ipv6_rules_without_expressions() {
+        let ipv4 = "*filter\n:INPUT DROP [0:0]\n:FORWARD DROP [0:0]\n[2:128] -A INPUT -i lo -j ACCEPT\nCOMMIT\n";
+        let ipv6 = "*filter\n:INPUT ACCEPT [0:0]\n[1:64] -A INPUT -p ipv6-icmp -j ACCEPT\nCOMMIT\n";
+        let report = build_firewall_report(
+            vec![
+                ok_evidence("network.firewall.iptables_ipv4", ipv4),
+                ok_evidence("network.firewall.iptables_ipv6", ipv6),
+            ],
+            FirewallBackend::Fw3,
+        );
+        assert_eq!(report.summary.tables, 2);
+        assert_eq!(report.summary.chains, 3);
+        assert_eq!(report.summary.rules, 2);
+        assert_eq!(report.summary.rules_with_counters, 2);
+        assert_eq!(report.summary.base_chains.len(), 3);
+        assert!(
+            report
+                .summary
+                .base_chains
+                .iter()
+                .any(|chain| chain.family == "ipv6" && chain.policy.as_deref() == Some("ACCEPT"))
+        );
     }
 
     #[test]
