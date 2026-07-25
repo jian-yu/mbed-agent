@@ -24,6 +24,7 @@ pub enum Command {
     DiagnoseNeighbors,
     DiagnoseFirewall,
     DiagnosePolicyRouting,
+    DiagnoseListeners,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -81,6 +82,7 @@ pub enum ResponseData {
     NeighborDiagnostic(Box<NeighborDiagnosticReport>),
     FirewallDiagnostic(Box<FirewallDiagnosticReport>),
     PolicyRoutingDiagnostic(Box<PolicyRoutingDiagnosticReport>),
+    ListenerDiagnostic(Box<ListenerDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -417,6 +419,59 @@ impl PolicyRoutingAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListenerDiagnosticReport {
+    pub summary: ListenerSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListenerSummary {
+    pub assessment: ListenerAssessment,
+    pub listeners: Vec<ListenerEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListenerEntry {
+    pub protocol: String,
+    pub family: String,
+    pub local_address: String,
+    pub port: u16,
+    pub scope: ListenerScope,
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerScope {
+    Wildcard,
+    Loopback,
+    LinkLocal,
+    Specific,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerAssessment {
+    ListenersPresent,
+    NoListeners,
+    CollectorUnavailable,
+}
+
+impl ListenerAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ListenersPresent => "listeners_present",
+            Self::NoListeners => "no_listeners",
+            Self::CollectorUnavailable => "collector_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -587,6 +642,7 @@ mod tests {
             Command::DiagnoseNeighbors,
             Command::DiagnoseFirewall,
             Command::DiagnosePolicyRouting,
+            Command::DiagnoseListeners,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,

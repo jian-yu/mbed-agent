@@ -146,6 +146,8 @@ impl Discovery {
             "openrc",
             "iwinfo",
             "ip",
+            "ss",
+            "netstat",
         ];
         let available_commands: Vec<String> = commands
             .into_iter()

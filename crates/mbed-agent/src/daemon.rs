@@ -333,6 +333,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnosePolicyRouting => {
             return handle_policy_routing_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseListeners => {
+            return handle_listener_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -584,6 +587,7 @@ struct AgentSnapshots {
     neighbors: Option<agent_protocol::NeighborDiagnosticReport>,
     firewall: Option<agent_protocol::FirewallDiagnosticReport>,
     policy_routing: Option<agent_protocol::PolicyRoutingDiagnosticReport>,
+    listeners: Option<agent_protocol::ListenerDiagnosticReport>,
 }
 
 async fn execute_agent_tool(
@@ -612,6 +616,9 @@ async fn execute_agent_tool(
         }
         ReadOnlyAgentTool::InspectPolicyRules | ReadOnlyAgentTool::InspectRouteTables => {
             execute_policy_routing_agent_tool(call, request_id, tool, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectListeningPorts | ReadOnlyAgentTool::InspectExposedServices => {
+            execute_listener_agent_tool(call, request_id, tool, state, snapshots).await
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
@@ -773,6 +780,46 @@ async fn execute_policy_routing_agent_tool(
     })
 }
 
+async fn execute_listener_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.listeners.is_none() {
+        let report = execute_agent_listener_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-listener-tool-snapshot"),
+            "listeners",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.listeners = Some(report);
+    }
+    let report = snapshots.listeners.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "listener snapshot cache is unavailable",
+        )
+    })?;
+    let content =
+        bounded_listener_observation(tool, report, state.config.llm.max_tool_context_bytes)
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
 async fn execute_wan_agent_tool(
     call: &ToolCall,
     request_id: &str,
@@ -840,10 +887,12 @@ enum ReadOnlyAgentTool {
     InspectFirewallBaseChains,
     InspectPolicyRules,
     InspectRouteTables,
+    InspectListeningPorts,
+    InspectExposedServices,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 13] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
@@ -855,6 +904,8 @@ impl ReadOnlyAgentTool {
         Self::InspectFirewallBaseChains,
         Self::InspectPolicyRules,
         Self::InspectRouteTables,
+        Self::InspectListeningPorts,
+        Self::InspectExposedServices,
     ];
 
     const fn name(self) -> &'static str {
@@ -870,6 +921,8 @@ impl ReadOnlyAgentTool {
             Self::InspectFirewallBaseChains => "inspect_firewall_base_chains",
             Self::InspectPolicyRules => "inspect_policy_rules",
             Self::InspectRouteTables => "inspect_route_tables",
+            Self::InspectListeningPorts => "inspect_listening_ports",
+            Self::InspectExposedServices => "inspect_exposed_services",
         }
     }
 
@@ -907,6 +960,12 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectRouteTables => {
                 "Inspect aggregate route counts, default routes, and exceptional routes per bounded routing table without exposing every route."
+            }
+            Self::InspectListeningPorts => {
+                "Inspect bounded TCP/UDP listening ports and binding scope without collecting process identities or exposing exact addresses."
+            }
+            Self::InspectExposedServices => {
+                "Inspect only non-loopback TCP/UDP listening ports that may be reachable from a link or wider network."
             }
         }
     }
@@ -1050,6 +1109,24 @@ async fn execute_agent_policy_routing_diagnostic(
     }
 }
 
+async fn execute_agent_listener_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::ListenerDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_listeners(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -1164,6 +1241,25 @@ struct RouteTableObservation<'a> {
     context_truncated: bool,
 }
 
+#[derive(serde::Serialize)]
+struct ListenerObservationEntry<'a> {
+    protocol: &'a str,
+    family: &'a str,
+    port: u16,
+    scope: agent_protocol::ListenerScope,
+    state: &'a Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ListenerObservation<'a> {
+    assessment: agent_protocol::ListenerAssessment,
+    listeners: &'a [ListenerObservationEntry<'a>],
+    source_entries: usize,
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
 fn bounded_tool_observation(
     tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
@@ -1238,7 +1334,54 @@ fn bounded_tool_observation(
         ReadOnlyAgentTool::InspectPolicyRules | ReadOnlyAgentTool::InspectRouteTables => {
             Err("policy-routing observations require a policy-routing snapshot".into())
         }
+        ReadOnlyAgentTool::InspectListeningPorts | ReadOnlyAgentTool::InspectExposedServices => {
+            Err("listener observations require a listener snapshot".into())
+        }
     }
+}
+
+fn bounded_listener_observation(
+    tool: ReadOnlyAgentTool,
+    report: &agent_protocol::ListenerDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    let exposed_only = tool == ReadOnlyAgentTool::InspectExposedServices;
+    let listeners: Vec<ListenerObservationEntry<'_>> = report
+        .summary
+        .listeners
+        .iter()
+        .filter(|listener| {
+            !exposed_only || listener.scope != agent_protocol::ListenerScope::Loopback
+        })
+        .map(|listener| ListenerObservationEntry {
+            protocol: &listener.protocol,
+            family: &listener.family,
+            port: listener.port,
+            scope: listener.scope,
+            state: &listener.state,
+        })
+        .collect();
+    for retained in (0..=listeners.len()).rev() {
+        let result = encode_tool_observation(
+            tool.name(),
+            &ListenerObservation {
+                assessment: report.summary.assessment,
+                listeners: &listeners[..retained],
+                source_entries: report.summary.listeners.len(),
+                truncated: report.summary.truncated,
+                complete: report.complete,
+                context_truncated: retained < listeners.len(),
+            },
+            limit,
+        );
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        tool.name()
+    ))
 }
 
 fn bounded_policy_routing_observation(
@@ -1773,6 +1916,51 @@ async fn handle_policy_routing_diagnosis(id: String, state: &AppState) -> Server
     ServerResponse::success(id, ResponseData::PolicyRoutingDiagnostic(Box::new(report)))
 }
 
+async fn handle_listener_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_listeners(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("listener diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "listener diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "listeners",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::ListenerDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -2158,6 +2346,52 @@ mod tests {
         assert!(encoded.len() <= 1024);
         let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
         assert_eq!(value["context_truncated"], true);
+    }
+
+    #[test]
+    fn listener_observation_omits_addresses_and_filters_loopback() {
+        let listeners = (0..100)
+            .map(|index| agent_protocol::ListenerEntry {
+                protocol: "tcp".into(),
+                family: "ipv4".into(),
+                local_address: if index % 2 == 0 {
+                    "127.0.0.1".into()
+                } else {
+                    "192.0.2.1".into()
+                },
+                port: 1000 + index,
+                scope: if index % 2 == 0 {
+                    agent_protocol::ListenerScope::Loopback
+                } else {
+                    agent_protocol::ListenerScope::Specific
+                },
+                state: Some("LISTEN".into()),
+            })
+            .collect();
+        let report = agent_protocol::ListenerDiagnosticReport {
+            summary: agent_protocol::ListenerSummary {
+                assessment: agent_protocol::ListenerAssessment::ListenersPresent,
+                listeners,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            complete: true,
+        };
+        let encoded =
+            bounded_listener_observation(ReadOnlyAgentTool::InspectExposedServices, &report, 1024)
+                .expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        assert!(!encoded.contains("127.0.0.1"));
+        assert!(!encoded.contains("192.0.2.1"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["source_entries"], 100);
+        assert_eq!(value["context_truncated"], true);
+        assert!(value["listeners"].as_array().is_some_and(|listeners| {
+            listeners
+                .iter()
+                .all(|listener| listener["scope"] != "loopback")
+        }));
     }
 
     #[test]

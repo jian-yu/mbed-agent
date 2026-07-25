@@ -103,6 +103,11 @@ enum DiagnoseTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Inspect bounded TCP/UDP listeners without process identities.
+    Listeners {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Show volatile diagnostic summaries from this boot.
     History {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
@@ -157,6 +162,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Diagnose {
             target: DiagnoseTarget::PolicyRouting { socket },
         } => run_client(&socket, Command::DiagnosePolicyRouting).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Listeners { socket },
+        } => run_client(&socket, Command::DiagnoseListeners).await,
         CliCommand::Diagnose {
             target: DiagnoseTarget::History { limit, socket },
         } => run_client(&socket, Command::DiagnosticHistory { limit }).await,

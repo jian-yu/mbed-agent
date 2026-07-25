@@ -809,7 +809,7 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 
 - Agent loop、OpenAI-compatible provider、stream parser。
 - 20–30 个 R0/R1 typed tools。
-- WAN/DNS/DHCP/路由四个故障 Runbook，以及跨 OpenWrt/通用 Linux 的有界接口、ARP/NDP 邻居、策略路由和 fw3/fw4/原生防火墙运行态清单。
+- WAN/DNS/DHCP/路由四个故障 Runbook，以及跨 OpenWrt/通用 Linux 的有界接口、ARP/NDP 邻居、监听暴露面、策略路由和 fw3/fw4/原生防火墙运行态清单。
 - `/tmp` SQLite 中的 session/task/turn/audit 和本地 CLI。
 - prompt/tool budget、输出截断、secret redaction。
 

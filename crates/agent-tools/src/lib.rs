@@ -9,6 +9,7 @@ use agent_protocol::{
     DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
     FirewallAssessment, FirewallBaseChain, FirewallDiagnosticReport, FirewallRuntimeSummary,
     FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceSummary,
+    ListenerAssessment, ListenerDiagnosticReport, ListenerEntry, ListenerScope, ListenerSummary,
     NeighborAssessment, NeighborDiagnosticReport, NeighborEntry, NeighborSummary,
     NetworkInterfaceSummary, PolicyRoutingAssessment, PolicyRoutingDiagnosticReport,
     PolicyRoutingSummary, PolicyRule, ProbeEvidence, ProbeStatus, RouteDiagnosticReport,
@@ -27,6 +28,7 @@ const MAX_NEIGHBOR_STATES: usize = 4;
 const MAX_FIREWALL_BASE_CHAINS: usize = 32;
 const MAX_POLICY_RULES: usize = 64;
 const MAX_ROUTE_TABLES: usize = 32;
+const MAX_LISTENERS: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -222,6 +224,26 @@ impl ToolRunner {
             self.run(Probe::IpRoute).await?,
         ];
         Ok(build_policy_routing_report(evidence))
+    }
+
+    /// Inspects bounded TCP/UDP listeners without collecting process identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_listeners(&self) -> io::Result<ListenerDiagnosticReport> {
+        let evidence = if self.resolve("ss").is_some() {
+            vec![
+                self.run_command("network.socket.listeners", "ss", &["-H", "-lntu"])
+                    .await?,
+            ]
+        } else {
+            vec![
+                self.run_command("network.socket.listeners", "netstat", &["-lntu"])
+                    .await?,
+            ]
+        };
+        Ok(build_listener_report(evidence))
     }
 
     async fn collect_passive(
@@ -1810,6 +1832,170 @@ fn is_custom_policy_rule(rule: &PolicyRule) -> bool {
             .is_some_and(|action| !matches!(action, "lookup" | "to_tbl"))
 }
 
+fn build_listener_report(evidence: Vec<ProbeEvidence>) -> ListenerDiagnosticReport {
+    let mut listeners = Vec::new();
+    let mut truncated = false;
+    let successful = evidence
+        .iter()
+        .find(|item| item.probe == "network.socket.listeners" && item.status == ProbeStatus::Ok);
+    if let Some(item) = successful {
+        let is_ss = Path::new(&item.source)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("ss");
+        parse_listeners(&item.output, is_ss, &mut listeners, &mut truncated);
+    }
+    listeners.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then_with(|| left.protocol.cmp(&right.protocol))
+            .then_with(|| left.local_address.cmp(&right.local_address))
+    });
+    let assessment = if successful.is_none() {
+        ListenerAssessment::CollectorUnavailable
+    } else if listeners.is_empty() {
+        ListenerAssessment::NoListeners
+    } else {
+        ListenerAssessment::ListenersPresent
+    };
+    let exposed = listeners
+        .iter()
+        .filter(|listener| listener.scope != ListenerScope::Loopback)
+        .count();
+    let mut findings = vec![match assessment {
+        ListenerAssessment::ListenersPresent => {
+            format!(
+                "{} bounded TCP/UDP listeners were normalized; {exposed} are bound outside loopback",
+                listeners.len()
+            )
+        }
+        ListenerAssessment::NoListeners => {
+            "the socket collector returned no TCP/UDP listeners".into()
+        }
+        ListenerAssessment::CollectorUnavailable => {
+            "neither a usable ss nor netstat listener collector is available".into()
+        }
+    }];
+    if truncated || evidence.iter().any(|item| item.truncated) {
+        findings
+            .push("listener inspection reached a configured byte or normalized-entry limit".into());
+    }
+    ListenerDiagnosticReport {
+        summary: ListenerSummary {
+            assessment,
+            listeners,
+            truncated,
+        },
+        complete: successful.is_some() && !truncated && !evidence.iter().any(|item| item.truncated),
+        evidence,
+        findings,
+    }
+}
+
+fn parse_listeners(
+    output: &str,
+    is_ss: bool,
+    listeners: &mut Vec<ListenerEntry>,
+    truncated: &mut bool,
+) {
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if listeners.len() >= MAX_LISTENERS {
+            *truncated = true;
+            break;
+        }
+        let parsed = if is_ss {
+            parse_ss_listener(line)
+        } else {
+            parse_netstat_listener(line)
+        };
+        if let Some(listener) = parsed {
+            if !listeners.contains(&listener) {
+                listeners.push(listener);
+            }
+        }
+    }
+}
+
+fn parse_ss_listener(line: &str) -> Option<ListenerEntry> {
+    let mut fields = line.split_whitespace();
+    let protocol = fields.next()?;
+    let state = fields.next();
+    let endpoint = line.split_whitespace().nth(4)?;
+    listener_entry(protocol, endpoint, state)
+}
+
+fn parse_netstat_listener(line: &str) -> Option<ListenerEntry> {
+    let mut fields = line.split_whitespace();
+    let protocol = fields.next()?;
+    if !matches!(protocol, "tcp" | "tcp6" | "udp" | "udp6") {
+        return None;
+    }
+    let endpoint = line.split_whitespace().nth(3)?;
+    let state = line
+        .split_whitespace()
+        .find(|field| matches!(*field, "LISTEN" | "UNCONN"));
+    listener_entry(protocol, endpoint, state)
+}
+
+fn listener_entry(protocol: &str, endpoint: &str, state: Option<&str>) -> Option<ListenerEntry> {
+    let protocol = match protocol {
+        "tcp" | "tcp6" => "tcp",
+        "udp" | "udp6" => "udp",
+        _ => return None,
+    };
+    let (raw_address, port) = endpoint.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    let normalized_address = if let Some(address) = raw_address.strip_prefix('[') {
+        let (address, suffix) = address.split_once(']')?;
+        format!("{address}{suffix}")
+    } else {
+        raw_address.into()
+    };
+    let raw_address = normalized_address.as_str();
+    if raw_address.is_empty() || raw_address.len() > 64 || raw_address.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let address_without_zone = raw_address.split('%').next().unwrap_or(raw_address);
+    let parsed = address_without_zone.parse::<IpAddr>().ok();
+    let scope = match (raw_address, parsed) {
+        ("*" | "0.0.0.0" | "::", _) => ListenerScope::Wildcard,
+        (_, Some(address)) if address.is_loopback() => ListenerScope::Loopback,
+        (_, Some(IpAddr::V4(address))) if address.is_link_local() => ListenerScope::LinkLocal,
+        (_, Some(IpAddr::V6(address))) if address.is_unicast_link_local() => {
+            ListenerScope::LinkLocal
+        }
+        (_, Some(_)) => ListenerScope::Specific,
+        _ => return None,
+    };
+    let family = parsed.map_or_else(
+        || {
+            if raw_address.contains(':') {
+                "ipv6"
+            } else {
+                "ipv4"
+            }
+        },
+        |address| {
+            if address.is_ipv4() { "ipv4" } else { "ipv6" }
+        },
+    );
+    Some(ListenerEntry {
+        protocol: protocol.into(),
+        family: family.into(),
+        local_address: raw_address.into(),
+        port,
+        scope,
+        state: state
+            .filter(|state| state.len() <= 16)
+            .map(str::to_ascii_uppercase),
+    })
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -1905,6 +2091,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn platform(backend: FirewallBackend) -> PlatformCapabilities {
         PlatformCapabilities {
@@ -2163,7 +2350,7 @@ printf '%s\n' '[{"dst":"default","gateway":"198.51.100.1","dev":"eth0","prefsrc"
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let mut generic = platform(FirewallBackend::Nftables);
@@ -2197,7 +2384,7 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let report = runner
@@ -2231,7 +2418,7 @@ printf '%s\n' '{"up":false,"available":true,"pending":true,"proto":"dhcp","l3_de
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let report = runner
@@ -2261,7 +2448,7 @@ printf '%s\n' '[{"dst":"default","gateway":"198.51.100.1","dev":"eth0","ifname":
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let mut generic = platform(FirewallBackend::Nftables);
@@ -2293,7 +2480,7 @@ printf '%s\n' '[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let mut generic = platform(FirewallBackend::Nftables);
@@ -2339,7 +2526,7 @@ printf '%s\n' '[{"dst":"192.0.2.1","dev":"eth0","lladdr":"00:11:22:AA:BB:CC","st
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let report = runner
@@ -2489,6 +2676,110 @@ printf '%s\n' '[{"dst":"192.0.2.1","dev":"eth0","lladdr":"00:11:22:AA:BB:CC","st
         assert!(!report.complete);
     }
 
+    #[tokio::test]
+    async fn listener_runbook_prefers_ss_and_classifies_binding_scope() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ss",
+            r"#!/bin/sh
+printf '%s\n' \
+'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' \
+'tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*' \
+'udp UNCONN 0 0 [fe80::1]%eth0:53 [::]:*' \
+'raw UNKNOWN 0 0 0.0.0.0:1 0.0.0.0:*'
+",
+        );
+        fixture.executable("bin/netstat", "#!/bin/sh\nexit 99\n");
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let report = runner.diagnose_listeners().await.expect("listeners");
+        assert_eq!(report.summary.listeners.len(), 3);
+        assert_eq!(
+            report.summary.assessment,
+            ListenerAssessment::ListenersPresent
+        );
+        assert!(
+            report
+                .evidence
+                .first()
+                .is_some_and(|item| item.source.ends_with("/ss"))
+        );
+        assert!(
+            report
+                .summary
+                .listeners
+                .iter()
+                .any(|listener| listener.port == 22 && listener.scope == ListenerScope::Wildcard)
+        );
+        assert!(
+            report
+                .summary
+                .listeners
+                .iter()
+                .any(|listener| listener.port == 8080 && listener.scope == ListenerScope::Loopback)
+        );
+        assert!(
+            report
+                .summary
+                .listeners
+                .iter()
+                .any(|listener| listener.port == 53 && listener.scope == ListenerScope::LinkLocal)
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_runbook_falls_back_to_busybox_netstat() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/netstat",
+            r"#!/bin/sh
+printf '%s\n' \
+'Active Internet connections (only servers)' \
+'Proto Recv-Q Send-Q Local Address Foreign Address State' \
+'tcp 0 0 :::443 :::* LISTEN' \
+'udp 0 0 0.0.0.0:67 0.0.0.0:*'
+",
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let report = runner.diagnose_listeners().await.expect("listeners");
+        assert!(report.complete);
+        assert_eq!(report.summary.listeners.len(), 2);
+        assert!(
+            report
+                .evidence
+                .first()
+                .is_some_and(|item| item.source.ends_with("/netstat"))
+        );
+    }
+
+    #[test]
+    fn listener_inventory_is_cardinality_bounded() {
+        let output = (1..=MAX_LISTENERS + 1)
+            .map(|port| format!("tcp LISTEN 0 128 0.0.0.0:{port} 0.0.0.0:*"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = build_listener_report(vec![ProbeEvidence {
+            probe: "network.socket.listeners".into(),
+            source: "/bin/ss".into(),
+            status: ProbeStatus::Ok,
+            output,
+            truncated: false,
+            duration_ms: 0,
+        }]);
+        assert_eq!(report.summary.listeners.len(), MAX_LISTENERS);
+        assert!(report.summary.truncated);
+        assert!(!report.complete);
+    }
+
     #[test]
     fn normalizes_fw3_ipv4_and_ipv6_rules_without_expressions() {
         let ipv4 = "*filter\n:INPUT DROP [0:0]\n:FORWARD DROP [0:0]\n[2:128] -A INPUT -i lo -j ACCEPT\nCOMMIT\n";
@@ -2556,7 +2847,7 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
         let runner = ToolRunner {
             root: fixture.root.clone(),
             command_dirs: vec![PathBuf::from("/bin")],
-            timeout: Duration::from_secs(3),
+            timeout: FIXTURE_TIMEOUT,
             max_output_bytes: 4096,
         };
         let report = runner
