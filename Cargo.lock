@@ -8,7 +8,9 @@ version = "0.1.0"
 dependencies = [
  "agent-protocol",
  "fs2",
+ "ring",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
 ]

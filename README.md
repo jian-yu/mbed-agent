@@ -17,6 +17,11 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
 - Runtime `/tmp` pressure admission and a bounded artifact cleaner. Critical
   pressure blocks new diagnostic/LLM tasks while status and history remain
   available.
+- The Phase 2 ChangeSet domain foundation: bounded typed object diffs, local
+  semantic risk escalation, SHA-256 plan digests that bind actor/boot/version
+  context, and a state machine that cannot skip approval, validation, rollback
+  arming, or verification. Approval tokens, persistence, and execution backends
+  remain disabled until their following slices are complete.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -64,6 +69,8 @@ Unknown or unmanaged objects remain read-only; no LLM-controlled raw shell,
 iptables, nft, UCI, or file-edit path is planned.
 This scope and its safety boundary are recorded in
 [ADR 0018](docs/adr/0018-maximal-safe-configurability.md).
+The implemented ChangeSet domain boundary is recorded in
+[ADR 0020](docs/adr/0020-changeset-domain-foundation.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

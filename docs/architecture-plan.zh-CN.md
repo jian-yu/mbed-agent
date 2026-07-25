@@ -968,6 +968,15 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 kill/重启和 `/tmp` 压力时，同一次开机内未确认变更可自动恢复；approval token
 不能重放或跨 actor/diff/boot 使用；设备重启后运行态记录清空且无恢复尝试。
 
+当前实现进度：已落地有界 ChangePlan/typed object diff、内容/版本摘要校验、
+语义风险只升不降、绑定 actor/boot/生命周期的规范化计划摘要，以及禁止跳过
+审批、staging、validation、rollback arm 和 verification 的状态机。计划摘要不是
+approval token；带设备启动期密钥的一次性 token、SQLite 状态持久化和独立
+rollback helper 仍按本阶段后续切片实现，在此之前不开放任何写工具。
+ChangePlan 只能由 daemon 的领域 planner 根据新鲜 before/after typed 对象生成，
+是返回给调用方的预览和内部持久化状态，不作为模型或 Channel 可直接提交执行的
+输入；风险信号同样由本地语义比较器产生。
+
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
 1. **防火墙完整策略**：OpenWrt UCI fw3/fw4 与普通 Linux nftables/iptables

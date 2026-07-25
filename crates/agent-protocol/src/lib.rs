@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const CHANGE_PLAN_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientRequest {
@@ -127,6 +128,128 @@ pub struct TaskHistoryEntry {
     pub duration_ms: u64,
     pub error_code: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangePlan {
+    pub schema_version: u16,
+    pub plan_id: String,
+    pub boot_id: String,
+    pub actor_id: String,
+    pub created_monotonic_ms: u64,
+    pub expires_monotonic_ms: u64,
+    pub risk: RiskLevel,
+    pub changes: Vec<ChangeDiff>,
+    pub validation_checks: Vec<String>,
+    pub verification_checks: Vec<String>,
+    pub rollback_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeDiff {
+    pub object: ConfigObjectRef,
+    pub operation: ChangeOperation,
+    pub before_digest: Option<String>,
+    pub after_digest: Option<String>,
+    pub summary: String,
+    pub sensitive_fields_redacted: bool,
+    pub risk_signals: ChangeRiskSignals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigObjectRef {
+    pub domain: ConfigDomain,
+    pub kind: String,
+    pub id: String,
+    pub expected_version: Option<String>,
+    pub ownership: ObjectOwnership,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+}
+
+impl RiskLevel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::R0 => "r0",
+            Self::R1 => "r1",
+            Self::R2 => "r2",
+            Self::R3 => "r3",
+            Self::R4 => "r4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDomain {
+    Firewall,
+    Network,
+    Dns,
+    Dhcp,
+    Wireless,
+    Service,
+    Qos,
+    WireGuard,
+    SystemNetwork,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOperation {
+    Create,
+    Update,
+    Delete,
+    Move,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectOwnership {
+    PlatformNative,
+    AgentOwned,
+    Unmanaged,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ChangeRiskSignals {
+    pub affects_management_path: bool,
+    pub widens_network_exposure: bool,
+    pub disrupts_service: bool,
+    pub changes_secret: bool,
+    pub changes_device_authentication: bool,
+    pub irreversible: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeSetState {
+    Draft,
+    Planned,
+    AwaitingApproval,
+    Approved,
+    Staged,
+    Validated,
+    RollbackArmed,
+    Applying,
+    Verifying,
+    AwaitingConfirmation,
+    Confirmed,
+    Rejected,
+    Expired,
+    ApplyFailed,
+    RollingBack,
+    RolledBack,
+    RollbackFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -879,5 +1002,42 @@ mod tests {
                 serde_json::from_str(&encoded).expect("deserialize request");
             assert_eq!(decoded, request);
         }
+    }
+
+    #[test]
+    fn change_plan_round_trip_preserves_security_fields() {
+        let plan = ChangePlan {
+            schema_version: CHANGE_PLAN_SCHEMA_VERSION,
+            plan_id: "plan-1".into(),
+            boot_id: "boot-1".into(),
+            actor_id: "cli/root".into(),
+            created_monotonic_ms: 100,
+            expires_monotonic_ms: 200,
+            risk: RiskLevel::R3,
+            changes: vec![ChangeDiff {
+                object: ConfigObjectRef {
+                    domain: ConfigDomain::Firewall,
+                    kind: "rule".into(),
+                    id: "managed-rule".into(),
+                    expected_version: None,
+                    ownership: ObjectOwnership::AgentOwned,
+                },
+                operation: ChangeOperation::Create,
+                before_digest: None,
+                after_digest: Some("a".repeat(64)),
+                summary: "create a managed firewall rule".into(),
+                sensitive_fields_redacted: true,
+                risk_signals: ChangeRiskSignals {
+                    widens_network_exposure: true,
+                    ..ChangeRiskSignals::default()
+                },
+            }],
+            validation_checks: vec!["firewall schema validates".into()],
+            verification_checks: vec!["management path remains reachable".into()],
+            rollback_required: true,
+        };
+        let encoded = serde_json::to_string(&plan).expect("serialize change plan");
+        let decoded: ChangePlan = serde_json::from_str(&encoded).expect("deserialize change plan");
+        assert_eq!(decoded, plan);
     }
 }
