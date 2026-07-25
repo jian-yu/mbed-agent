@@ -22,9 +22,14 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   context, and a state machine that cannot skip approval, validation, rollback
   arming, or verification. Volatile SQLite now stores bounded plans and
   atomically binds one-use approval-token digests to the exact actor, boot, and
-  plan while enforcing rollback deadlines. Token issuance, administrator
-  elevation, and execution backends remain disabled until their following
-  slices are complete.
+  plan while enforcing rollback deadlines.
+- Local administrator authentication uses a salted PBKDF2-HMAC-SHA256 verifier
+  from the root-only configuration. `mbed-agent auth elevate` grants only the
+  authenticated actor a short-lived, daemon-RAM `device-admin` capability bound
+  to the current boot ID and monotonic expiry. Password request buffers are
+  redacted and zeroized; neither passwords nor capabilities enter SQLite.
+  Approval-token issuance and execution backends remain disabled until their
+  following safety slices are complete.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -60,9 +65,9 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   commands.
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
-administrator elevation, and configuration transactions are planned but are not
-implemented yet. The configuration roadmap is intentionally broader than a few
-fixed operations: it targets capability-gated typed CRUD for firewall,
+Channel-facing elevation, and configuration transactions are planned but are
+not implemented yet. The configuration roadmap is intentionally broader than a
+few fixed operations: it targets capability-gated typed CRUD for firewall,
 interfaces/addresses, bridges/VLANs, routes, DNS/DHCP, wireless, controlled
 services, QoS, and WireGuard. OpenWrt will use UCI and its native fw3/fw4/netifd
 control planes; generic Linux will use supported adapters and Agent-owned
@@ -76,6 +81,8 @@ The implemented ChangeSet domain boundary is recorded in
 [ADR 0020](docs/adr/0020-changeset-domain-foundation.md).
 Volatile ChangeSet and one-use approval storage is recorded in
 [ADR 0021](docs/adr/0021-volatile-changeset-approval-store.md).
+Boot-bound local administrator elevation is recorded in
+[ADR 0022](docs/adr/0022-boot-bound-administrator-elevation.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -118,6 +125,29 @@ cargo run -p mbed-agent -- diagnose qdisc
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 ```
+
+To enable local administrator elevation, generate a salted verifier without
+placing the plaintext password in shell arguments:
+
+```sh
+printf '%s\n' 'replace-with-a-strong-password' \
+  | cargo run -p mbed-agent -- auth hash-password
+```
+
+Copy the result to `auth.admin_password_hash`, set `auth.enabled = true`, make
+the configuration mode `0600`, and restart the daemon. Elevate the local CLI
+actor by sending the password over stdin:
+
+```sh
+printf '%s\n' 'replace-with-a-strong-password' \
+  | cargo run -p mbed-agent -- auth elevate
+```
+
+The returned capability expires after `auth.capability_ttl_secs` and disappears
+on daemon restart. Failed authentication is rate-limited per actor with
+`auth.max_failures` and `auth.lockout_secs`. The same authenticator is designed
+for verified MQTT, WeCom, and WeChat actors, but those adapters are not connected
+yet. Passwords are never accepted as command-line arguments.
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart

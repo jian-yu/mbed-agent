@@ -1,11 +1,14 @@
 use std::error::Error;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_protocol::{ClientRequest, Command, PROTOCOL_VERSION, ServerResponse};
+use agent_core::generate_password_hash;
+use agent_protocol::{ClientRequest, Command, PROTOCOL_VERSION, SensitiveString, ServerResponse};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use zeroize::{Zeroize, Zeroizing};
 
 mod daemon;
 mod logging;
@@ -55,6 +58,11 @@ enum CliCommand {
     Task {
         #[command(subcommand)]
         target: TaskTarget,
+    },
+    /// Configure or request local administrator authentication.
+    Auth {
+        #[command(subcommand)]
+        target: AuthTarget,
     },
 }
 
@@ -148,6 +156,17 @@ enum TaskTarget {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AuthTarget {
+    /// Read a password from stdin and print a salted configuration hash.
+    HashPassword,
+    /// Read a password from stdin and elevate the local CLI actor in daemon RAM.
+    Elevate {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Args::parse().command {
@@ -203,7 +222,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Task {
             target: TaskTarget::History { limit, socket },
         } => run_client(&socket, Command::TaskHistory { limit }).await,
+        CliCommand::Auth {
+            target: AuthTarget::HashPassword,
+        } => {
+            let password = read_password_stdin()?;
+            println!("{}", generate_password_hash(&password)?);
+            Ok(())
+        }
+        CliCommand::Auth {
+            target: AuthTarget::Elevate { socket },
+        } => {
+            let mut password = read_password_stdin()?;
+            let password = match String::from_utf8(std::mem::take(&mut password)) {
+                Ok(password) => password,
+                Err(error) => {
+                    let mut invalid = error.into_bytes();
+                    invalid.zeroize();
+                    return Err("administrator password must be valid UTF-8".into());
+                }
+            };
+            run_client(
+                &socket,
+                Command::Elevate {
+                    password: SensitiveString::new(password),
+                },
+            )
+            .await
+        }
     }
+}
+
+fn read_password_stdin() -> Result<Zeroizing<Vec<u8>>, Box<dyn Error>> {
+    const MAX_PASSWORD_BYTES: usize = 1_024;
+    let mut password = Zeroizing::new(Vec::with_capacity(128));
+    io::stdin()
+        .lock()
+        .take(u64::try_from(MAX_PASSWORD_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut password)?;
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err("administrator password exceeds 1024 bytes".into());
+    }
+    if password.last() == Some(&b'\n') {
+        password.pop();
+        if password.last() == Some(&b'\r') {
+            password.pop();
+        }
+    }
+    if password.is_empty() {
+        return Err("administrator password must not be empty".into());
+    }
+    Ok(password)
 }
 
 async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error>> {
@@ -218,7 +286,7 @@ async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error
         id,
         command,
     };
-    let mut payload = serde_json::to_vec(&request)?;
+    let mut payload = Zeroizing::new(serde_json::to_vec(&request)?);
     payload.push(b'\n');
     stream.write_all(&payload).await?;
 

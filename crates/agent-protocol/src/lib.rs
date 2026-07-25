@@ -1,5 +1,8 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const CHANGE_PLAN_SCHEMA_VERSION: u16 = 1;
@@ -30,6 +33,7 @@ pub enum Command {
     DiagnoseInterfaceStats,
     DiagnoseConntrack,
     DiagnoseQdisc,
+    Elevate { password: SensitiveString },
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -92,9 +96,51 @@ pub enum ResponseData {
     InterfaceStatsDiagnostic(Box<InterfaceStatsDiagnosticReport>),
     ConntrackDiagnostic(Box<ConntrackDiagnosticReport>),
     QdiscDiagnostic(Box<QdiscDiagnosticReport>),
+    Elevation(ElevationResponse),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct SensitiveString(String);
+
+impl SensitiveString {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl fmt::Debug for SensitiveString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElevationResponse {
+    pub actor_id: String,
+    pub role: String,
+    pub boot_id: String,
+    pub expires_monotonic_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1011,6 +1057,7 @@ pub struct ProtocolError {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
+    Unauthorized,
     UnsupportedProtocol,
     Internal,
     ResourceExhausted,
@@ -1023,6 +1070,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
+            Self::Unauthorized => "unauthorized",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::Internal => "internal",
             Self::ResourceExhausted => "resource_exhausted",
@@ -1052,6 +1100,9 @@ mod tests {
             Command::DiagnoseInterfaceStats,
             Command::DiagnoseConntrack,
             Command::DiagnoseQdisc,
+            Command::Elevate {
+                password: SensitiveString::new("secret".into()),
+            },
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1100,5 +1151,11 @@ mod tests {
         let encoded = serde_json::to_string(&plan).expect("serialize change plan");
         let decoded: ChangePlan = serde_json::from_str(&encoded).expect("deserialize change plan");
         assert_eq!(decoded, plan);
+    }
+
+    #[test]
+    fn sensitive_strings_are_redacted_from_debug_output() {
+        let secret = SensitiveString::new("do-not-log".into());
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
     }
 }

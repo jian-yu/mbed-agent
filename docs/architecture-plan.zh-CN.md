@@ -345,7 +345,7 @@ Policy Engine 必须对 typed diff 做语义比较，风险只能上调，不能
 
 建议交互为 `/elevate` → Agent 进入专用认证状态 → 用户提交管理员密码 → 本地认证器校验 → 返回授权范围与 TTL。认证消息必须绕过 LLM、普通消息队列、SQLite、日志、遥测和审计参数；只记录“actor 在何时认证成功/失败”，绝不记录密码或 hash。密码在解析后使用可清零内存容器，并在校验完成后立即覆盖。若 Channel 支持撤回消息，认证后尽力撤回，但不能把平台侧撤回视为安全保证。
 
-OpenWrt 默认可由最小权限的本地认证 helper 使用系统 `crypt(3)`/shadow 语义校验管理员密码；具备 PAM 的通用 Linux 则使用 PAM。主 Agent 不把 `/etc/shadow` 内容传给工具、模型或 Channel。失败实行指数退避、并发锁和短时封禁，避免远程爆破。授权默认 5 分钟、只绑定 `channel + account/user id + conversation/device`，空闲或守护进程/整机重启即失效；用户可以 `/deauth` 主动撤销。
+首版采用 Agent 专用管理员密码：CLI 从 stdin 读取密码并生成带随机 salt、受最低迭代次数约束的 PBKDF2-HMAC-SHA256 verifier，只把 verifier 写入 root-only 配置。这样 OpenWrt 与普通 Linux 使用完全一致的本地校验语义，不读取或复制 `/etc/shadow`，也不依赖裁剪系统通常缺失的 PAM。后续可增加系统 `crypt(3)`/PAM adapter，但不能弱化同一 actor、锁定和内存 capability 边界。失败按 actor 计数并短时封禁，避免一个 Channel actor 锁死全部入口。授权默认 5 分钟、只绑定 `channel + account/user id + conversation/device` 和当前 boot id，使用单调时钟判断过期，守护进程/整机重启即失效；用户可以 `/deauth` 主动撤销。
 
 “Channel 不受限”表示所有 Channel 都能进入同一认证流程，不表示密码可以被平台安全地传输。对端到端保密不足、会长期保留聊天记录的 Channel，CLI 必须明确警告风险，并可选返回一次性本地 HTTPS/CLI challenge 供用户输入；最终校验仍发生在设备本地。
 
@@ -554,6 +554,14 @@ max_diagnostic_records = 128
 max_diagnostic_record_bytes = 32768
 max_change_set_records = 32
 max_change_plan_bytes = 65536
+
+[auth]
+enabled = false
+admin_password_hash = ""
+capability_ttl_secs = 300
+approval_ttl_secs = 120
+max_failures = 5
+lockout_secs = 60
 
 [logging]
 level = "info"

@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
+
+use crate::auth::AdminPasswordVerifier;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const LOG_LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
@@ -17,6 +20,7 @@ pub struct AgentConfig {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub logging: LoggingConfig,
+    pub auth: AuthConfig,
     pub llm: LlmConfig,
 }
 
@@ -29,6 +33,7 @@ impl Default for AgentConfig {
             server: ServerConfig::default(),
             storage: StorageConfig::default(),
             logging: LoggingConfig::default(),
+            auth: AuthConfig::default(),
             llm: LlmConfig::default(),
         }
     }
@@ -146,6 +151,7 @@ impl AgentConfig {
             ));
         }
 
+        self.auth.validate()?;
         self.llm.validate()?;
 
         let allocated = self
@@ -198,6 +204,58 @@ impl SecretString {
 impl fmt::Debug for SecretString {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    pub enabled: bool,
+    pub admin_password_hash: SecretString,
+    pub capability_ttl_secs: u64,
+    pub approval_ttl_secs: u64,
+    pub max_failures: u8,
+    pub lockout_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admin_password_hash: SecretString::default(),
+            capability_ttl_secs: 300,
+            approval_ttl_secs: 120,
+            max_failures: 5,
+            lockout_secs: 60,
+        }
+    }
+}
+
+impl AuthConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(30..=900).contains(&self.capability_ttl_secs)
+            || !(30..=300).contains(&self.approval_ttl_secs)
+            || !(1..=20).contains(&self.max_failures)
+            || !(1..=3_600).contains(&self.lockout_secs)
+        {
+            return Err(ConfigError::Validation(
+                "auth limits are inconsistent: capability TTL must be 30-900 seconds, approval TTL 30-300 seconds, max failures 1-20, and lockout 1-3600 seconds".into(),
+            ));
+        }
+        if self.enabled {
+            AdminPasswordVerifier::parse(self.admin_password_hash.expose()).map_err(|_| {
+                ConfigError::Validation(
+                    "enabled auth requires a valid PBKDF2-SHA256 admin_password_hash".into(),
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -509,6 +567,20 @@ mod tests {
     fn llm_key_is_redacted_from_debug_output() {
         let secret = SecretString("do-not-log".into());
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn enabled_auth_requires_a_strong_encoded_password_hash() {
+        let mut config = AgentConfig::default();
+        config.auth.enabled = true;
+        assert!(config.validate().is_err());
+
+        config.auth.admin_password_hash = SecretString(
+            "pbkdf2-sha256$100000$07070707070707070707070707070707$\
+             ae1c044bd6cd0165f889325f36d0eaf0b1b166da6cb6a1cb7057a57a362be12a"
+                .into(),
+        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

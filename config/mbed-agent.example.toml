@@ -40,6 +40,15 @@ max_files = 8
 max_line_bytes = 4096
 rate_limit_per_target_per_sec = 20
 
+[auth]
+enabled = false
+# Generate with: printf '%s\n' 'strong password' | mbed-agent auth hash-password
+admin_password_hash = ""
+capability_ttl_secs = 300
+approval_ttl_secs = 120
+max_failures = 5
+lockout_secs = 60
+
 [llm]
 enabled = false
 provider = "open-ai-compatible"

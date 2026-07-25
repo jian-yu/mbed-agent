@@ -13,6 +13,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -21,6 +22,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -719,11 +721,13 @@ dependencies = [
  "clap",
  "libc",
  "platform-linux",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

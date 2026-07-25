@@ -1,7 +1,11 @@
+pub mod auth;
 pub mod changes;
 pub mod config;
 pub mod resources;
 
+pub use auth::{
+    AdminPasswordVerifier, AuthError, AuthManager, DeviceAdminCapability, generate_password_hash,
+};
 pub use changes::{
     ChangePlanError, ChangeTransitionError, assess_plan, plan_digest, transition_change_set,
 };

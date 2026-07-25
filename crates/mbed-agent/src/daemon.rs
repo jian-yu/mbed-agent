@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -6,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_core::{AgentConfig, TmpBudget};
+use agent_core::{AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, TmpBudget};
 use agent_protocol::{
     ClientRequest, Command, CompletionResponse, DiagnosticHistoryEntry, ErrorCode,
     PROTOCOL_VERSION, ResponseData, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
@@ -19,11 +20,13 @@ use agent_provider::{
 use agent_store::{DiagnosticRecord, Store, TaskRecord};
 use agent_tools::ToolRunner;
 use platform_linux::PlatformCapabilities;
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use crate::logging;
 
@@ -40,11 +43,24 @@ struct AppState {
     llm_slots: Semaphore,
     log_writer: logging::BoundedMakeWriter,
     started: Instant,
+    auth: Arc<AuthManager>,
 }
 
 pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config = AgentConfig::load_or_default(config_path)?;
     ensure_secret_config_permissions(config_path, &config)?;
+    let boot_id = discover_boot_id()?;
+    let auth = Arc::new(if config.auth.enabled {
+        AuthManager::new(
+            AdminPasswordVerifier::parse(config.auth.admin_password_hash.expose())?,
+            boot_id,
+            config.auth.capability_ttl_secs,
+            config.auth.max_failures,
+            config.auth.lockout_secs,
+        )
+    } else {
+        AuthManager::disabled(boot_id)
+    });
     let log_writer = init_logging(&config)?;
 
     let budget = TmpBudget::new(config.storage.clone())?;
@@ -91,6 +107,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         llm_slots,
         log_writer,
         started: Instant::now(),
+        auth,
     });
     let mut cleanup_interval =
         tokio::time::interval(Duration::from_secs(state.budget.cleanup_interval_secs()));
@@ -133,7 +150,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Result<()> {
-    if !config.llm.enabled || !path.exists() {
+    if (!config.llm.enabled && !config.auth.enabled) || !path.exists() {
         return Ok(());
     }
     let mode = fs::metadata(path)?.permissions().mode();
@@ -141,12 +158,35 @@ fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Re
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "LLM credentials require {} to have mode 0600 or stricter",
+                "configured credentials require {} to have mode 0600 or stricter",
                 path.display()
             ),
         ));
     }
     Ok(())
+}
+
+fn discover_boot_id() -> io::Result<String> {
+    if let Ok(value) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        let value = value.trim();
+        if !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        {
+            return Ok(value.to_ascii_lowercase());
+        }
+    }
+    let mut random = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| io::Error::other("operating system randomness is unavailable"))?;
+    let mut encoded = String::with_capacity(random.len() * 2);
+    for byte in random {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
 }
 
 fn build_llm_provider(
@@ -260,6 +300,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<AppState>) -> io::Resul
     let mut reader = BufReader::new(read_half);
 
     while let Some(frame) = read_frame(&mut reader, state.config.runtime.max_request_bytes).await? {
+        let frame = Zeroizing::new(frame);
         let response = match serde_json::from_slice::<ClientRequest>(&frame) {
             Ok(request) => handle_request(request, &state).await,
             Err(error) => ServerResponse::error(
@@ -309,6 +350,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             }
         },
         Command::Status => status_response(state),
+        Command::Elevate { password } => {
+            return handle_elevation(request.id, password.into_inner(), state).await;
+        }
         Command::DiagnoseWan { active } => {
             return handle_wan_diagnosis(request.id, active, state).await;
         }
@@ -359,6 +403,71 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         }
     };
     ServerResponse::success(request.id, result)
+}
+
+async fn handle_elevation(id: String, password: String, state: &AppState) -> ServerResponse {
+    const LOCAL_CLI_ACTOR: &str = "cli/local";
+    let password = Zeroizing::new(password);
+    let auth = Arc::clone(&state.auth);
+    let now_monotonic_ms = u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let outcome = tokio::task::spawn_blocking(move || {
+        auth.elevate(LOCAL_CLI_ACTOR, password.as_bytes(), now_monotonic_ms)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(capability)) => {
+            info!(
+                actor_id = LOCAL_CLI_ACTOR,
+                "device administrator capability granted"
+            );
+            ServerResponse::success(
+                id,
+                ResponseData::Elevation(agent_protocol::ElevationResponse {
+                    actor_id: capability.actor_id,
+                    role: "device-admin".into(),
+                    boot_id: capability.boot_id,
+                    expires_monotonic_ms: capability.expires_monotonic_ms,
+                }),
+            )
+        }
+        Ok(Err(AuthError::Disabled)) => ServerResponse::error(
+            id,
+            ErrorCode::Unavailable,
+            "administrator authentication is not enabled",
+        ),
+        Ok(Err(AuthError::InvalidCredentials | AuthError::Locked)) => {
+            warn!(
+                actor_id = LOCAL_CLI_ACTOR,
+                "device administrator authentication failed"
+            );
+            ServerResponse::error(
+                id,
+                ErrorCode::Unauthorized,
+                "administrator authentication failed",
+            )
+        }
+        Ok(Err(AuthError::InvalidActor | AuthError::EmptyPassword)) => ServerResponse::error(
+            id,
+            ErrorCode::InvalidRequest,
+            "administrator authentication request is invalid",
+        ),
+        Ok(Err(error)) => {
+            error!(%error, "administrator authentication state failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            )
+        }
+        Err(error) => {
+            error!(%error, "administrator authentication worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            )
+        }
+    }
 }
 
 fn status_response(state: &AppState) -> ResponseData {
@@ -3184,6 +3293,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn elevation_is_boot_bound_and_does_not_persist_passwords() {
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/elevation-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let mut config = AgentConfig::default();
+        config.storage.path = root.join("agent.db");
+        let budget = TmpBudget::new(config.storage.clone()).expect("budget");
+        let store = Arc::new(
+            Store::open(&config.storage.path, config.storage.max_database_bytes).expect("store"),
+        );
+        let encoded =
+            agent_core::generate_password_hash(b"test administrator password").expect("hash");
+        let auth = AuthManager::new(
+            AdminPasswordVerifier::parse(&encoded).expect("verifier"),
+            "test-boot".into(),
+            300,
+            3,
+            60,
+        );
+        let state = AppState {
+            platform: PlatformCapabilities::discover(),
+            budget,
+            store,
+            tools: ToolRunner::system(Duration::from_millis(100), 4096),
+            diagnostic_slots: Semaphore::new(1),
+            llm: None,
+            llm_slots: Semaphore::new(1),
+            log_writer: test_log_writer(&root),
+            started: Instant::now(),
+            auth: Arc::new(auth),
+            config,
+        };
+
+        let rejected = handle_elevation("wrong".into(), "wrong password".into(), &state).await;
+        assert_eq!(
+            rejected.error.expect("unauthorized").code,
+            ErrorCode::Unauthorized
+        );
+        let granted = handle_elevation(
+            "correct".into(),
+            "test administrator password".into(),
+            &state,
+        )
+        .await;
+        let Some(ResponseData::Elevation(capability)) = granted.result else {
+            panic!("expected elevation response");
+        };
+        assert_eq!(capability.actor_id, "cli/local");
+        assert_eq!(capability.role, "device-admin");
+        assert_eq!(capability.boot_id, "test-boot");
+        assert!(
+            state
+                .auth
+                .is_device_admin("cli/local", 1)
+                .expect("auth state")
+        );
+        let database = fs::read(&state.config.storage.path).expect("database bytes");
+        assert!(
+            !database
+                .windows(b"test administrator password".len())
+                .any(|window| window == b"test administrator password")
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).expect("remove test runtime");
+    }
+
+    #[tokio::test]
     async fn critical_managed_storage_rejects_new_tasks() {
         let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(format!(
@@ -3207,6 +3386,7 @@ mod tests {
             llm_slots: Semaphore::new(1),
             log_writer: test_log_writer(&root),
             started: Instant::now(),
+            auth: Arc::new(AuthManager::disabled("test-boot".into())),
             config,
         };
 
@@ -3294,6 +3474,7 @@ mod tests {
             llm_slots: Semaphore::new(1),
             log_writer: test_log_writer(&root),
             started: Instant::now(),
+            auth: Arc::new(AuthManager::disabled("test-boot".into())),
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
@@ -3368,6 +3549,7 @@ mod tests {
             llm_slots: Semaphore::new(1),
             log_writer: test_log_writer(&root),
             started: Instant::now(),
+            auth: Arc::new(AuthManager::disabled("test-boot".into())),
             config,
         };
 

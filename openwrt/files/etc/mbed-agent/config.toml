@@ -26,6 +26,8 @@ cleanup_interval_secs = 60
 max_task_records = 256
 max_diagnostic_records = 128
 max_diagnostic_record_bytes = 32768
+max_change_set_records = 32
+max_change_plan_bytes = 65536
 
 [logging]
 level = "info"
@@ -37,6 +39,14 @@ max_file_bytes = 262144
 max_files = 8
 max_line_bytes = 4096
 rate_limit_per_target_per_sec = 20
+
+[auth]
+enabled = false
+admin_password_hash = ""
+capability_ttl_secs = 300
+approval_ttl_secs = 120
+max_failures = 5
+lockout_secs = 60
 
 [llm]
 enabled = false
