@@ -1,6 +1,9 @@
 # Mbed Agent
 
-Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and small embedded Linux systems. The current implementation is the Phase 0 runtime foundation described in [the architecture plan](docs/architecture-plan.zh-CN.md).
+Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+
+and small embedded Linux systems. The current implementation contains the
+Phase 0 runtime foundation and an expanding Phase 1 read-only diagnostic set
+described in [the architecture plan](docs/architecture-plan.zh-CN.md).
 
 ## Current scope
 
@@ -45,7 +48,17 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
 administrator elevation, and configuration transactions are planned but are not
-implemented yet.
+implemented yet. The configuration roadmap is intentionally broader than a few
+fixed operations: it targets capability-gated typed CRUD for firewall,
+interfaces/addresses, bridges/VLANs, routes, DNS/DHCP, wireless, controlled
+services, QoS, and WireGuard. OpenWrt will use UCI and its native fw3/fw4/netifd
+control planes; generic Linux will use supported adapters and Agent-owned
+nftables/iptables/network objects. Every write must pass plan/diff, dynamic risk,
+approval, validation, bounded snapshot, verification, and confirmed rollback.
+Unknown or unmanaged objects remain read-only; no LLM-controlled raw shell,
+iptables, nft, UCI, or file-edit path is planned.
+This scope and its safety boundary are recorded in
+[ADR 0018](docs/adr/0018-maximal-safe-configurability.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

@@ -1,8 +1,8 @@
 # Mbed Agent：面向 OpenWrt 与小型嵌入式 Linux 的智能网络 Agent 实现方案
 
-> 文档状态：架构草案 v0.3  
-> 更新日期：2026-07-18  
-> 项目仓库：<https://github.com/jian-yu/mbed-agent>  
+> 文档状态：架构草案 v0.4
+> 更新日期：2026-07-25
+> 项目仓库：<https://github.com/jian-yu/mbed-agent>
 > 目标读者：产品负责人、OpenWrt 工程师、Rust 工程师、云平台与安全工程师
 
 ## 1. 执行摘要
@@ -13,7 +13,7 @@ Mbed Agent 定位为运行在 OpenWrt、Buildroot、Yocto 等小型嵌入式 Lin
 
 本方案采用严格的易失运行时：除 `/etc/config/*` 与 `/etc/mbed-agent/` 下的配置、Channel 绑定凭据外，Agent 运行产生的会话、任务、审计、快照、日志和附件一律不得写入 Flash。唯一数据库为 `/tmp/mbed-agent/agent.db` 中的 SQLite；守护进程重启时可继续使用同一次开机内的数据，整机重启或断电后无需恢复。
 
-推荐首先实现“只读诊断闭环”，再实现“可回滚配置闭环”，最后扩展自动修复和业务增强。首个可用版本重点覆盖 WAN 无法上网、DNS 异常、DHCP/地址冲突、Wi-Fi 接入问题、路由与防火墙错误、性能退化六类高频场景。
+推荐首先实现“只读诊断闭环”，再实现“通用安全配置闭环”，最后扩展自动修复和业务增强。配置面不局限于少数预设用例：在平台能力可探测、输入可强类型校验、影响可预览、结果可验证且失败可回滚的前提下，应最大限度开放防火墙、网络、DNS/DHCP、无线、路由、服务与 QoS 等专业配置能力。无法可靠建立这些安全条件的动作必须降级为只读建议或拒绝执行，不能退化为任意 root shell。首个可用版本重点覆盖 WAN 无法上网、DNS 异常、DHCP/地址冲突、Wi-Fi 接入问题、路由与防火墙错误、性能退化六类高频场景。
 
 ### 1.1 已确认的产品约束
 
@@ -22,6 +22,7 @@ Mbed Agent 定位为运行在 OpenWrt、Buildroot、Yocto 等小型嵌入式 Lin
 3. 唯一数据库为 SQLite，固定使用 `/tmp/mbed-agent/agent.db`，无需跨设备重启或断电恢复。
 4. 任意 Channel 的 actor 均可通过设备管理员密码校验，短时提升为 `device-admin`；密码校验完全在设备本地完成。
 5. `/tmp` 使用必须具有可配置的分项限额、总限额和剩余空间保护；日志等级、格式、单条大小、轮转文件大小和总量均可配置。
+6. 所有专业能力都应同时评估“观察、计划、配置、验证、回滚”五种能力，不得因首个用例简单而把实现固化成单用途命令；在风险可控范围内采用能力探测驱动的最大可配置原则。
 
 ## 2. 产品定位与边界
 
@@ -47,6 +48,8 @@ Agent 的系统角色应固定为：
 - 基于证据的多步故障诊断。
 - UCI 配置查询、差异预览、验证、提交和回滚。
 - 网络连通性、DNS、路由、接口、无线、DHCP、防火墙诊断。
+- 通过统一 ChangeSet 配置防火墙策略、接口/地址、Bridge/VLAN、路由、
+  DNS/DHCP、无线、受控服务和 QoS；具体可写字段由平台 capability 与本地策略共同决定。
 - 本地 CLI、MQTT、企业微信智能机器人、微信 ClawBot 等 Channel 接入。
 - OpenAI、Anthropic、Gemini、OpenAI-compatible 等模型接入。
 - 会话、任务、审计和少量知识写入 `/tmp` 中的易失 SQLite，不跨设备重启恢复。
@@ -58,6 +61,9 @@ Agent 的系统角色应固定为：
 - 不以完整 MCP Host 作为设备端首发依赖；设备资源足够时再作为可选 feature。
 - 不在首版实现任意第三方动态库插件，避免 ABI、供应链和内存不可控。
 - 不承诺替代专业抓包分析、射频测试或运营商线路侧诊断系统。
+- 不承诺“任何配置都能写”：未知 schema、无法生成 diff、无法验证、
+  无法建立回滚或会越过项目托管边界的配置只读展示，不交给 LLM 以
+  raw nft/iptables/UCI 参数或任意文件编辑方式执行。
 
 ## 3. 设计原则
 
@@ -72,6 +78,10 @@ Agent 的系统角色应固定为：
 9. **Provider/channel neutral**：核心领域模型不依赖某家 LLM 或消息平台的数据结构。
 10. **Least privilege**：把诊断与变更分级，默认只读，危险操作需要明确授权。
 11. **Evidence-driven**：每个诊断结论都可追溯到 Tool Observation。
+12. **Maximal safe configurability**：不是只实现少数固定按钮；每个领域提供
+    完整 typed CRUD 和 capability contract，但只执行本机能够安全验证与回滚的子集。
+13. **Managed ownership**：普通 Linux 上只修改 Agent 明确创建并标记所有权的
+    table、chain、set、配置片段和服务 drop-in；已有第三方对象默认只读。
 
 ## 4. 总体架构
 
@@ -278,6 +288,40 @@ Skill 是按需注入的 Markdown + metadata，内容包括诊断原则、OpenWr
 
 Skill 必须有版本、适用平台范围、token 估算和签名摘要；只注入与任务匹配的 Skill，避免一个巨型 system prompt。
 
+### 7.5 通用安全配置面
+
+配置能力采用“广领域 typed model + 平台 capability 裁剪”，而不是为“限制一个
+MAC”之类的单一需求增加专用脚本。每个配置对象至少支持 `inspect`、`plan_create`、
+`plan_update`、`plan_delete`、`validate` 和 `verify`；支持重排的对象还提供
+`plan_move`。模型只能填充领域对象，不能提供 executable、argv、UCI section
+表达式、nft statement 或配置文件路径。
+
+首批配置能力矩阵如下。表中的“最大范围”是产品目标；设备实际暴露的写能力必须
+取该范围、本机 `PlatformCapabilities`、本地 policy allowlist 和当前 actor 权限的交集。
+
+| 领域 | 最大 typed 配置范围 | OpenWrt 后端 | 普通 Linux 后端 | 主要限制 |
+|---|---|---|---|---|
+| 防火墙 | zone、默认策略、forwarding、filter rule、MAC/IP/CIDR、协议/端口、接口、address set、DNAT/SNAT/redirect、masquerade、启停、顺序 | `/etc/config/firewall` UCI，统一服务 fw3/iptables 与 fw4/nftables | Agent 专属 nft table/chain/set；无 nft 时使用专属 iptables chain/ipset | 不生成 raw expression；不自动改第三方 chain；涉及管理路径为 R3 |
+| L2/L3 网络 | interface/device、静态/动态地址、MTU、MAC override、Bridge、VLAN、bond、VRF、默认/静态路由、policy rule | network UCI + netifd/ubus，按 swconfig/DSA capability 裁剪 | netlink 运行态；持久化仅通过识别出的 NetworkManager、systemd-networkd 或厂商受支持 adapter | 修改当前管理接口、默认路由或 LAN 地址为 R3；未知网络管理器只允许运行态或只读 |
+| DNS | 上游 resolver、搜索域、split DNS、缓存参数、静态主机、DNSSEC 开关 | dhcp UCI + dnsmasq/odhcpd | systemd-resolved、NetworkManager 或 Agent 托管 dnsmasq 片段 | 不覆盖未知手工 `/etc/resolv.conf`；凭据型 DoH/DoT 参数按 secret 处理 |
+| DHCP | 地址池、租期、静态租约、option、RA/DHCPv6 模式 | dhcp UCI + dnsmasq/odhcpd | Agent 托管 dnsmasq/odhcpd adapter | 地址池冲突、网段越界和管理地址冲突必须在 stage 阶段拒绝 |
+| 无线 | radio 启停、国家码、信道/带宽/功率、SSID、模式、加密、密钥、网络绑定、隔离、MAC policy | wireless UCI + netifd/hostapd | 仅在识别并支持 hostapd/wpa_supplicant 管理方式时写 Agent 托管片段 | 扫描与配置分级；改管理 SSID/密钥为 R3；密钥不进 SQLite/日志/LLM |
+| 服务 | reload/restart/start/stop、受支持服务的 enable/disable、有限 typed 参数 | ubus/procd/init script allowlist | systemd/OpenRC/BusyBox init adapter allowlist | 不接受任意 service 名；enable/disable 属于持久配置 |
+| QoS/流控 | qdisc/class/filter、接口限速、DSCP 分类、SQM profile | sqm UCI 或受控 `tc` | Agent 托管 `tc` 对象，必要时使用受支持网络管理器持久化 | 只删除带 Agent ownership 的对象；CPU/带宽预算超限时拒绝 |
+| VPN/隧道 | WireGuard interface/peer、路由与防火墙绑定；后续扩展受支持隧道 | network/firewall UCI | netlink/wg + Agent 托管配置 adapter | 私钥只存在 root-only 配置或外部密钥源；改变管理隧道为 R3 |
+| 系统网络参数 | 明确 allowlist 的 sysctl、hostname、时区/NTP server | system UCI 或受支持配置 | sysctl.d/服务 adapter 的 Agent 托管片段 | 内核安全参数、包安装、固件升级不归入普通网络 ChangeSet |
+
+“最大可配置”不等于“一次计划可无限修改”。单个 ChangeSet 必须设置对象数、diff
+字节、snapshot 字节、执行步骤、墙钟时间和并发锁上限；Tiny 默认一次只允许一个
+写事务。跨领域目标可以包含多个对象，但必须形成一个依赖图，例如新增访客 SSID
+同时包含 wireless interface、VLAN/Bridge、DHCP pool、firewall zone、forwarding
+和隔离规则，统一预览、审批、应用和回滚，不能留下半配置状态。
+
+每个 typed 对象具有稳定 `object_id`、`desired_state`、`preconditions`、
+`ownership` 和 `sensitive_fields`。更新和删除必须引用刚读取的对象版本或内容
+摘要，避免 LLM 根据过期状态覆盖用户刚做的修改。创建对象使用 daemon 生成的
+幂等键和可识别名称；重复提交不得产生重复规则、重复 VLAN 或重复 DHCP lease。
+
 ## 8. 安全、权限与防断网设计
 
 ### 8.1 风险级别
@@ -286,9 +330,14 @@ Skill 必须有版本、适用平台范围、token 估算和签名摘要；只�
 |---|---|---|---|
 | R0 | 纯本地只读、低敏感 | 查看接口统计 | 自动允许 |
 | R1 | 只读但可能泄露敏感信息/产生流量 | 配置读取、DNS/HTTP 探测 | 允许并脱敏/限速 |
-| R2 | 可逆的局部变更 | DHCP renew、服务 reload | 每任务或每会话审批 |
-| R3 | 可能中断管理连接 | 修改 WAN/LAN、防火墙、无线、重启服务 | 展示 diff，逐次审批，强制回滚计时器 |
+| R2 | 可逆且不改变管理路径的局部变更 | 新增非管理网段规则、DHCP renew、服务 reload | `network-admin` 或 `device-admin`，审批绑定精确 diff |
+| R3 | 可能中断管理连接或扩大暴露面 | 修改 WAN/LAN、默认路由、管理 SSID、防火墙默认策略、DNAT、停止服务 | 仅 `device-admin`，展示 diff，逐次审批，强制回滚计时器 |
 | R4 | 高危或不可逆 | 升级固件、恢复出厂、修改认证、任意 shell | 默认禁止；未来专用工作流 |
+
+风险不是仅按工具名静态决定。同一个防火墙 rule，新增访客网到互联网的受限
+forwarding 可以是 R2，允许 WAN 访问管理端口则必须提升为 R3；删除规则、扩大
+CIDR/端口范围、把 DROP 改为 ACCEPT、改变当前会话入站路径也会动态提高风险。
+Policy Engine 必须对 typed diff 做语义比较，风险只能上调，不能由 LLM 指定或下调。
 
 ### 8.2 审批主体
 
@@ -300,20 +349,53 @@ OpenWrt 默认可由最小权限的本地认证 helper 使用系统 `crypt(3)`/s
 
 “Channel 不受限”表示所有 Channel 都能进入同一认证流程，不表示密码可以被平台安全地传输。对端到端保密不足、会长期保留聊天记录的 Channel，CLI 必须明确警告风险，并可选返回一次性本地 HTTPS/CLI challenge 供用户输入；最终校验仍发生在设备本地。
 
+审批不是一句“同意”。Daemon 对规范化 ChangeSet、设备 boot id、actor、风险、
+过期时间和当前对象版本计算摘要，签发短时、一次性的 approval token。应用时重新
+读取状态并重算摘要；任何 diff、能力、对象版本、actor 或 boot id 变化都会使 token
+失效并返回重新预览。Channel 的按钮、文本确认和 CLI 最终都只提交该 token，不得
+自行构造已批准状态。
+
 ### 8.3 配置事务与回滚
 
-OpenWrt 配置变更建议实现：
+OpenWrt 与普通 Linux 共用以下 ChangeSet 状态机：
 
-1. 对相关 UCI package 和关键运行状态生成压缩 snapshot。
-2. 在 staging 中应用 typed patch，生成规范化 diff。
-3. 静态校验字段、引用、CIDR、冲突规则和平台 capability。
-4. 可行时调用服务自身的 check/test，例如 nftables check。
-5. 在 `/tmp` 中创建易失 rollback job，并写入 monotonic deadline。
-6. commit + reload，不直接默认 restart 整机。
-7. 从管理路径和目标业务路径执行 health probes。
-8. 收到本地确认或探测成功后取消 rollback；否则恢复 snapshot。
+```text
+Draft → Planned → AwaitingApproval → Approved → Staged → Validated
+      → RollbackArmed → Applying → Verifying → AwaitingConfirmation
+      → Confirmed
+      ↘ Rejected / Expired / ApplyFailed → RollingBack → RolledBack
+```
 
-回滚机制不能只存在于 Agent 主进程内。应生成由 procd 管理的独立一次性 rollback helper，snapshot 与 journal 都位于 `/tmp/mbed-agent/rollback/`；同一次开机内即使 Agent 崩溃或管理连接断开，也能在超时后恢复。根据本项目的易失状态约束，整机重启或断电后不恢复未确认事务，也不在 Flash 保存 snapshot/journal。配置事务必须尽量缩短 commit 到复测的窗口，并在文档与 UI 中明确这一限制。
+1. 获取领域写锁，重新读取相关配置、运行状态、当前管理路径和平台能力。
+2. 将自然语言目标编译为 typed desired state；解析引用并生成有序依赖图。
+3. 计算语义 diff、动态风险、Flash 写入清单、预计服务影响和验证计划。
+4. 对相关 UCI package、Agent 托管配置和关键运行状态生成有界 snapshot；超出
+   `storage.max_rollback_bytes` 时在任何写入前失败。
+5. 在隔离 staging 中渲染目标配置，执行 schema、引用、CIDR、端口、地址池、
+   ownership、管理路径和冲突校验。
+6. 调用后端原生 dry-run/check：例如 `fw4 check`/`nft --check`、iptables-restore
+   test（能力存在时）、dnsmasq/hostapd 配置检查或网络管理器验证。
+7. 展示规范化 diff、风险、服务动作、探针和回滚 deadline，签发绑定精确计划的
+   approval token；状态变化后必须重新 plan。
+8. 审批通过后，在 `/tmp` 原子写入 rollback snapshot/journal，启动独立 helper，
+   再以最少步骤 commit/apply + reload；默认不重启整机。
+9. 从当前管理路径、保底本地路径和目标业务路径执行前后相同的 health probes。
+   自动探针成功只表示满足预定义断言；R3 默认仍等待用户显式确认。
+10. 确认后取消 helper、清除敏感 snapshot 并写易失审计；超时、进程崩溃、
+    管理连接断开、验证失败或用户请求时恢复 snapshot，再验证恢复结果。
+
+回滚机制不能只存在于 Agent 主进程内。OpenWrt 使用 procd 管理的独立一次性
+rollback helper；普通 Linux 使用同一可执行程序的 `rollback-helper` 模式，由
+systemd-run/OpenRC/BusyBox supervisor 或独立受控子进程守护。snapshot 与 journal
+都位于 `/tmp/mbed-agent/rollback/`；helper 只接受 daemon 生成的定长事务 ID，
+不接受任意路径或命令。同一次开机内即使 Agent 崩溃或管理连接断开，也能在超时
+后恢复。整机重启或断电后不恢复未确认事务，也不在 Flash 保存 snapshot/journal。
+
+对于无法快照的运行态变更，ChangeSet 必须生成精确逆操作并在 stage 时验证目标
+对象仍由 Agent 所有；无法证明逆操作安全时拒绝写入。对配置文件的恢复采用
+同目录临时文件、`fsync`、权限/owner 保留和原子 rename；不得用 SQLite 充当配置
+snapshot。任何回滚失败都进入 `RollbackFailed` 严重告警状态，停止新的写事务，
+但保留只读诊断和本地人工恢复说明。
 
 ### 8.4 Shell 隔离
 
@@ -432,7 +514,7 @@ ClawBot 绑定与运行流程：
 
 ### 11.1 分层与位置
 
-配置优先级：编译默认值 < `/etc/config/mbed-agent` 的设备基础配置 < `/etc/mbed-agent/config.toml` 高级配置 < UCI/CLI 显式 override。环境变量只用于开发，不作为 OpenWrt 生产密钥方案。`/etc/config/mbed-agent`、`/etc/mbed-agent/config.toml` 与 `/etc/mbed-agent/channels.d/` 是 Agent 运行时唯一允许主动写入 Flash 的区域；修改 OpenWrt 业务配置时，仅可通过受控 ChangeSet 写目标 `/etc/config/*`。
+配置优先级：编译默认值 < `/etc/config/mbed-agent` 的设备基础配置 < `/etc/mbed-agent/config.toml` 高级配置 < UCI/CLI 显式 override。环境变量只用于开发，不作为 OpenWrt 生产密钥方案。`/etc/config/mbed-agent`、`/etc/mbed-agent/config.toml` 与 `/etc/mbed-agent/channels.d/` 是 Agent 自身运行时唯一允许主动写入 Flash 的区域。业务配置只能由受控 ChangeSet 写入：OpenWrt 限定为相关 `/etc/config/*`；普通 Linux 限定为 capability contract 中逐项声明的 Agent-owned 配置片段，例如固定的 `nftables.d/mbed-agent.nft` 或服务 drop-in，不能把父目录变成通用写权限。
 
 UCI 保存适合 LuCI 管理的平坦字段，如 enabled、device id、profile、日志级别；复杂 provider/channel/policy 使用 TOML。Channel 扫码绑定结果也属于配置。启动时合并为强类型配置并完整校验，不允许未知关键字段静默忽略。
 
@@ -504,8 +586,19 @@ long_poll_timeout_secs = 40
 [policy]
 default = "deny"
 auto_allow = ["system.read", "network.read", "openwrt.read"]
-require_approval = ["service.reload", "openwrt.change"]
+require_approval = ["service.reload", "configuration.change"]
 deny = ["system.shell", "firmware.flash", "factory_reset"]
+
+[policy.changes]
+enabled_domains = ["firewall", "network", "dns", "dhcp", "wireless", "service", "qos", "wireguard"]
+max_objects_per_change_set = 32
+max_diff_bytes = 65536
+max_concurrent_change_sets = 1
+approval_ttl_secs = 300
+rollback_confirm_timeout_secs = 90
+require_explicit_r3_confirmation = true
+generic_linux_persistence = "managed_only"
+allow_unmanaged_object_mutation = false
 
 [privacy]
 redact_secrets = true
@@ -543,8 +636,11 @@ tasks(id, session_id, status, goal, deadline, step_count, result_code)
 turns(id, task_id, provider, model, input_digest, output_summary, usage_json)
 tool_calls(id, task_id, name, args_redacted, risk, status, started_at, ended_at)
 observations(id, tool_call_id, kind, payload, truncated, artifact_id)
-change_sets(id, task_id, status, snapshot_ref, diff, rollback_deadline)
-approvals(id, task_id, actor_id, scope, expires_at, decision)
+change_sets(id, task_id, status, risk, plan_digest, boot_id, snapshot_ref,
+            diff, rollback_deadline, created_at, updated_at)
+change_objects(change_set_id, domain, object_id, operation, before_digest,
+               after_digest, ownership, order_index)
+approvals(id, change_set_id, actor_id, plan_digest, expires_at, used_at, decision)
 audit_events(seq, timestamp, actor_id, action, object, result, prev_hash, hash)
 outbox(id, channel, destination, payload, expires_at, attempts)
 facts(key, scope, value, confidence, source, expires_at)
@@ -553,7 +649,10 @@ schema_migrations(version, applied_at)
 
 ### 12.4 Flash 写隔离
 
-- Agent 进程通过路径 allowlist 限制写文件：仅配置事务可写 `/etc/config/*` 与 `/etc/mbed-agent/*`，其余写操作只能位于 `/tmp/mbed-agent/*`。
+- Agent 进程通过路径 allowlist 限制写文件：自身配置只允许
+  `/etc/config/mbed-agent` 与 `/etc/mbed-agent/*`；业务配置事务只允许当前
+  platform adapter 声明的精确 UCI package 或 Agent-owned 配置片段，其余写操作
+  只能位于 `/tmp/mbed-agent/*`。allowlist 保存规范化固定路径，不接受用户路径。
 - SQLite 的 main DB、WAL、SHM、journal 和临时文件必须全部留在 `/tmp/mbed-agent/`；设置 `SQLITE_TMPDIR=/tmp/mbed-agent/sqlite-tmp` 或等价 VFS 控制。
 - 不设置持久化 core dump；量产日志默认写有界的 `/tmp/mbed-agent/log/`，可选 stderr/logd，禁止 Agent 自行写 `/var/log`（某些系统该路径可能位于 Flash）。
 - 不把审计、指标、outbox、模型缓存、附件、抓包、快照、token 或授权 capability 写入配置目录。
@@ -613,6 +712,7 @@ mbed-agent storage prune [--artifacts|--history|--logs]
 |---|---|---|---|
 | 防火墙 | firewall3 (`fw3`) + iptables/ip6tables | firewall4 (`fw4`) + nftables | 统一 UCI 模型，分别实现 `Fw3Backend` 与 `Fw4Backend` |
 | 防火墙观察 | `fw3 print`、`iptables-save`、`ip6tables-save`、ipset/counters | `fw4 print`、`nft list ruleset`，可用时采用 JSON/trace | 输出归一化为 zone/rule/redirect/counter/evidence |
+| 防火墙配置 | UCI zone/forwarding/rule/redirect/ipset，由 fw3 渲染 | 同一 UCI 语义，由 fw4 渲染 | Agent 修改 UCI typed 对象，不直接拼 iptables/nft rule；render/check/reload 分后端 |
 | 网络设备 | swconfig 与 DSA 可能并存，21.02 是重要迁移期 | 多数目标使用 DSA | 识别 bridge/device/interface，不假设 `eth0.N` 或 switch 节点 |
 | 包管理 | opkg | opkg；更新版本/特定分支可能为 apk | 只读探测 `PackageManager`，Agent 运行时不安装包 |
 | 脚本/服务 | shell、ubus、procd、rpcd | 可能增加 ucode 与更多 ubus 能力 | 核心不依赖 ucode，按 capability 使用增强接口 |
@@ -620,7 +720,25 @@ mbed-agent storage prune [--artifacts|--history|--logs]
 
 防火墙后端探测顺序：读取 `/etc/openwrt_release`/`ubus call system board` → 检查 `fw4`/`fw3` executable → 检查 `nft`/`iptables-save` 实际可执行性 → 读取 firewall service 状态。若设备人为安装了兼容层或混合工具，按当前负责生成 UCI ruleset 的服务选择 backend，不能仅因 `iptables` 命令存在就判为 fw3。
 
-`FirewallBackend` trait 至少提供 `inspect_uci`、`render`、`validate`、`runtime_rules`、`counters`、`reload` 和 `trace_capability`。常规 zone/rule/redirect 变更只操作共享的 `/etc/config/firewall` UCI 语义；自定义 iptables/nft include、raw table expression 和第三方链不得自动跨 fw3/fw4 转译，只做只读分析并提示人工确认。22.03 默认由 fw3/iptables 切换为 fw4/nftables，这是必须覆盖的主要兼容断点。[OpenWrt 22.03 官方发布说明](https://openwrt.org/releases/22.03/notes-22.03.0)
+`FirewallBackend` trait 至少提供 `capabilities`、`inspect`、`stage`、`render`、
+`validate`、`snapshot`、`apply`、`verify`、`rollback`、`runtime_rules`、
+`counters` 和 `trace_capability`。常规 zone/rule/redirect/ipset 变更操作共享的
+`/etc/config/firewall` UCI 语义，由 `Fw3Backend`/`Fw4Backend` 分别完成渲染校验、
+服务动作和运行态复测。MAC 限制只是 `FirewallMatch.source_macs` 的一种条件，可与
+源/目的 zone、IP/CIDR、协议、端口、时间和 action 组合，不建立专用命令。
+
+自定义 iptables/nft include、raw table expression 和第三方链不得自动跨 fw3/fw4
+转译，只做只读分析并提示人工确认。22.03 默认由 fw3/iptables 切换为 fw4/nftables，
+这是必须覆盖的主要兼容断点。[OpenWrt 22.03 官方发布说明](https://openwrt.org/releases/22.03/notes-22.03.0)
+
+普通 Linux 不是直接套用 OpenWrt UCI。`NftablesBackend` 创建固定命名且带 ownership
+comment 的专属 table/chain/set，通过完整 ruleset staging 与 `nft --check` 验证，
+原子替换项目托管对象；`IptablesBackend` 创建专属 chain/ipset，只从已批准的固定
+hook 建立一次跳转，使用 `iptables-restore`/`ip6tables-restore` 的无 flush 模式
+更新。二者都不得清空 builtin chain、修改非托管规则或把 `iptables-save` 的未知
+内容重新解释后覆盖。持久化只有在检测到受支持的发行版 firewall adapter 且能够
+写 Agent 专属配置片段时开放；否则明确标记 `runtime_only`，整机重启后由设备原有
+控制面决定状态，不悄悄写 `/etc/rc.local`。
 
 构建产物必须按 `OpenWrt release × target × subtarget × libc ABI` 生成，不发布一个所谓“全版本通用”的 musl 二进制。CI 基线至少包含 21.02、22.03、23.05、24.10 和当前稳定版；后续新版本先进入 `experimental`，完成 QEMU 与真机 capability contract tests 后标记 supported。21.02 SDK 和 package feed 应固定 checksum 并从项目缓存/归档获取，保证 EOL 版本仍可复现构建。
 
@@ -768,7 +886,17 @@ mbed-agent log clear
 
 Agent 不能只创建 SSID。计划必须包含 wireless interface、network/VLAN、DHCP、firewall zone、forwarding policy 和管理面隔离，并进行冲突检测。R3 审批中展示完整资源图与 diff；变更后同时验证 SSID、DHCP、互联网访问以及无法访问 LAN 管理地址。
 
-### 16.3 离线故障
+### 16.3 “限制某设备访问并开放一个业务端口”
+
+Agent 把请求编译为同一个 `FirewallPolicy` desired state，而不是执行两条字符串
+命令：限制条件可以引用源 MAC、源 zone 和时间范围；业务开放规则可以引用目的
+设备、协议、端口、DNAT 和 source allowlist。Policy Engine 检查 MAC/IP 当前映射
+只作为证据而不把它当永久身份，识别新规则是否影响当前管理 actor，并把扩大 WAN
+暴露面的部分提升为 R3。OpenWrt 生成 UCI rule/redirect，由当前 fw3 或 fw4 渲染；
+普通 Linux 只生成 Agent-owned nftables/iptables 对象。两项变更统一 diff、审批、
+应用和回滚，验证既包含受限设备路径，也包含允许来源的端口连通性和管理路径。
+
+### 16.4 离线故障
 
 LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，生成确定性报告。同一次开机内若任务已有未确认变更，`/tmp` rollback helper 不依赖模型或 Agent 主进程完成恢复；整机重启或断电后不恢复运行态。
 
@@ -776,14 +904,24 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 
 ### 17.1 测试层次
 
-- 单元测试：schema、策略矩阵、状态机、脱敏、provider stream parser、配置迁移。
-- 属性/模糊测试：UCI patch、CIDR/地址解析、SSE/JSON/CBOR parser、MQTT envelope、截断逻辑。
+- 单元测试：schema、typed CRUD、语义 diff、动态风险、策略矩阵、ChangeSet
+  状态机、幂等键、ownership、脱敏、provider stream parser、配置迁移。
+- 属性/模糊测试：UCI patch、nft/iptables renderer、CIDR/地址/端口/地址池解析、
+  对象依赖图、SSE/JSON/CBOR parser、MQTT envelope、截断逻辑。
 - 合约测试：录制各 LLM provider 和 Channel 的合法/异常事件序列，防 API 漂移。
-- 平台集成测试：OpenWrt x86_64 QEMU，21.02 运行真实 fw3/iptables，22.03+ 运行 fw4/nftables，并覆盖 ubus/UCI/netifd。
-- 网络仿真：Linux namespace + veth + nftables + dnsmasq + tc/netem，注入丢包、高延迟、DNS 污染、MTU 黑洞、路由错误。
+- 平台集成测试：OpenWrt x86_64 QEMU，21.02 运行真实 fw3/iptables，22.03+
+  运行 fw4/nftables，并覆盖 UCI typed CRUD、ubus/netifd、render/check/reload/
+  rollback；普通 Linux 分别覆盖 nftables 和 iptables managed backend。
+- 网络仿真：Linux namespace + veth + nftables/iptables + dnsmasq + hostapd
+  仿真 + tc/netem，注入丢包、高延迟、DNS 污染、MTU 黑洞、路由错误，并验证
+  防火墙、Bridge/VLAN、路由、DHCP、DNS 和 QoS 的前后探针。
 - 设备矩阵：至少一台 MIPS 低内存设备、一台 ARMv7、一台 AArch64 和 x86_64。
-- 故障注入：进程 kill、断电近似、`/tmp` 满/低水位、只读 overlay、时间跳变、MQTT 重复/乱序、ClawBot long-poll 中断、模型半截 tool call。
-- 安全测试：prompt injection corpus、命令参数注入、越权审批、secret 泄漏、签名 bundle 和 rollback bypass。
+- 故障注入：stage/apply/verify/rollback 各阶段 kill、管理链路断开、服务 reload
+  失败、`/tmp` 满/低水位、只读 overlay、时间跳变、MQTT 重复/乱序、ClawBot
+  long-poll 中断、模型半截 tool call。
+- 安全测试：prompt injection corpus、命令参数注入、raw expression/path 注入、
+  非托管对象修改、approval token 重放/换 actor/换 boot/换 diff、越权审批、
+  secret 泄漏、签名 bundle 和 rollback bypass。
 
 ### 17.2 Agent 评测集
 
@@ -815,16 +953,43 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 
 **退出标准**：评测集中高频只读故障诊断正确率达团队设定阈值，无写操作路径。
 
-### Phase 2：安全变更闭环（4–6 周）
+### Phase 2：通用安全变更底座（4–6 周）
 
-- UCI typed patch、diff、snapshot、独立 rollback helper。
-- R2/R3 策略、审批 token、actor/RBAC。
-- firewall4、Wi-Fi、DNS/DHCP 的受控变更和前后探针。
-- LuCI 最小审批/任务页面。
+- typed `ChangeSet`/desired-state/diff/precondition/idempotency 协议，不绑定某个配置域。
+- 动态 R2/R3 风险计算、一次性 approval token、actor/RBAC 与任意 Channel 可进入的
+  本地管理员密码提权。
+- 有界 snapshot/journal、写事务单并发锁、独立 `rollback-helper`、确认超时和
+  `RollbackFailed` 熔断。
+- 后端 trait、ownership 标记、staging/dry-run、前后探针和易失审计。
+- 先用不改变管理路径的 Agent 托管测试对象验证 OpenWrt procd 与普通 Linux
+  systemd/OpenRC/BusyBox helper。
 
-**退出标准**：断网和 Agent 进程崩溃/重启注入下，同一次开机内未确认变更可自动恢复；设备重启场景验证运行态被清空且无恢复尝试。
+**退出标准**：对测试配置域注入校验失败、apply 半失败、管理连接中断、Agent
+kill/重启和 `/tmp` 压力时，同一次开机内未确认变更可自动恢复；approval token
+不能重放或跨 actor/diff/boot 使用；设备重启后运行态记录清空且无恢复尝试。
 
-### Phase 3：直连多 Channel（4–6 周）
+### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
+
+1. **防火墙完整策略**：OpenWrt UCI fw3/fw4 与普通 Linux nftables/iptables
+   managed backend；zone、forwarding、filter、MAC/IP/端口、set、NAT/redirect、
+   masquerade、启停和排序。
+2. **L2/L3 网络**：接口/地址、Bridge/VLAN、MTU、静态路由和 policy rule；优先
+   交付不影响管理路径的新增对象，再开放带 confirmed-commit 的 WAN/LAN 修改。
+3. **DNS/DHCP**：resolver、split DNS、静态主机、地址池、租期、静态租约、
+   DHCP option、RA/DHCPv6。
+4. **无线**：radio、国家码、信道、SSID、加密、网络绑定、客户端隔离和 MAC
+   policy；秘密字段全程旁路 LLM/SQLite。
+5. **服务、QoS 与 VPN**：服务 allowlist、SQM/tc、WireGuard；只修改 Agent
+   托管对象或平台原生 typed 配置。
+6. 每个切片同时交付 inspect/plan/create/update/delete/move（适用时）、
+   capability、动态风险、验证、回滚、CLI、Agent tool、审计和跨平台测试，
+   不接受“只能新增不能维护”或“OpenWrt 能写、普通 Linux 永久缺席”的半实现。
+
+**退出标准**：能力矩阵中承诺的 CRUD 在对应 supported capability 上全部可用；
+OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/仿真
+事务、回滚和幂等测试；未知/第三方对象始终保持只读。
+
+### Phase 4：直连多 Channel（4–6 周）
 
 - MQTT 5 device protocol、mTLS、易失 outbox、去重和证书轮换。
 - 企业微信官方长连接 adapter、CLI 二维码/官方凭据绑定、自动重连。
@@ -835,9 +1000,10 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 
-### Phase 4：专业能力与产品化（持续）
+### Phase 5：专业诊断与产品化（持续）
 
-- IPv6、Wi-Fi、PPPoE、VPN、QoS、Multi-WAN 高级 Runbook。
+- IPv6、Wi-Fi、PPPoE、VPN、QoS、Multi-WAN 高级 Runbook，以及已支持配置域的
+  确定性自动修复模板；自动修复仍复用同一 ChangeSet/审批/回滚路径。
 - 可选抓包分析、脱敏诊断包和远端知识检索，所有本地 artifact 位于 `/tmp`。
 - 厂商硬件平台 adapter、白标、批量策略和 OTA 对接。
 - 根据真实故障数据扩充 eval，优化 token、延迟和误操作率。
@@ -853,6 +1019,8 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 - SQLite 是唯一运行时存储，固定在 `/tmp`，不引入设备端向量数据库或跨重启恢复。
 - 除配置与 Channel 绑定凭据外，Agent 运行态严禁写 Flash。
 - 任意 Channel actor 都可以通过本地校验管理员密码，临时提升为 `device-admin`。
+- 配置面采用 capability 驱动的 typed CRUD，在可验证、可审批、可回滚和 ownership
+  明确的范围内最大化开放；未知或非托管对象保持只读。
 - 高频诊断由 Runbook 承担，LLM 处理意图、解释和长尾。
 
 ### Phase 0 必须实测后定案
@@ -864,13 +1032,25 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 5. 一个多 feature binary 还是 core + channel sidecar；首选前者，只有实测证明隔离收益明显才拆进程。
 6. “Mbed Agent”名称是否会与 Arm Mbed 生态造成商标/搜索混淆；正式发布前应完成名称检索。
 
-## 20. 建议的首个纵向切片
+## 20. 纵向切片顺序
 
-不要一开始同时做所有模型、机器人和网络工具。最合理的首个纵向切片是：
+已经完成并持续扩展的首个只读纵向切片是：
 
 > OpenWrt x86_64/AArch64 + 本地 CLI + 一个 OpenAI-compatible Provider + `/tmp` SQLite + WAN/DNS 只读 Runbook + 12 个 typed tools + 易失审计与资源/Flash 零写入基准。
 
-该切片会一次验证运行时、Provider 流式协议、工具边界、OpenWrt 数据源、上下文压缩、存储和包体/RSS。随后第二个切片加入一次可回滚的 DNS 配置变更；第三个切片再加入 MQTT。这样每一步都有完整用户价值，也能尽早暴露最危险的执行与回滚问题。
+接下来的配置工作不能从某个孤立 DNS 或 MAC 命令开始。顺序固定为：
+
+1. 先交付与领域无关的 ChangeSet、device-admin、approval token、snapshot、
+   独立 rollback helper、确认和故障注入测试。
+2. 用完整防火墙策略做第一个可写领域，覆盖 OpenWrt fw3/fw4 和普通 Linux
+   nftables/iptables；MAC 限制作为组合条件测试之一。
+3. 按 Phase 3 的顺序扩展 L2/L3、DNS/DHCP、无线、服务、QoS 和 WireGuard，
+   每个切片都有 CRUD、前后验证和回滚，不积累只能 plan 不能 apply 的接口。
+4. Channel 接入复用同一 actor/approval API；MQTT、企业微信和微信 ClawBot
+   不能另建绕过本地策略的远程执行路径。
+
+这样既尽早验证最危险的执行与回滚问题，也保证后续新增配置域只是实现 typed
+adapter 和领域验证器，而不是复制权限、事务与审计代码。
 
 ## 21. 参考项目与官方资料
 
@@ -899,3 +1079,8 @@ LLM/MQTT 都不可达时，CLI 仍能执行 `diagnose wan` 等本地 Runbook，�
 7. Provider、Channel、平台差异通过 adapter 隔离，替换任何一家供应商不改 Agent 核心。
 8. 企业微信/微信绑定使用官方能力，守护进程重启后自动重连，个人微信号逆向登录不进入项目。
 9. 除配置类写入外，真机测试证明 Agent 不向 Flash 写运行态数据。
+10. 每个标记为 writable 的 capability 都有 inspect/plan/apply/verify/rollback
+    和适用的 create/update/delete/move 测试；不支持的字段返回结构化 capability
+    错误，不静默忽略。
+11. OpenWrt UCI 变更不绕过 fw3/fw4/netifd 等原生控制面；普通 Linux 不修改
+    未标记为 Agent-owned 的 firewall/network/service 对象。
