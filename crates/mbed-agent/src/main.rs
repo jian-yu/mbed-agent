@@ -64,6 +64,12 @@ enum CliCommand {
         #[command(subcommand)]
         target: AuthTarget,
     },
+    #[command(hide = true)]
+    RollbackHelper {
+        transaction_id: String,
+        #[arg(short, long, default_value = "/etc/mbed-agent/config.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -248,6 +254,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
             )
             .await
+        }
+        CliCommand::RollbackHelper {
+            transaction_id,
+            config,
+        } => {
+            let config = agent_core::AgentConfig::load(&config)?;
+            let runtime_root = config
+                .storage
+                .path
+                .parent()
+                .ok_or("storage path has no runtime root")?;
+            agent_core::run_rollback_helper(
+                &runtime_root.join("rollback"),
+                &transaction_id,
+                config.storage.max_rollback_bytes,
+            )?;
+            Ok(())
         }
     }
 }

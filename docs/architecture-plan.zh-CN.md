@@ -531,6 +531,7 @@ max_request_bytes = 65536
 task_timeout_secs = 120
 tool_timeout_secs = 3
 max_tool_output_bytes = 65536
+rollback_confirm_timeout_secs = 90
 
 [platform]
 kind = "openwrt"

@@ -95,9 +95,10 @@ impl AgentConfig {
             || self.runtime.max_request_bytes < 1024
             || self.runtime.tool_timeout_secs == 0
             || self.runtime.max_tool_output_bytes < 1024
+            || !(5..=600).contains(&self.runtime.rollback_confirm_timeout_secs)
         {
             return Err(ConfigError::Validation(
-                "runtime limits must allow a task, a tool timeout, and 1024-byte buffers".into(),
+                "runtime limits must allow a task, a tool timeout, 1024-byte buffers, and a rollback confirmation timeout of 5-600 seconds".into(),
             ));
         }
         if self.server.socket_mode > 0o777 {
@@ -396,6 +397,7 @@ pub struct RuntimeConfig {
     pub task_timeout_secs: u64,
     pub tool_timeout_secs: u64,
     pub max_tool_output_bytes: usize,
+    pub rollback_confirm_timeout_secs: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -406,6 +408,7 @@ impl Default for RuntimeConfig {
             task_timeout_secs: 120,
             tool_timeout_secs: 3,
             max_tool_output_bytes: 64 * 1024,
+            rollback_confirm_timeout_secs: 90,
         }
     }
 }

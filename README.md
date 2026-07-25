@@ -30,6 +30,9 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   redacted and zeroized; neither passwords nor capabilities enter SQLite.
   Approval-token issuance and execution backends remain disabled until their
   following safety slices are complete.
+- Bounded rollback bundles now use typed, compiled target/reload mappings,
+  SHA-256 snapshot verification, `O_NOFOLLOW`, durable atomic replacement, and
+  a hidden independent `rollback-helper` mode in the same executable.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -83,6 +86,8 @@ Volatile ChangeSet and one-use approval storage is recorded in
 [ADR 0021](docs/adr/0021-volatile-changeset-approval-store.md).
 Boot-bound local administrator elevation is recorded in
 [ADR 0022](docs/adr/0022-boot-bound-administrator-elevation.md).
+Bounded snapshots and the independent rollback watchdog are recorded in
+[ADR 0023](docs/adr/0023-bounded-independent-rollback.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
