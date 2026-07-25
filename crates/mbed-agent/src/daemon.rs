@@ -330,6 +330,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseFirewall => {
             return handle_firewall_diagnosis(request.id, state).await;
         }
+        Command::DiagnosePolicyRouting => {
+            return handle_policy_routing_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -580,6 +583,7 @@ struct AgentSnapshots {
     interfaces: Option<agent_protocol::InterfaceDiagnosticReport>,
     neighbors: Option<agent_protocol::NeighborDiagnosticReport>,
     firewall: Option<agent_protocol::FirewallDiagnosticReport>,
+    policy_routing: Option<agent_protocol::PolicyRoutingDiagnosticReport>,
 }
 
 async fn execute_agent_tool(
@@ -605,6 +609,9 @@ async fn execute_agent_tool(
         ReadOnlyAgentTool::InspectFirewallRuntime
         | ReadOnlyAgentTool::InspectFirewallBaseChains => {
             execute_firewall_agent_tool(call, request_id, tool, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectPolicyRules | ReadOnlyAgentTool::InspectRouteTables => {
+            execute_policy_routing_agent_tool(call, request_id, tool, state, snapshots).await
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
@@ -726,6 +733,46 @@ async fn execute_firewall_agent_tool(
     })
 }
 
+async fn execute_policy_routing_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.policy_routing.is_none() {
+        let report = execute_agent_policy_routing_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-policy-routing-tool-snapshot"),
+            "policy-routing",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.policy_routing = Some(report);
+    }
+    let report = snapshots.policy_routing.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "policy-routing snapshot cache is unavailable",
+        )
+    })?;
+    let content =
+        bounded_policy_routing_observation(tool, report, state.config.llm.max_tool_context_bytes)
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
 async fn execute_wan_agent_tool(
     call: &ToolCall,
     request_id: &str,
@@ -791,10 +838,12 @@ enum ReadOnlyAgentTool {
     InspectNeighbors,
     InspectFirewallRuntime,
     InspectFirewallBaseChains,
+    InspectPolicyRules,
+    InspectRouteTables,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
@@ -804,6 +853,8 @@ impl ReadOnlyAgentTool {
         Self::InspectNeighbors,
         Self::InspectFirewallRuntime,
         Self::InspectFirewallBaseChains,
+        Self::InspectPolicyRules,
+        Self::InspectRouteTables,
     ];
 
     const fn name(self) -> &'static str {
@@ -817,6 +868,8 @@ impl ReadOnlyAgentTool {
             Self::InspectNeighbors => "inspect_neighbors",
             Self::InspectFirewallRuntime => "inspect_firewall_runtime",
             Self::InspectFirewallBaseChains => "inspect_firewall_base_chains",
+            Self::InspectPolicyRules => "inspect_policy_rules",
+            Self::InspectRouteTables => "inspect_route_tables",
         }
     }
 
@@ -848,6 +901,12 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectFirewallBaseChains => {
                 "Inspect bounded firewall base-chain hooks, policies, and rule counts without exposing individual rules."
+            }
+            Self::InspectPolicyRules => {
+                "Inspect bounded policy-routing priorities, selectors, marks, interfaces, actions, and target tables without changing rules."
+            }
+            Self::InspectRouteTables => {
+                "Inspect aggregate route counts, default routes, and exceptional routes per bounded routing table without exposing every route."
             }
         }
     }
@@ -973,6 +1032,24 @@ async fn execute_agent_firewall_diagnostic(
     }
 }
 
+async fn execute_agent_policy_routing_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::PolicyRoutingDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_policy_routing(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -1068,6 +1145,25 @@ struct FirewallBaseChainObservation<'a> {
     context_truncated: bool,
 }
 
+#[derive(serde::Serialize)]
+struct PolicyRuleObservation<'a> {
+    assessment: agent_protocol::PolicyRoutingAssessment,
+    rules: &'a [agent_protocol::PolicyRule],
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
+#[derive(serde::Serialize)]
+struct RouteTableObservation<'a> {
+    assessment: agent_protocol::PolicyRoutingAssessment,
+    tables: &'a [agent_protocol::RouteTableSummary],
+    total_routes: u32,
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
 fn bounded_tool_observation(
     tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
@@ -1139,7 +1235,57 @@ fn bounded_tool_observation(
         | ReadOnlyAgentTool::InspectFirewallBaseChains => {
             Err("firewall observations require a firewall snapshot".into())
         }
+        ReadOnlyAgentTool::InspectPolicyRules | ReadOnlyAgentTool::InspectRouteTables => {
+            Err("policy-routing observations require a policy-routing snapshot".into())
+        }
     }
+}
+
+fn bounded_policy_routing_observation(
+    tool: ReadOnlyAgentTool,
+    report: &agent_protocol::PolicyRoutingDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    let total = if tool == ReadOnlyAgentTool::InspectPolicyRules {
+        report.summary.rules.len()
+    } else {
+        report.summary.tables.len()
+    };
+    for retained in (0..=total).rev() {
+        let result = if tool == ReadOnlyAgentTool::InspectPolicyRules {
+            encode_tool_observation(
+                tool.name(),
+                &PolicyRuleObservation {
+                    assessment: report.summary.assessment,
+                    rules: &report.summary.rules[..retained],
+                    truncated: report.summary.truncated,
+                    complete: report.complete,
+                    context_truncated: retained < total,
+                },
+                limit,
+            )
+        } else {
+            encode_tool_observation(
+                tool.name(),
+                &RouteTableObservation {
+                    assessment: report.summary.assessment,
+                    tables: &report.summary.tables[..retained],
+                    total_routes: report.summary.total_routes,
+                    truncated: report.summary.truncated,
+                    complete: report.complete,
+                    context_truncated: retained < total,
+                },
+                limit,
+            )
+        };
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        tool.name()
+    ))
 }
 
 fn bounded_firewall_observation(
@@ -1582,6 +1728,51 @@ async fn handle_firewall_diagnosis(id: String, state: &AppState) -> ServerRespon
     ServerResponse::success(id, ResponseData::FirewallDiagnostic(Box::new(report)))
 }
 
+async fn handle_policy_routing_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_policy_routing(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("policy-routing diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "policy-routing diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "policy-routing",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::PolicyRoutingDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -1923,6 +2114,48 @@ mod tests {
         .expect("bounded observation");
         assert!(encoded.len() <= 1024);
         assert!(!encoded.contains("expr"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["context_truncated"], true);
+    }
+
+    #[test]
+    fn policy_rule_observation_shrinks_to_context_budget() {
+        let rules = (0..64)
+            .map(|priority| agent_protocol::PolicyRule {
+                priority: Some(priority),
+                source: Some("192.0.2.0/24".into()),
+                destination: None,
+                table: "100".into(),
+                action: None,
+                fwmark: Some("0x1/0xff".into()),
+                incoming_interface: Some("eth0".into()),
+                outgoing_interface: None,
+            })
+            .collect();
+        let report = agent_protocol::PolicyRoutingDiagnosticReport {
+            summary: agent_protocol::PolicyRoutingSummary {
+                assessment: agent_protocol::PolicyRoutingAssessment::CustomPolicyPresent,
+                rules,
+                tables: vec![agent_protocol::RouteTableSummary {
+                    table: "100".into(),
+                    routes: 4,
+                    default_routes: 1,
+                    exceptional_routes: 0,
+                }],
+                total_routes: 4,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            complete: true,
+        };
+        let encoded = bounded_policy_routing_observation(
+            ReadOnlyAgentTool::InspectPolicyRules,
+            &report,
+            1024,
+        )
+        .expect("bounded observation");
+        assert!(encoded.len() <= 1024);
         let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
         assert_eq!(value["context_truncated"], true);
     }

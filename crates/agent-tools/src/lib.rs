@@ -10,8 +10,9 @@ use agent_protocol::{
     FirewallAssessment, FirewallBaseChain, FirewallDiagnosticReport, FirewallRuntimeSummary,
     FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceSummary,
     NeighborAssessment, NeighborDiagnosticReport, NeighborEntry, NeighborSummary,
-    NetworkInterfaceSummary, ProbeEvidence, ProbeStatus, RouteDiagnosticReport, RouteSummary,
-    WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
+    NetworkInterfaceSummary, PolicyRoutingAssessment, PolicyRoutingDiagnosticReport,
+    PolicyRoutingSummary, PolicyRule, ProbeEvidence, ProbeStatus, RouteDiagnosticReport,
+    RouteSummary, RouteTableSummary, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -24,6 +25,8 @@ const MAX_ADDRESSES_PER_INTERFACE: usize = 8;
 const MAX_NEIGHBORS: usize = 64;
 const MAX_NEIGHBOR_STATES: usize = 4;
 const MAX_FIREWALL_BASE_CHAINS: usize = 32;
+const MAX_POLICY_RULES: usize = 64;
+const MAX_ROUTE_TABLES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -206,6 +209,19 @@ impl ToolRunner {
             }],
         };
         Ok(build_firewall_report(evidence, platform.firewall.backend))
+    }
+
+    /// Inspects bounded policy rules and aggregate route-table state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_policy_routing(&self) -> io::Result<PolicyRoutingDiagnosticReport> {
+        let evidence = vec![
+            self.run(Probe::IpRule).await?,
+            self.run(Probe::IpRoute).await?,
+        ];
+        Ok(build_policy_routing_report(evidence))
     }
 
     async fn collect_passive(
@@ -1597,6 +1613,203 @@ const fn firewall_backend_name(backend: FirewallBackend) -> &'static str {
     }
 }
 
+fn build_policy_routing_report(evidence: Vec<ProbeEvidence>) -> PolicyRoutingDiagnosticReport {
+    let mut summary = PolicyRoutingSummary {
+        assessment: PolicyRoutingAssessment::InsufficientEvidence,
+        rules: Vec::new(),
+        tables: Vec::new(),
+        total_routes: 0,
+        truncated: false,
+    };
+    let has_rule_evidence = successful_output(&evidence, "network.route.rules").is_some();
+    let has_route_evidence = successful_output(&evidence, "network.route.list").is_some();
+    if let Some(output) = successful_output(&evidence, "network.route.rules") {
+        parse_policy_rules(output, &mut summary);
+    }
+    if let Some(output) = successful_output(&evidence, "network.route.list") {
+        parse_route_tables(output, &mut summary);
+    }
+    let custom = summary.rules.iter().any(is_custom_policy_rule);
+    summary.assessment = if !has_rule_evidence {
+        PolicyRoutingAssessment::InsufficientEvidence
+    } else if summary.rules.is_empty() {
+        PolicyRoutingAssessment::NoRules
+    } else if custom {
+        PolicyRoutingAssessment::CustomPolicyPresent
+    } else {
+        PolicyRoutingAssessment::DefaultPolicyOnly
+    };
+    let mut findings = vec![
+        match summary.assessment {
+            PolicyRoutingAssessment::CustomPolicyPresent => {
+                "custom policy-routing selectors or non-default route tables are present"
+            }
+            PolicyRoutingAssessment::DefaultPolicyOnly => {
+                "only the conventional local, main, and default policy rules were normalized"
+            }
+            PolicyRoutingAssessment::NoRules => "no policy-routing rules were returned",
+            PolicyRoutingAssessment::InsufficientEvidence => {
+                "policy-routing rule evidence is unavailable"
+            }
+        }
+        .into(),
+    ];
+    if !has_route_evidence {
+        findings.push("aggregate route-table evidence is unavailable".into());
+    }
+    if summary.truncated || evidence.iter().any(|item| item.truncated) {
+        findings.push(
+            "policy-routing inspection reached a configured byte or normalized-entry limit".into(),
+        );
+    }
+    PolicyRoutingDiagnosticReport {
+        complete: has_rule_evidence
+            && has_route_evidence
+            && !summary.truncated
+            && !evidence.iter().any(|item| item.truncated),
+        summary,
+        evidence,
+        findings,
+    }
+}
+
+fn parse_policy_rules(output: &str, summary: &mut PolicyRoutingSummary) {
+    let Ok(rules) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for rule in rules {
+        if summary.rules.len() >= MAX_POLICY_RULES {
+            summary.truncated = true;
+            break;
+        }
+        let table = json_scalar_string(&rule, "table", 32)
+            .or_else(|| json_scalar_string(&rule, "lookup", 32))
+            .map_or_else(
+                || "unspecified".into(),
+                |table| normalize_route_table(&table),
+            );
+        let source = normalized_route_selector(&rule, "src");
+        let destination = normalized_route_selector(&rule, "dst");
+        let fwmark = json_scalar_string(&rule, "fwmark", 32).filter(|mark| valid_fwmark(mark));
+        summary.rules.push(PolicyRule {
+            priority: rule.get("priority").and_then(serde_json::Value::as_u64),
+            source,
+            destination,
+            table,
+            action: bounded_json_string(&rule, "action", 32),
+            fwmark,
+            incoming_interface: bounded_json_string(&rule, "iifname", 64)
+                .or_else(|| bounded_json_string(&rule, "iif", 64)),
+            outgoing_interface: bounded_json_string(&rule, "oifname", 64)
+                .or_else(|| bounded_json_string(&rule, "oif", 64)),
+        });
+    }
+}
+
+fn parse_route_tables(output: &str, summary: &mut PolicyRoutingSummary) {
+    let Ok(routes) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for route in routes {
+        let table = json_scalar_string(&route, "table", 32)
+            .map_or_else(|| "main".into(), |table| normalize_route_table(&table));
+        summary.total_routes = summary.total_routes.saturating_add(1);
+        let position = summary
+            .tables
+            .iter()
+            .position(|candidate| candidate.table == table);
+        let table_summary = if let Some(position) = position {
+            &mut summary.tables[position]
+        } else {
+            if summary.tables.len() >= MAX_ROUTE_TABLES {
+                summary.truncated = true;
+                continue;
+            }
+            summary.tables.push(RouteTableSummary {
+                table: table.clone(),
+                routes: 0,
+                default_routes: 0,
+                exceptional_routes: 0,
+            });
+            summary.tables.last_mut().expect("route table was inserted")
+        };
+        table_summary.routes = table_summary.routes.saturating_add(1);
+        let destination = route
+            .get("dst")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default");
+        if matches!(destination, "default" | "0.0.0.0/0" | "::/0") {
+            table_summary.default_routes = table_summary.default_routes.saturating_add(1);
+        }
+        if route
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "blackhole" | "unreachable" | "prohibit" | "throw"))
+        {
+            table_summary.exceptional_routes = table_summary.exceptional_routes.saturating_add(1);
+        }
+    }
+    summary
+        .tables
+        .sort_by(|left, right| left.table.cmp(&right.table));
+}
+
+fn json_scalar_string(value: &serde_json::Value, key: &str, limit: usize) -> Option<String> {
+    let value = value.get(key)?;
+    if let Some(value) = value.as_str() {
+        return (!value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control))
+            .then(|| value.to_owned());
+    }
+    value
+        .as_u64()
+        .map(|value| value.to_string())
+        .filter(|value| value.len() <= limit)
+}
+
+fn normalized_route_selector(value: &serde_json::Value, key: &str) -> Option<String> {
+    let selector = bounded_json_string(value, key, 64)?;
+    if selector == "all" {
+        return None;
+    }
+    if selector.parse::<IpAddr>().is_ok() {
+        return Some(selector);
+    }
+    let (address, prefix) = selector.split_once('/')?;
+    let address = address.parse::<IpAddr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    let maximum = if address.is_ipv4() { 32 } else { 128 };
+    (prefix <= maximum).then_some(selector)
+}
+
+fn normalize_route_table(table: &str) -> String {
+    match table {
+        "255" => "local".into(),
+        "254" => "main".into(),
+        "253" => "default".into(),
+        _ => table.to_owned(),
+    }
+}
+
+fn valid_fwmark(mark: &str) -> bool {
+    !mark.is_empty()
+        && mark
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b'x' | b'X' | b'/'))
+}
+
+fn is_custom_policy_rule(rule: &PolicyRule) -> bool {
+    !matches!(rule.table.as_str(), "local" | "main" | "default")
+        || rule.source.is_some()
+        || rule.destination.is_some()
+        || rule.fwmark.is_some()
+        || rule.incoming_interface.is_some()
+        || rule.outgoing_interface.is_some()
+        || rule
+            .action
+            .as_deref()
+            .is_some_and(|action| !matches!(action, "lookup" | "to_tbl"))
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -2204,6 +2417,76 @@ printf '%s\n' '[{"dst":"192.0.2.1","dev":"eth0","lladdr":"00:11:22:AA:BB:CC","st
         );
         assert_eq!(report.summary.base_chains[0].rules, 1);
         assert!(report.complete);
+    }
+
+    #[test]
+    fn normalizes_custom_policy_rules_and_route_table_totals() {
+        let rules = serde_json::json!([
+            {"priority": 0, "src": "all", "table": "local"},
+            {"priority": 1000, "src": "192.0.2.0/24", "fwmark": 1, "table": 100},
+            {"priority": 32766, "src": "all", "table": 254}
+        ]);
+        let routes = serde_json::json!([
+            {"dst": "default", "table": 100, "gateway": "192.0.2.1"},
+            {"dst": "198.51.100.0/24", "table": 100},
+            {"type": "blackhole", "dst": "203.0.113.0/24", "table": 100},
+            {"dst": "default", "table": "main", "gateway": "198.51.100.1"}
+        ]);
+        let report = build_policy_routing_report(vec![
+            ok_evidence(
+                "network.route.rules",
+                &serde_json::to_string(&rules).expect("rules"),
+            ),
+            ok_evidence(
+                "network.route.list",
+                &serde_json::to_string(&routes).expect("routes"),
+            ),
+        ]);
+        assert_eq!(
+            report.summary.assessment,
+            PolicyRoutingAssessment::CustomPolicyPresent
+        );
+        assert_eq!(report.summary.rules.len(), 3);
+        assert_eq!(report.summary.rules[1].table, "100");
+        assert_eq!(
+            report.summary.rules[1].source.as_deref(),
+            Some("192.0.2.0/24")
+        );
+        assert_eq!(report.summary.rules[1].fwmark.as_deref(), Some("1"));
+        assert_eq!(report.summary.total_routes, 4);
+        let custom = report
+            .summary
+            .tables
+            .iter()
+            .find(|table| table.table == "100")
+            .expect("custom table");
+        assert_eq!(custom.routes, 3);
+        assert_eq!(custom.default_routes, 1);
+        assert_eq!(custom.exceptional_routes, 1);
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn policy_rule_inventory_is_cardinality_bounded() {
+        let rules: Vec<serde_json::Value> = (0..=MAX_POLICY_RULES)
+            .map(|priority| {
+                serde_json::json!({
+                    "priority": priority,
+                    "src": "all",
+                    "table": "main"
+                })
+            })
+            .collect();
+        let report = build_policy_routing_report(vec![
+            ok_evidence(
+                "network.route.rules",
+                &serde_json::to_string(&rules).expect("rules"),
+            ),
+            ok_evidence("network.route.list", "[]"),
+        ]);
+        assert_eq!(report.summary.rules.len(), MAX_POLICY_RULES);
+        assert!(report.summary.truncated);
+        assert!(!report.complete);
     }
 
     #[test]

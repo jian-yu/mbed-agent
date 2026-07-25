@@ -23,6 +23,7 @@ pub enum Command {
     DiagnoseInterfaces,
     DiagnoseNeighbors,
     DiagnoseFirewall,
+    DiagnosePolicyRouting,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -79,6 +80,7 @@ pub enum ResponseData {
     InterfaceDiagnostic(Box<InterfaceDiagnosticReport>),
     NeighborDiagnostic(Box<NeighborDiagnosticReport>),
     FirewallDiagnostic(Box<FirewallDiagnosticReport>),
+    PolicyRoutingDiagnostic(Box<PolicyRoutingDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -357,6 +359,64 @@ impl FirewallAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyRoutingDiagnosticReport {
+    pub summary: PolicyRoutingSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyRoutingSummary {
+    pub assessment: PolicyRoutingAssessment,
+    pub rules: Vec<PolicyRule>,
+    pub tables: Vec<RouteTableSummary>,
+    pub total_routes: u32,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyRule {
+    pub priority: Option<u64>,
+    pub source: Option<String>,
+    pub destination: Option<String>,
+    pub table: String,
+    pub action: Option<String>,
+    pub fwmark: Option<String>,
+    pub incoming_interface: Option<String>,
+    pub outgoing_interface: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteTableSummary {
+    pub table: String,
+    pub routes: u32,
+    pub default_routes: u32,
+    pub exceptional_routes: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRoutingAssessment {
+    CustomPolicyPresent,
+    DefaultPolicyOnly,
+    NoRules,
+    InsufficientEvidence,
+}
+
+impl PolicyRoutingAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CustomPolicyPresent => "custom_policy_present",
+            Self::DefaultPolicyOnly => "default_policy_only",
+            Self::NoRules => "no_rules",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -526,6 +586,7 @@ mod tests {
             Command::DiagnoseInterfaces,
             Command::DiagnoseNeighbors,
             Command::DiagnoseFirewall,
+            Command::DiagnosePolicyRouting,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,
