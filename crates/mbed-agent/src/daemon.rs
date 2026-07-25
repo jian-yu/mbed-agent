@@ -359,6 +359,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseRoutes => {
             return handle_route_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseInterfaces => {
+            return handle_interface_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -495,6 +498,7 @@ async fn run_read_only_agent(
     ];
     let tools = read_only_agent_tools();
     let mut wan_snapshot = None;
+    let mut interface_snapshot = None;
     let mut prompt_tokens = None;
     let mut completion_tokens = None;
 
@@ -547,9 +551,15 @@ async fn run_read_only_agent(
             tool_calls: completion.tool_calls,
         });
         messages.push(
-            execute_agent_tool(&call, request_id, state, &mut wan_snapshot)
-                .await
-                .map_err(|failure| failure.with_usage(prompt_tokens, completion_tokens))?,
+            execute_agent_tool(
+                &call,
+                request_id,
+                state,
+                &mut wan_snapshot,
+                &mut interface_snapshot,
+            )
+            .await
+            .map_err(|failure| failure.with_usage(prompt_tokens, completion_tokens))?,
         );
     }
     Err(AgentLoopFailure::new(
@@ -568,6 +578,7 @@ async fn execute_agent_tool(
     request_id: &str,
     state: &AppState,
     wan_snapshot: &mut Option<agent_protocol::WanDiagnosticReport>,
+    interface_snapshot: &mut Option<agent_protocol::InterfaceDiagnosticReport>,
 ) -> Result<ModelMessage, AgentLoopFailure> {
     let tool = validate_read_only_tool_call(call).map_err(|reason| {
         warn!(tool = %call.name, %reason, "model requested a rejected tool call");
@@ -576,6 +587,39 @@ async fn execute_agent_tool(
             format!("model tool call was rejected: {reason}"),
         )
     })?;
+    if tool == ReadOnlyAgentTool::InspectInterfaces {
+        ensure_task_storage(state)
+            .await
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+        if interface_snapshot.is_none() {
+            let report = execute_agent_interface_diagnostic(state)
+                .await
+                .map_err(agent_tool_failure)?;
+            persist_diagnostic(
+                &format!("{request_id}-interface-tool-snapshot"),
+                "interfaces",
+                false,
+                report.summary.assessment.as_str(),
+                &report.summary,
+                state,
+            )
+            .await;
+            *interface_snapshot = Some(report);
+        }
+        let report = interface_snapshot.as_ref().ok_or_else(|| {
+            AgentLoopFailure::new(
+                ErrorCode::Internal,
+                "interface snapshot cache is unavailable",
+            )
+        })?;
+        let content =
+            bounded_interface_observation(report, state.config.llm.max_tool_context_bytes)
+                .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+        return Ok(ModelMessage::Tool {
+            tool_call_id: call.id.clone(),
+            content,
+        });
+    }
     if wan_snapshot.is_none() {
         ensure_task_storage(state)
             .await
@@ -614,11 +658,11 @@ fn agent_tool_failure(error: AgentToolError) -> AgentLoopFailure {
         ),
         AgentToolError::TimedOut => AgentLoopFailure::new(
             ErrorCode::ResourceExhausted,
-            "Agent WAN diagnosis exceeded the configured task timeout",
+            "Agent diagnostic exceeded the configured task timeout",
         ),
         AgentToolError::Failed(error) => AgentLoopFailure::new(
             ErrorCode::Internal,
-            format!("Agent WAN diagnosis failed: {error}"),
+            format!("Agent diagnostic failed: {error}"),
         ),
     }
 }
@@ -630,15 +674,17 @@ enum ReadOnlyAgentTool {
     InspectDns,
     InspectDhcp,
     InspectWanFirewall,
+    InspectInterfaces,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
         Self::InspectDhcp,
         Self::InspectWanFirewall,
+        Self::InspectInterfaces,
     ];
 
     const fn name(self) -> &'static str {
@@ -648,6 +694,7 @@ impl ReadOnlyAgentTool {
             Self::InspectDns => "inspect_dns",
             Self::InspectDhcp => "inspect_dhcp",
             Self::InspectWanFirewall => "inspect_wan_firewall",
+            Self::InspectInterfaces => "inspect_interfaces",
         }
     }
 
@@ -667,6 +714,9 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectWanFirewall => {
                 "Inspect the detected firewall backend and normalized WAN zone policies without changing rules."
+            }
+            Self::InspectInterfaces => {
+                "Inventory bounded kernel network interface, link, carrier, address, bridge/VLAN kind, and master state without changing devices."
             }
         }
     }
@@ -738,6 +788,24 @@ async fn execute_agent_wan_diagnostic(
     }
 }
 
+async fn execute_agent_interface_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::InterfaceDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_interfaces(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -781,6 +849,16 @@ struct FirewallObservation<'a> {
     assessment: agent_protocol::WanAssessment,
     firewall_backend: &'a str,
     firewall_zone: &'a Option<agent_protocol::FirewallZoneSummary>,
+}
+
+#[derive(serde::Serialize)]
+struct InterfaceObservation<'a> {
+    assessment: agent_protocol::InterfaceAssessment,
+    interfaces: &'a [agent_protocol::NetworkInterfaceSummary],
+    truncated: bool,
+    findings: &'a [String],
+    complete: bool,
+    context_truncated: bool,
 }
 
 fn bounded_tool_observation(
@@ -844,7 +922,38 @@ fn bounded_tool_observation(
             },
             limit,
         ),
+        ReadOnlyAgentTool::InspectInterfaces => {
+            Err("interface observations require an interface snapshot".into())
+        }
     }
+}
+
+fn bounded_interface_observation(
+    report: &agent_protocol::InterfaceDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    for retained in (0..=report.summary.interfaces.len()).rev() {
+        let context_truncated = retained < report.summary.interfaces.len();
+        let result = encode_tool_observation(
+            ReadOnlyAgentTool::InspectInterfaces.name(),
+            &InterfaceObservation {
+                assessment: report.summary.assessment,
+                interfaces: &report.summary.interfaces[..retained],
+                truncated: report.summary.truncated,
+                findings: &report.findings,
+                complete: report.complete,
+                context_truncated,
+            },
+            limit,
+        );
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        ReadOnlyAgentTool::InspectInterfaces.name()
+    ))
 }
 
 fn encode_tool_observation<T: serde::Serialize>(
@@ -1042,6 +1151,51 @@ async fn handle_route_diagnosis(id: String, state: &AppState) -> ServerResponse 
     )
     .await;
     ServerResponse::success(id, ResponseData::RouteDiagnostic(Box::new(report)))
+}
+
+async fn handle_interface_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_interfaces(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("interface diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "interface diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "interfaces",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::InterfaceDiagnostic(Box::new(report)))
 }
 
 async fn persist_diagnostic<T: serde::Serialize>(
@@ -1280,6 +1434,41 @@ mod tests {
             assert_eq!(tool.parameters["type"], "object");
             assert_eq!(tool.parameters["additionalProperties"], false);
         }
+    }
+
+    #[test]
+    fn interface_tool_observation_shrinks_to_context_budget() {
+        let interface = agent_protocol::NetworkInterfaceSummary {
+            name: "eth0".into(),
+            index: Some(2),
+            kind: Some("ether".into()),
+            operstate: Some("UP".into()),
+            up: Some(true),
+            carrier: Some(true),
+            mtu: Some(1500),
+            master: None,
+            addresses: vec!["192.0.2.10/24".into()],
+            dynamic_address: true,
+        };
+        let report = agent_protocol::InterfaceDiagnosticReport {
+            summary: agent_protocol::InterfaceSummary {
+                assessment: agent_protocol::InterfaceAssessment::InterfacesReady,
+                interfaces: vec![interface; 16],
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: vec!["interfaces ready".into()],
+            complete: true,
+        };
+        let encoded = bounded_interface_observation(&report, 1024).expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["context_truncated"], true);
+        assert!(
+            value["interfaces"]
+                .as_array()
+                .is_some_and(|interfaces| interfaces.len() < 16)
+        );
     }
 
     #[test]

@@ -18,19 +18,20 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
   OpenWrt-only ubus/UCI probes.
-- Deterministic `diagnose wan`, `diagnose dns`, `diagnose dhcp`, and
-  `diagnose routes` runbooks. They gather bounded, read-only evidence and
-  normalize it across OpenWrt and generic Linux. Focused runs execute only their
-  required collectors; the WAN run also includes firewall-backend and UCI zone
-  evidence.
+- Deterministic `diagnose wan`, `diagnose dns`, `diagnose dhcp`,
+  `diagnose routes`, and `diagnose interfaces` runbooks. They gather bounded,
+  read-only evidence and normalize it across OpenWrt and generic Linux. Focused
+  runs execute only their required collectors; the WAN run also includes
+  firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
   redirects, and redacted API-key configuration.
 - A bounded read-only Agent loop with locally allowlisted `diagnose_wan`,
-  `inspect_default_routes`, `inspect_dns`, `inspect_dhcp`, and
-  `inspect_wan_firewall` tools. Tool arguments are parsed and validated
-  on-device, and the model can never request active probes or shell commands.
+  `inspect_default_routes`, `inspect_dns`, `inspect_dhcp`,
+  `inspect_wan_firewall`, and `inspect_interfaces` tools. Tool arguments are
+  parsed and validated on-device, and the model can never request active probes
+  or shell commands.
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
 administrator elevation, and configuration transactions are planned but are not
@@ -65,6 +66,7 @@ cargo run -p mbed-agent -- diagnose wan --active
 cargo run -p mbed-agent -- diagnose dns
 cargo run -p mbed-agent -- diagnose dhcp
 cargo run -p mbed-agent -- diagnose routes
+cargo run -p mbed-agent -- diagnose interfaces
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 ```
@@ -106,6 +108,10 @@ an external DNS query succeeded.
 `diagnose dhcp` never renews a lease. OpenWrt uses normalized ubus protocol and
 pending state; generic Linux reports DHCP only when `ip -j` marks an address as
 dynamic, otherwise it returns insufficient evidence instead of guessing.
+`diagnose interfaces` uses only bounded kernel link/address collectors on both
+OpenWrt and generic Linux. It retains at most 32 interfaces and eight validated
+IP addresses per interface, reports inventory truncation explicitly, and does
+not run route, DNS, firewall, or active-connectivity probes.
 
 Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
 probe output is not persisted. History is bounded by configurable record-count

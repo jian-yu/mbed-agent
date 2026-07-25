@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use agent_protocol::{
     DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
-    FirewallZoneSummary, ProbeEvidence, ProbeStatus, RouteDiagnosticReport, RouteSummary,
+    FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceSummary,
+    NetworkInterfaceSummary, ProbeEvidence, ProbeStatus, RouteDiagnosticReport, RouteSummary,
     WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
@@ -16,6 +17,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 const WAN_INTERFACE: &str = "wan";
+const MAX_INTERFACES: usize = 32;
+const MAX_ADDRESSES_PER_INTERFACE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -129,17 +132,35 @@ impl ToolRunner {
         Ok(build_route_report(evidence, platform))
     }
 
+    /// Inventories kernel network interfaces using bounded, passive collectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_interfaces(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<InterfaceDiagnosticReport> {
+        let evidence = self
+            .collect_passive(platform, DiagnosticScope::Interfaces)
+            .await?;
+        Ok(build_interface_report(evidence))
+    }
+
     async fn collect_passive(
         &self,
         platform: &PlatformCapabilities,
         scope: DiagnosticScope,
     ) -> io::Result<Vec<ProbeEvidence>> {
         let mut evidence = Vec::with_capacity(12);
-        if platform.kind == PlatformKind::OpenWrt {
+        if platform.kind == PlatformKind::OpenWrt && scope != DiagnosticScope::Interfaces {
             evidence.push(self.run(Probe::UbusWan).await?);
         }
-        for probe in [Probe::IpLink, Probe::IpAddress, Probe::IpRoute] {
+        for probe in [Probe::IpLink, Probe::IpAddress] {
             evidence.push(self.run(probe).await?);
+        }
+        if scope != DiagnosticScope::Interfaces {
+            evidence.push(self.run(Probe::IpRoute).await?);
         }
         if matches!(scope, DiagnosticScope::Wan | DiagnosticScope::Routes) {
             evidence.push(self.run(Probe::IpRule).await?);
@@ -297,6 +318,7 @@ enum DiagnosticScope {
     Dns,
     Dhcp,
     Routes,
+    Interfaces,
 }
 
 impl Probe {
@@ -971,6 +993,201 @@ fn build_route_report(
     }
 }
 
+fn build_interface_report(evidence: Vec<ProbeEvidence>) -> InterfaceDiagnosticReport {
+    let mut interfaces = Vec::new();
+    let mut truncated = false;
+    if let Some(output) = successful_output(&evidence, "network.interface.link") {
+        parse_interface_links(output, &mut interfaces, &mut truncated);
+    }
+    if let Some(output) = successful_output(&evidence, "network.interface.address") {
+        parse_interface_addresses(output, &mut interfaces, &mut truncated);
+    }
+    interfaces.sort_by(|left, right| {
+        left.index
+            .unwrap_or(u64::MAX)
+            .cmp(&right.index.unwrap_or(u64::MAX))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let has_link_evidence = successful_output(&evidence, "network.interface.link").is_some();
+    let has_usable_interface = interfaces.iter().any(|interface| interface.name != "lo");
+    let has_ready_interface = interfaces.iter().any(|interface| {
+        interface.name != "lo"
+            && (interface.up == Some(true)
+                || interface.carrier == Some(true)
+                || !interface.addresses.is_empty())
+    });
+    let assessment = if !has_link_evidence {
+        InterfaceAssessment::InsufficientEvidence
+    } else if !has_usable_interface {
+        InterfaceAssessment::NoUsableInterfaces
+    } else if has_ready_interface {
+        InterfaceAssessment::InterfacesReady
+    } else {
+        InterfaceAssessment::LinksDown
+    };
+    let mut findings =
+        vec![match assessment {
+        InterfaceAssessment::InterfacesReady => {
+            "one or more non-loopback interfaces are up, have carrier, or hold an IP address"
+        }
+        InterfaceAssessment::LinksDown => {
+            "network interfaces were found, but no non-loopback interface is operational"
+        }
+        InterfaceAssessment::NoUsableInterfaces => {
+            "only the loopback interface is present"
+        }
+        InterfaceAssessment::InsufficientEvidence => {
+            "kernel interface evidence is unavailable"
+        }
+    }
+    .into()];
+    if truncated || evidence.iter().any(|item| item.truncated) {
+        findings
+            .push("interface inventory reached a configured byte or normalized-entry limit".into());
+    }
+    let complete = has_link_evidence
+        && successful_output(&evidence, "network.interface.address").is_some()
+        && !truncated
+        && !evidence.iter().any(|item| item.truncated);
+    InterfaceDiagnosticReport {
+        summary: InterfaceSummary {
+            assessment,
+            interfaces,
+            truncated,
+        },
+        evidence,
+        findings,
+        complete,
+    }
+}
+
+fn parse_interface_links(
+    output: &str,
+    interfaces: &mut Vec<NetworkInterfaceSummary>,
+    truncated: &mut bool,
+) {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for item in items {
+        let Some(name) = bounded_json_string(&item, "ifname", 64) else {
+            continue;
+        };
+        if interfaces.len() >= MAX_INTERFACES {
+            *truncated = true;
+            break;
+        }
+        let flags = item.get("flags").and_then(serde_json::Value::as_array);
+        let flag = |expected: &str| {
+            flags.is_some_and(|flags| {
+                flags.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+                })
+            })
+        };
+        let operstate = bounded_json_string(&item, "operstate", 32);
+        let up = if flag("UP") {
+            Some(true)
+        } else {
+            operstate
+                .as_deref()
+                .map(|state| state.eq_ignore_ascii_case("up"))
+        };
+        let carrier = if flag("LOWER_UP") {
+            Some(true)
+        } else if flag("NO-CARRIER") {
+            Some(false)
+        } else {
+            None
+        };
+        let kind = item
+            .get("linkinfo")
+            .and_then(|value| bounded_json_string(value, "info_kind", 64))
+            .or_else(|| bounded_json_string(&item, "link_type", 64));
+        interfaces.push(NetworkInterfaceSummary {
+            name,
+            index: item.get("ifindex").and_then(serde_json::Value::as_u64),
+            kind,
+            operstate,
+            up,
+            carrier,
+            mtu: item.get("mtu").and_then(serde_json::Value::as_u64),
+            master: bounded_json_string(&item, "master", 64),
+            addresses: Vec::new(),
+            dynamic_address: false,
+        });
+    }
+}
+
+fn parse_interface_addresses(
+    output: &str,
+    interfaces: &mut [NetworkInterfaceSummary],
+    truncated: &mut bool,
+) {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for item in items {
+        let Some(name) = bounded_json_string(&item, "ifname", 64) else {
+            continue;
+        };
+        let Some(interface) = interfaces
+            .iter_mut()
+            .find(|interface| interface.name == name)
+        else {
+            continue;
+        };
+        let Some(addresses) = item.get("addr_info").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for address in addresses {
+            let Some(local) = address
+                .get("local")
+                .and_then(serde_json::Value::as_str)
+                .filter(|local| local.parse::<IpAddr>().is_ok())
+            else {
+                continue;
+            };
+            if interface.addresses.len() >= MAX_ADDRESSES_PER_INTERFACE {
+                *truncated = true;
+                break;
+            }
+            let maximum_prefix = if local.contains(':') { 128 } else { 32 };
+            let prefix = address
+                .get("prefixlen")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|prefix| *prefix <= maximum_prefix)
+                .unwrap_or(maximum_prefix);
+            push_unique(&mut interface.addresses, format!("{local}/{prefix}"));
+            interface.dynamic_address |= address
+                .get("dynamic")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || address
+                    .get("flags")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|flags| {
+                        flags.iter().any(|flag| {
+                            flag.as_str()
+                                .is_some_and(|flag| flag.eq_ignore_ascii_case("dynamic"))
+                        })
+                    });
+        }
+    }
+}
+
+fn bounded_json_string(value: &serde_json::Value, key: &str, limit: usize) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -1440,6 +1657,76 @@ printf '%s\n' '[{"dst":"default","gateway":"198.51.100.1","dev":"eth0","ifname":
                 .iter()
                 .any(|finding| finding.contains("inferred"))
         );
+    }
+
+    #[tokio::test]
+    async fn interface_runbook_normalizes_generic_linux_links_and_addresses() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ip",
+            r#"#!/bin/sh
+printf '%s\n' '[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],"mtu":65536,"operstate":"UNKNOWN","link_type":"loopback","addr_info":[{"local":"127.0.0.1","prefixlen":8}]},{"ifindex":2,"ifname":"eth0","flags":["BROADCAST","UP","LOWER_UP"],"mtu":1500,"operstate":"UP","link_type":"ether","addr_info":[{"local":"192.0.2.10","prefixlen":24,"dynamic":true},{"local":"2001:db8::10","prefixlen":64}]}]'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(3),
+            max_output_bytes: 4096,
+        };
+        let mut generic = platform(FirewallBackend::Nftables);
+        generic.kind = PlatformKind::GenericLinux;
+        let report = runner
+            .diagnose_interfaces(&generic)
+            .await
+            .expect("interface diagnosis");
+        assert_eq!(
+            report.summary.assessment,
+            InterfaceAssessment::InterfacesReady
+        );
+        assert!(report.complete);
+        assert_eq!(report.evidence.len(), 2);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .all(|item| item.probe.starts_with("network.interface."))
+        );
+        let eth0 = report
+            .summary
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "eth0")
+            .expect("eth0");
+        assert_eq!(eth0.index, Some(2));
+        assert_eq!(eth0.operstate.as_deref(), Some("UP"));
+        assert_eq!(eth0.carrier, Some(true));
+        assert_eq!(eth0.addresses, ["192.0.2.10/24", "2001:db8::10/64"]);
+        assert!(eth0.dynamic_address);
+    }
+
+    #[test]
+    fn interface_inventory_caps_normalized_entries() {
+        let links: Vec<serde_json::Value> = (0..=MAX_INTERFACES)
+            .map(|index| {
+                serde_json::json!({
+                    "ifindex": index + 1,
+                    "ifname": format!("eth{index}"),
+                    "flags": ["BROADCAST"],
+                    "operstate": "DOWN"
+                })
+            })
+            .collect();
+        let report = build_interface_report(vec![
+            ok_evidence(
+                "network.interface.link",
+                &serde_json::to_string(&links).expect("links"),
+            ),
+            ok_evidence("network.interface.address", "[]"),
+        ]);
+        assert_eq!(report.summary.interfaces.len(), MAX_INTERFACES);
+        assert!(report.summary.truncated);
+        assert!(!report.complete);
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ pub enum Command {
     DiagnoseDns,
     DiagnoseDhcp,
     DiagnoseRoutes,
+    DiagnoseInterfaces,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -73,6 +74,7 @@ pub enum ResponseData {
     DnsDiagnostic(Box<DnsDiagnosticReport>),
     DhcpDiagnostic(Box<DhcpDiagnosticReport>),
     RouteDiagnostic(Box<RouteDiagnosticReport>),
+    InterfaceDiagnostic(Box<InterfaceDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -202,6 +204,56 @@ pub struct RouteSummary {
     pub device: Option<String>,
     pub addresses: Vec<String>,
     pub default_routes: Vec<WanRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceDiagnosticReport {
+    pub summary: InterfaceSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceSummary {
+    pub assessment: InterfaceAssessment,
+    pub interfaces: Vec<NetworkInterfaceSummary>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkInterfaceSummary {
+    pub name: String,
+    pub index: Option<u64>,
+    pub kind: Option<String>,
+    pub operstate: Option<String>,
+    pub up: Option<bool>,
+    pub carrier: Option<bool>,
+    pub mtu: Option<u64>,
+    pub master: Option<String>,
+    pub addresses: Vec<String>,
+    pub dynamic_address: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceAssessment {
+    InterfacesReady,
+    LinksDown,
+    NoUsableInterfaces,
+    InsufficientEvidence,
+}
+
+impl InterfaceAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InterfacesReady => "interfaces_ready",
+            Self::LinksDown => "links_down",
+            Self::NoUsableInterfaces => "no_usable_interfaces",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -371,6 +423,7 @@ mod tests {
             Command::DiagnoseDns,
             Command::DiagnoseDhcp,
             Command::DiagnoseRoutes,
+            Command::DiagnoseInterfaces,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,
