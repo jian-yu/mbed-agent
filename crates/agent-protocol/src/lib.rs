@@ -25,6 +25,7 @@ pub enum Command {
     DiagnoseFirewall,
     DiagnosePolicyRouting,
     DiagnoseListeners,
+    DiagnoseWireless,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -83,6 +84,7 @@ pub enum ResponseData {
     FirewallDiagnostic(Box<FirewallDiagnosticReport>),
     PolicyRoutingDiagnostic(Box<PolicyRoutingDiagnosticReport>),
     ListenerDiagnostic(Box<ListenerDiagnosticReport>),
+    WirelessDiagnostic(Box<WirelessDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -472,6 +474,62 @@ impl ListenerAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessDiagnosticReport {
+    pub summary: WirelessSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessSummary {
+    pub assessment: WirelessAssessment,
+    pub radios: Vec<WirelessRadioSummary>,
+    pub interfaces: Vec<WirelessInterfaceSummary>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessRadioSummary {
+    pub name: String,
+    pub up: Option<bool>,
+    pub pending: Option<bool>,
+    pub disabled: Option<bool>,
+    pub channel: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessInterfaceSummary {
+    pub name: String,
+    pub radio: Option<String>,
+    pub mode: Option<String>,
+    pub ssid: Option<String>,
+    pub channel: Option<u32>,
+    pub frequency_mhz: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WirelessAssessment {
+    WirelessPresent,
+    RadiosDisabled,
+    NoWireless,
+    CollectorUnavailable,
+}
+
+impl WirelessAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WirelessPresent => "wireless_present",
+            Self::RadiosDisabled => "radios_disabled",
+            Self::NoWireless => "no_wireless",
+            Self::CollectorUnavailable => "collector_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -643,6 +701,7 @@ mod tests {
             Command::DiagnoseFirewall,
             Command::DiagnosePolicyRouting,
             Command::DiagnoseListeners,
+            Command::DiagnoseWireless,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,

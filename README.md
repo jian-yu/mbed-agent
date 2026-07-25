@@ -23,9 +23,10 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
   The additional `diagnose firewall` runbook normalizes runtime fw3/fw4,
   iptables, and nftables counts; `diagnose policy-routing` normalizes policy
   selectors and aggregate route tables; `diagnose listeners` classifies bounded
-  TCP/UDP binding exposure. All gather bounded, read-only evidence across
-  OpenWrt and generic Linux. Focused runs execute only their required collectors;
-  the WAN run also includes firewall-backend and UCI zone evidence.
+  TCP/UDP binding exposure; `diagnose wireless` normalizes radio and interface
+  state without scanning. All gather bounded, read-only evidence across OpenWrt
+  and generic Linux. Focused runs execute only their required collectors; the
+  WAN run also includes firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
@@ -36,8 +37,9 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+ and
   Runtime firewall totals and base-chain policies are exposed through two more
   expression-free tools. Policy rules and aggregate route tables have separate
   bounded views backed by one snapshot. Listening ports and non-loopback
-  exposure have address-free views. Tool arguments are parsed and validated
-  on-device, and the model can never request active probes or shell commands.
+  exposure have address-free views; wireless tools omit SSID values and AP
+  addresses. Tool arguments are parsed and validated on-device, and the model
+  can never request active probes or shell commands.
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
 administrator elevation, and configuration transactions are planned but are not
@@ -77,6 +79,7 @@ cargo run -p mbed-agent -- diagnose neighbors
 cargo run -p mbed-agent -- diagnose firewall
 cargo run -p mbed-agent -- diagnose policy-routing
 cargo run -p mbed-agent -- diagnose listeners
+cargo run -p mbed-agent -- diagnose wireless
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 ```
@@ -138,6 +141,10 @@ non-default route details remain outside model context and SQLite.
 It retains at most 128 TCP/UDP listeners without requesting process identities,
 classifies wildcard/loopback/link-local/specific bindings, and omits exact local
 addresses from every LLM observation.
+`diagnose wireless` uses OpenWrt ubus status plus passive `iw dev` or `iwinfo`
+fallback evidence. It retains at most 16 radios and 32 interfaces, never scans
+or changes association state, and replaces local SSID values with a boolean
+presence marker before sending observations to an LLM.
 
 Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
 probe output is not persisted. History is bounded by configurable record-count

@@ -14,6 +14,8 @@ use agent_protocol::{
     NetworkInterfaceSummary, PolicyRoutingAssessment, PolicyRoutingDiagnosticReport,
     PolicyRoutingSummary, PolicyRule, ProbeEvidence, ProbeStatus, RouteDiagnosticReport,
     RouteSummary, RouteTableSummary, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
+    WirelessAssessment, WirelessDiagnosticReport, WirelessInterfaceSummary, WirelessRadioSummary,
+    WirelessSummary,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -29,6 +31,8 @@ const MAX_FIREWALL_BASE_CHAINS: usize = 32;
 const MAX_POLICY_RULES: usize = 64;
 const MAX_ROUTE_TABLES: usize = 32;
 const MAX_LISTENERS: usize = 128;
+const MAX_WIRELESS_RADIOS: usize = 16;
+const MAX_WIRELESS_INTERFACES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -244,6 +248,40 @@ impl ToolRunner {
             ]
         };
         Ok(build_listener_report(evidence))
+    }
+
+    /// Inspects bounded wireless radio and interface state without scanning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a resolved collector cannot be executed.
+    pub async fn diagnose_wireless(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<WirelessDiagnosticReport> {
+        let mut evidence = Vec::with_capacity(2);
+        if platform.kind == PlatformKind::OpenWrt && platform.has_ubus {
+            evidence.push(
+                self.run_command(
+                    "openwrt.wireless.status",
+                    "ubus",
+                    &["call", "network.wireless", "status"],
+                )
+                .await?,
+            );
+        }
+        if self.resolve("iw").is_some() {
+            evidence.push(
+                self.run_command("network.wireless.iw", "iw", &["dev"])
+                    .await?,
+            );
+        } else {
+            evidence.push(
+                self.run_command("network.wireless.iwinfo", "iwinfo", &[])
+                    .await?,
+            );
+        }
+        Ok(build_wireless_report(evidence))
     }
 
     async fn collect_passive(
@@ -1996,6 +2034,330 @@ fn listener_entry(protocol: &str, endpoint: &str, state: Option<&str>) -> Option
     })
 }
 
+fn build_wireless_report(evidence: Vec<ProbeEvidence>) -> WirelessDiagnosticReport {
+    let mut summary = WirelessSummary {
+        assessment: WirelessAssessment::CollectorUnavailable,
+        radios: Vec::new(),
+        interfaces: Vec::new(),
+        truncated: false,
+    };
+    if let Some(output) = successful_output(&evidence, "openwrt.wireless.status") {
+        parse_ubus_wireless(output, &mut summary);
+    }
+    if let Some(output) = successful_output(&evidence, "network.wireless.iw") {
+        parse_iw_dev(output, &mut summary);
+    }
+    if let Some(output) = successful_output(&evidence, "network.wireless.iwinfo") {
+        parse_iwinfo(output, &mut summary);
+    }
+    summary
+        .radios
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    summary
+        .interfaces
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    let successful = evidence.iter().any(|item| item.status == ProbeStatus::Ok);
+    let disabled_only = !summary.radios.is_empty()
+        && summary
+            .radios
+            .iter()
+            .all(|radio| radio.disabled == Some(true) || radio.up == Some(false));
+    summary.assessment = if !successful {
+        WirelessAssessment::CollectorUnavailable
+    } else if disabled_only {
+        WirelessAssessment::RadiosDisabled
+    } else if summary.radios.is_empty() && summary.interfaces.is_empty() {
+        WirelessAssessment::NoWireless
+    } else {
+        WirelessAssessment::WirelessPresent
+    };
+    let configured_ssids = summary
+        .interfaces
+        .iter()
+        .filter(|interface| interface.ssid.is_some())
+        .count();
+    let mut findings = vec![match summary.assessment {
+        WirelessAssessment::WirelessPresent => format!(
+            "{} radios and {} wireless interfaces were normalized; {configured_ssids} interfaces have a local SSID value",
+            summary.radios.len(),
+            summary.interfaces.len()
+        ),
+        WirelessAssessment::RadiosDisabled => {
+            "wireless radios were found, but all reported radios are disabled or down".into()
+        }
+        WirelessAssessment::NoWireless => {
+            "the wireless collector returned no radios or interfaces".into()
+        }
+        WirelessAssessment::CollectorUnavailable => {
+            "no usable ubus, iw, or iwinfo wireless evidence is available".into()
+        }
+    }];
+    if summary.truncated || evidence.iter().any(|item| item.truncated) {
+        findings
+            .push("wireless inspection reached a configured byte or normalized-entry limit".into());
+    }
+    WirelessDiagnosticReport {
+        complete: successful && !summary.truncated && !evidence.iter().any(|item| item.truncated),
+        summary,
+        evidence,
+        findings,
+    }
+}
+
+fn parse_ubus_wireless(output: &str, summary: &mut WirelessSummary) {
+    let Ok(radios) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(output)
+    else {
+        return;
+    };
+    for (name, value) in radios {
+        if !valid_bounded_text(&name, 64) {
+            continue;
+        }
+        if summary.radios.len() >= MAX_WIRELESS_RADIOS {
+            summary.truncated = true;
+            break;
+        }
+        let config = value.get("config");
+        let channel = config
+            .and_then(|config| json_u32(config, "channel"))
+            .or_else(|| json_u32(&value, "channel"));
+        let disabled = json_boolish(&value, "disabled")
+            .or_else(|| config.and_then(|config| json_boolish(config, "disabled")));
+        push_wireless_radio(
+            summary,
+            WirelessRadioSummary {
+                name: name.clone(),
+                up: value.get("up").and_then(serde_json::Value::as_bool),
+                pending: value.get("pending").and_then(serde_json::Value::as_bool),
+                disabled,
+                channel,
+            },
+        );
+        let Some(interfaces) = value
+            .get("interfaces")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for interface in interfaces {
+            let config = interface.get("config");
+            let ifname = bounded_json_string(interface, "ifname", 64)
+                .or_else(|| bounded_json_string(interface, "section", 64));
+            let Some(ifname) = ifname else {
+                continue;
+            };
+            push_wireless_interface(
+                summary,
+                WirelessInterfaceSummary {
+                    name: ifname,
+                    radio: Some(name.clone()),
+                    mode: config.and_then(|config| bounded_json_string(config, "mode", 32)),
+                    ssid: config.and_then(|config| bounded_json_string(config, "ssid", 64)),
+                    channel,
+                    frequency_mhz: None,
+                },
+            );
+        }
+    }
+}
+
+fn parse_iw_dev(output: &str, summary: &mut WirelessSummary) {
+    let mut current_radio = None;
+    let mut current_interface = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(phy) = line.strip_prefix("phy#") {
+            let name = format!("phy{phy}");
+            if valid_bounded_text(&name, 64) {
+                push_wireless_radio(
+                    summary,
+                    WirelessRadioSummary {
+                        name: name.clone(),
+                        up: None,
+                        pending: None,
+                        disabled: None,
+                        channel: None,
+                    },
+                );
+                current_radio = Some(name);
+            }
+            current_interface = None;
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("Interface ") {
+            if !valid_bounded_text(name, 64) {
+                continue;
+            }
+            push_wireless_interface(
+                summary,
+                WirelessInterfaceSummary {
+                    name: name.into(),
+                    radio: current_radio.clone(),
+                    mode: None,
+                    ssid: None,
+                    channel: None,
+                    frequency_mhz: None,
+                },
+            );
+            current_interface = Some(name.to_owned());
+            continue;
+        }
+        let Some(name) = current_interface.as_deref() else {
+            continue;
+        };
+        let Some(interface) = summary
+            .interfaces
+            .iter_mut()
+            .find(|interface| interface.name == name)
+        else {
+            continue;
+        };
+        if let Some(mode) = line
+            .strip_prefix("type ")
+            .filter(|mode| valid_bounded_text(mode, 32))
+        {
+            interface.mode = Some(mode.to_ascii_lowercase());
+        } else if let Some(channel) = line.strip_prefix("channel ") {
+            let mut fields = channel.split_whitespace();
+            interface.channel = fields.next().and_then(|value| value.parse::<u32>().ok());
+            interface.frequency_mhz = fields
+                .next()
+                .and_then(|value| value.trim_start_matches('(').parse::<u32>().ok());
+        }
+    }
+}
+
+fn parse_iwinfo(output: &str, summary: &mut WirelessSummary) {
+    let mut current_interface = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some((prefix, raw_ssid)) = line.split_once("ESSID:") {
+            let Some(name) = prefix.split_whitespace().next() else {
+                continue;
+            };
+            if !valid_bounded_text(name, 64) {
+                continue;
+            }
+            let ssid = raw_ssid.trim().trim_matches('"').to_owned();
+            push_wireless_interface(
+                summary,
+                WirelessInterfaceSummary {
+                    name: name.into(),
+                    radio: None,
+                    mode: None,
+                    ssid: valid_bounded_text(&ssid, 64).then_some(ssid),
+                    channel: None,
+                    frequency_mhz: None,
+                },
+            );
+            current_interface = Some(name.to_owned());
+            continue;
+        }
+        let Some(name) = current_interface.as_deref() else {
+            continue;
+        };
+        let Some(interface) = summary
+            .interfaces
+            .iter_mut()
+            .find(|interface| interface.name == name)
+        else {
+            continue;
+        };
+        if let Some(mode) = value_after_label(line, "Mode:", 32) {
+            interface.mode = Some(mode.to_ascii_lowercase());
+        }
+        if let Some(channel) = value_after_label(line, "Channel:", 8) {
+            interface.channel = channel.parse::<u32>().ok();
+        }
+        if let Some(frequency) = frequency_ghz_mhz(line) {
+            interface.frequency_mhz = Some(frequency);
+        }
+    }
+}
+
+fn push_wireless_radio(summary: &mut WirelessSummary, radio: WirelessRadioSummary) {
+    if summary.radios.iter().any(|item| item.name == radio.name) {
+        return;
+    }
+    if summary.radios.len() >= MAX_WIRELESS_RADIOS {
+        summary.truncated = true;
+    } else {
+        summary.radios.push(radio);
+    }
+}
+
+fn push_wireless_interface(summary: &mut WirelessSummary, interface: WirelessInterfaceSummary) {
+    if let Some(existing) = summary
+        .interfaces
+        .iter_mut()
+        .find(|item| item.name == interface.name)
+    {
+        if existing.radio.is_none() {
+            existing.radio = interface.radio;
+        }
+        if existing.mode.is_none() {
+            existing.mode = interface.mode;
+        }
+        if existing.ssid.is_none() {
+            existing.ssid = interface.ssid;
+        }
+        if existing.channel.is_none() {
+            existing.channel = interface.channel;
+        }
+        if existing.frequency_mhz.is_none() {
+            existing.frequency_mhz = interface.frequency_mhz;
+        }
+    } else if summary.interfaces.len() >= MAX_WIRELESS_INTERFACES {
+        summary.truncated = true;
+    } else {
+        summary.interfaces.push(interface);
+    }
+}
+
+fn valid_bounded_text(value: &str, limit: usize) -> bool {
+    !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+}
+
+fn json_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn json_boolish(value: &serde_json::Value, key: &str) -> Option<bool> {
+    let value = value.get(key)?;
+    value
+        .as_bool()
+        .or_else(|| value.as_u64().map(|value| value != 0))
+}
+
+fn value_after_label(line: &str, label: &str, limit: usize) -> Option<String> {
+    let (_, value) = line.split_once(label)?;
+    let value = value.split_whitespace().next()?;
+    valid_bounded_text(value, limit).then(|| value.to_owned())
+}
+
+fn frequency_ghz_mhz(line: &str) -> Option<u32> {
+    let before = line.split("GHz").next()?;
+    let value = before.split_whitespace().last()?.trim_start_matches('(');
+    let (whole, fraction) = value.split_once('.')?;
+    let whole = whole.parse::<u32>().ok()?;
+    if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let width = fraction.len().min(3);
+    let fraction = fraction.get(..width)?.parse::<u32>().ok()?;
+    let scale = 10_u32.pow(u32::try_from(3 - width).ok()?);
+    whole
+        .checked_mul(1000)?
+        .checked_add(fraction.checked_mul(scale)?)
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -2778,6 +3140,101 @@ printf '%s\n' \
         assert_eq!(report.summary.listeners.len(), MAX_LISTENERS);
         assert!(report.summary.truncated);
         assert!(!report.complete);
+    }
+
+    #[tokio::test]
+    async fn openwrt_wireless_runbook_normalizes_ubus_without_scanning() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ubus",
+            r#"#!/bin/sh
+printf '%s\n' '{"radio0":{"up":true,"pending":false,"disabled":false,"config":{"channel":"11"},"interfaces":[{"section":"default_radio0","ifname":"wlan0","config":{"mode":"ap","ssid":"Private SSID"}}]},"radio1":{"up":false,"disabled":true,"interfaces":[]}}'
+"#,
+        );
+        fixture.executable("bin/iwinfo", "#!/bin/sh\nexit 0\n");
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let mut openwrt = platform(FirewallBackend::Fw4);
+        openwrt.has_ubus = true;
+        let report = runner.diagnose_wireless(&openwrt).await.expect("wireless");
+        assert_eq!(
+            report.summary.assessment,
+            WirelessAssessment::WirelessPresent
+        );
+        assert_eq!(report.summary.radios.len(), 2);
+        assert_eq!(report.summary.radios[0].channel, Some(11));
+        assert_eq!(report.summary.interfaces.len(), 1);
+        assert_eq!(
+            report.summary.interfaces[0].ssid.as_deref(),
+            Some("Private SSID")
+        );
+        assert_eq!(report.summary.interfaces[0].mode.as_deref(), Some("ap"));
+        assert!(report.complete);
+    }
+
+    #[tokio::test]
+    async fn generic_wireless_runbook_normalizes_iw_dev() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/iw",
+            r"#!/bin/sh
+printf '%s\n' \
+'phy#0' \
+'	Interface wlan0' \
+'		ifindex 3' \
+'		type managed' \
+'		channel 36 (5180 MHz), width: 80 MHz'
+",
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let mut generic = platform(FirewallBackend::Nftables);
+        generic.kind = PlatformKind::GenericLinux;
+        generic.has_ubus = false;
+        let report = runner.diagnose_wireless(&generic).await.expect("wireless");
+        assert_eq!(report.summary.radios[0].name, "phy0");
+        assert_eq!(report.summary.interfaces[0].name, "wlan0");
+        assert_eq!(
+            report.summary.interfaces[0].mode.as_deref(),
+            Some("managed")
+        );
+        assert_eq!(report.summary.interfaces[0].channel, Some(36));
+        assert_eq!(report.summary.interfaces[0].frequency_mhz, Some(5180));
+    }
+
+    #[tokio::test]
+    async fn wireless_runbook_falls_back_to_iwinfo() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/iwinfo",
+            r#"#!/bin/sh
+printf '%s\n' \
+'wlan0     ESSID: "Guest"' \
+'          Mode: Master  Channel: 6 (2.437 GHz)'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let mut generic = platform(FirewallBackend::Nftables);
+        generic.kind = PlatformKind::GenericLinux;
+        generic.has_ubus = false;
+        let report = runner.diagnose_wireless(&generic).await.expect("wireless");
+        assert_eq!(report.summary.interfaces[0].ssid.as_deref(), Some("Guest"));
+        assert_eq!(report.summary.interfaces[0].mode.as_deref(), Some("master"));
+        assert_eq!(report.summary.interfaces[0].channel, Some(6));
+        assert_eq!(report.summary.interfaces[0].frequency_mhz, Some(2437));
     }
 
     #[test]

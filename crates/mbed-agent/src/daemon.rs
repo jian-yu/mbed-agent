@@ -336,6 +336,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseListeners => {
             return handle_listener_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseWireless => {
+            return handle_wireless_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -588,6 +591,7 @@ struct AgentSnapshots {
     firewall: Option<agent_protocol::FirewallDiagnosticReport>,
     policy_routing: Option<agent_protocol::PolicyRoutingDiagnosticReport>,
     listeners: Option<agent_protocol::ListenerDiagnosticReport>,
+    wireless: Option<agent_protocol::WirelessDiagnosticReport>,
 }
 
 async fn execute_agent_tool(
@@ -619,6 +623,9 @@ async fn execute_agent_tool(
         }
         ReadOnlyAgentTool::InspectListeningPorts | ReadOnlyAgentTool::InspectExposedServices => {
             execute_listener_agent_tool(call, request_id, tool, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectWirelessRadios | ReadOnlyAgentTool::InspectWirelessInterfaces => {
+            execute_wireless_agent_tool(call, request_id, tool, state, snapshots).await
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
@@ -820,6 +827,46 @@ async fn execute_listener_agent_tool(
     })
 }
 
+async fn execute_wireless_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.wireless.is_none() {
+        let report = execute_agent_wireless_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-wireless-tool-snapshot"),
+            "wireless",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.wireless = Some(report);
+    }
+    let report = snapshots.wireless.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "wireless snapshot cache is unavailable",
+        )
+    })?;
+    let content =
+        bounded_wireless_observation(tool, report, state.config.llm.max_tool_context_bytes)
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
 async fn execute_wan_agent_tool(
     call: &ToolCall,
     request_id: &str,
@@ -889,10 +936,12 @@ enum ReadOnlyAgentTool {
     InspectRouteTables,
     InspectListeningPorts,
     InspectExposedServices,
+    InspectWirelessRadios,
+    InspectWirelessInterfaces,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
@@ -906,6 +955,8 @@ impl ReadOnlyAgentTool {
         Self::InspectRouteTables,
         Self::InspectListeningPorts,
         Self::InspectExposedServices,
+        Self::InspectWirelessRadios,
+        Self::InspectWirelessInterfaces,
     ];
 
     const fn name(self) -> &'static str {
@@ -923,6 +974,8 @@ impl ReadOnlyAgentTool {
             Self::InspectRouteTables => "inspect_route_tables",
             Self::InspectListeningPorts => "inspect_listening_ports",
             Self::InspectExposedServices => "inspect_exposed_services",
+            Self::InspectWirelessRadios => "inspect_wireless_radios",
+            Self::InspectWirelessInterfaces => "inspect_wireless_interfaces",
         }
     }
 
@@ -966,6 +1019,12 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectExposedServices => {
                 "Inspect only non-loopback TCP/UDP listening ports that may be reachable from a link or wider network."
+            }
+            Self::InspectWirelessRadios => {
+                "Inspect bounded wireless radio up, pending, disabled, and channel state without scanning."
+            }
+            Self::InspectWirelessInterfaces => {
+                "Inspect bounded wireless interface, mode, channel, frequency, and SSID-presence metadata without exposing SSID values or AP addresses."
             }
         }
     }
@@ -1127,6 +1186,24 @@ async fn execute_agent_listener_diagnostic(
     }
 }
 
+async fn execute_agent_wireless_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::WirelessDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_wireless(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -1260,6 +1337,34 @@ struct ListenerObservation<'a> {
     context_truncated: bool,
 }
 
+#[derive(serde::Serialize)]
+struct WirelessRadioObservation<'a> {
+    assessment: agent_protocol::WirelessAssessment,
+    radios: &'a [agent_protocol::WirelessRadioSummary],
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
+#[derive(serde::Serialize)]
+struct WirelessInterfaceEntry<'a> {
+    name: &'a str,
+    radio: &'a Option<String>,
+    mode: &'a Option<String>,
+    ssid_configured: bool,
+    channel: Option<u32>,
+    frequency_mhz: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct WirelessInterfaceObservation<'a> {
+    assessment: agent_protocol::WirelessAssessment,
+    interfaces: &'a [WirelessInterfaceEntry<'a>],
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
 fn bounded_tool_observation(
     tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
@@ -1337,7 +1442,69 @@ fn bounded_tool_observation(
         ReadOnlyAgentTool::InspectListeningPorts | ReadOnlyAgentTool::InspectExposedServices => {
             Err("listener observations require a listener snapshot".into())
         }
+        ReadOnlyAgentTool::InspectWirelessRadios | ReadOnlyAgentTool::InspectWirelessInterfaces => {
+            Err("wireless observations require a wireless snapshot".into())
+        }
     }
+}
+
+fn bounded_wireless_observation(
+    tool: ReadOnlyAgentTool,
+    report: &agent_protocol::WirelessDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    if tool == ReadOnlyAgentTool::InspectWirelessRadios {
+        for retained in (0..=report.summary.radios.len()).rev() {
+            let result = encode_tool_observation(
+                tool.name(),
+                &WirelessRadioObservation {
+                    assessment: report.summary.assessment,
+                    radios: &report.summary.radios[..retained],
+                    truncated: report.summary.truncated,
+                    complete: report.complete,
+                    context_truncated: retained < report.summary.radios.len(),
+                },
+                limit,
+            );
+            if result.is_ok() {
+                return result;
+            }
+        }
+    } else {
+        let interfaces: Vec<WirelessInterfaceEntry<'_>> = report
+            .summary
+            .interfaces
+            .iter()
+            .map(|interface| WirelessInterfaceEntry {
+                name: &interface.name,
+                radio: &interface.radio,
+                mode: &interface.mode,
+                ssid_configured: interface.ssid.is_some(),
+                channel: interface.channel,
+                frequency_mhz: interface.frequency_mhz,
+            })
+            .collect();
+        for retained in (0..=interfaces.len()).rev() {
+            let result = encode_tool_observation(
+                tool.name(),
+                &WirelessInterfaceObservation {
+                    assessment: report.summary.assessment,
+                    interfaces: &interfaces[..retained],
+                    truncated: report.summary.truncated,
+                    complete: report.complete,
+                    context_truncated: retained < interfaces.len(),
+                },
+                limit,
+            );
+            if result.is_ok() {
+                return result;
+            }
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        tool.name()
+    ))
 }
 
 fn bounded_listener_observation(
@@ -1961,6 +2128,51 @@ async fn handle_listener_diagnosis(id: String, state: &AppState) -> ServerRespon
     ServerResponse::success(id, ResponseData::ListenerDiagnostic(Box::new(report)))
 }
 
+async fn handle_wireless_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_wireless(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("wireless diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "wireless diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "wireless",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::WirelessDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -2391,6 +2603,46 @@ mod tests {
             listeners
                 .iter()
                 .all(|listener| listener["scope"] != "loopback")
+        }));
+    }
+
+    #[test]
+    fn wireless_interface_observation_omits_ssids_and_shrinks() {
+        let interfaces = (0..32)
+            .map(|index| agent_protocol::WirelessInterfaceSummary {
+                name: format!("wlan{index}"),
+                radio: Some(format!("phy{index}")),
+                mode: Some("ap".into()),
+                ssid: Some(format!("Private SSID {index}")),
+                channel: Some(11),
+                frequency_mhz: Some(2462),
+            })
+            .collect();
+        let report = agent_protocol::WirelessDiagnosticReport {
+            summary: agent_protocol::WirelessSummary {
+                assessment: agent_protocol::WirelessAssessment::WirelessPresent,
+                radios: Vec::new(),
+                interfaces,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            complete: true,
+        };
+        let encoded = bounded_wireless_observation(
+            ReadOnlyAgentTool::InspectWirelessInterfaces,
+            &report,
+            1024,
+        )
+        .expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        assert!(!encoded.contains("Private SSID"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["context_truncated"], true);
+        assert!(value["interfaces"].as_array().is_some_and(|interfaces| {
+            interfaces
+                .iter()
+                .all(|interface| interface["ssid_configured"] == true)
         }));
     }
 

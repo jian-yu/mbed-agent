@@ -144,6 +144,7 @@ impl Discovery {
             "pacman",
             "systemctl",
             "openrc",
+            "iw",
             "iwinfo",
             "ip",
             "ss",
