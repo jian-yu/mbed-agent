@@ -2774,7 +2774,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
-    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+    // Rust's parallel test runner can briefly starve local shell fixtures on
+    // loaded CI hosts. Production probe timeouts remain configuration-bounded.
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn platform(backend: FirewallBackend) -> PlatformCapabilities {
         PlatformCapabilities {

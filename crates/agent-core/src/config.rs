@@ -112,11 +112,14 @@ impl AgentConfig {
         }
         if self.storage.max_diagnostic_records == 0
             || self.storage.max_task_records == 0
+            || self.storage.max_change_set_records == 0
             || self.storage.max_diagnostic_record_bytes == 0
+            || self.storage.max_change_plan_bytes == 0
             || self.storage.max_diagnostic_record_bytes > self.storage.max_database_bytes
+            || self.storage.max_change_plan_bytes > self.storage.max_database_bytes
         {
             return Err(ConfigError::Validation(
-                "task and diagnostic audit limits must be non-zero and fit the database budget"
+                "task, diagnostic, and ChangeSet limits must be non-zero and fit the database budget"
                     .into(),
             ));
         }
@@ -381,6 +384,8 @@ pub struct StorageConfig {
     pub max_task_records: u32,
     pub max_diagnostic_records: u32,
     pub max_diagnostic_record_bytes: u64,
+    pub max_change_set_records: u32,
+    pub max_change_plan_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -399,6 +404,8 @@ impl Default for StorageConfig {
             max_task_records: 256,
             max_diagnostic_records: 128,
             max_diagnostic_record_bytes: 32 * 1024,
+            max_change_set_records: 32,
+            max_change_plan_bytes: 64 * 1024,
         }
     }
 }
@@ -526,6 +533,17 @@ mod tests {
     fn volatile_task_history_must_retain_at_least_one_record() {
         let mut config = AgentConfig::default();
         config.storage.max_task_records = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn volatile_change_sets_have_record_and_payload_bounds() {
+        let mut config = AgentConfig::default();
+        config.storage.max_change_set_records = 0;
+        assert!(config.validate().is_err());
+
+        config.storage.max_change_set_records = 1;
+        config.storage.max_change_plan_bytes = config.storage.max_database_bytes + 1;
         assert!(config.validate().is_err());
     }
 

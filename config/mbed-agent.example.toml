@@ -26,6 +26,8 @@ cleanup_interval_secs = 60
 max_task_records = 256
 max_diagnostic_records = 128
 max_diagnostic_record_bytes = 32768
+max_change_set_records = 32
+max_change_plan_bytes = 65536
 
 [logging]
 level = "info"

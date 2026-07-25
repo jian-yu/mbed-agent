@@ -11,9 +11,10 @@ default = ["bundled-sqlite"]
 bundled-sqlite = ["rusqlite/bundled"]
 
 [dependencies]
+agent-core.workspace = true
+agent-protocol.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
-

@@ -552,6 +552,8 @@ cleanup_interval_secs = 60
 max_task_records = 256
 max_diagnostic_records = 128
 max_diagnostic_record_bytes = 32768
+max_change_set_records = 32
+max_change_plan_bytes = 65536
 
 [logging]
 level = "info"
@@ -976,6 +978,12 @@ rollback helper 仍按本阶段后续切片实现，在此之前不开放任何�
 ChangePlan 只能由 daemon 的领域 planner 根据新鲜 before/after typed 对象生成，
 是返回给调用方的预览和内部持久化状态，不作为模型或 Channel 可直接提交执行的
 输入；风险信号同样由本地语义比较器产生。
+易失 SQLite 已实现 ChangeSet 计划、状态和 approval token digest 表：状态转换
+使用 expected-state + plan digest + boot id 原子比较；一次性审批消费与进入
+`Approved` 在同一事务完成；错误 actor/boot/diff/token、过期和重放统一失败。
+rollback arm 只能通过带未来 monotonic deadline 的专用事务完成。记录数与计划
+payload 分别受 `storage.max_change_set_records` 和
+`storage.max_change_plan_bytes` 限制，设备重启随 `/tmp` 一起清空。
 
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 

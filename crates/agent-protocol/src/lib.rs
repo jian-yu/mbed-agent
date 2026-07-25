@@ -186,6 +186,18 @@ impl RiskLevel {
             Self::R4 => "r4",
         }
     }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "r0" => Some(Self::R0),
+            "r1" => Some(Self::R1),
+            "r2" => Some(Self::R2),
+            "r3" => Some(Self::R3),
+            "r4" => Some(Self::R4),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -250,6 +262,55 @@ pub enum ChangeSetState {
     RollingBack,
     RolledBack,
     RollbackFailed,
+}
+
+impl ChangeSetState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Planned => "planned",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Approved => "approved",
+            Self::Staged => "staged",
+            Self::Validated => "validated",
+            Self::RollbackArmed => "rollback_armed",
+            Self::Applying => "applying",
+            Self::Verifying => "verifying",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::Confirmed => "confirmed",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+            Self::ApplyFailed => "apply_failed",
+            Self::RollingBack => "rolling_back",
+            Self::RolledBack => "rolled_back",
+            Self::RollbackFailed => "rollback_failed",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "draft" => Some(Self::Draft),
+            "planned" => Some(Self::Planned),
+            "awaiting_approval" => Some(Self::AwaitingApproval),
+            "approved" => Some(Self::Approved),
+            "staged" => Some(Self::Staged),
+            "validated" => Some(Self::Validated),
+            "rollback_armed" => Some(Self::RollbackArmed),
+            "applying" => Some(Self::Applying),
+            "verifying" => Some(Self::Verifying),
+            "awaiting_confirmation" => Some(Self::AwaitingConfirmation),
+            "confirmed" => Some(Self::Confirmed),
+            "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
+            "apply_failed" => Some(Self::ApplyFailed),
+            "rolling_back" => Some(Self::RollingBack),
+            "rolled_back" => Some(Self::RolledBack),
+            "rollback_failed" => Some(Self::RollbackFailed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
