@@ -26,6 +26,7 @@ pub enum Command {
     DiagnosePolicyRouting,
     DiagnoseListeners,
     DiagnoseWireless,
+    DiagnoseInterfaceStats,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -85,6 +86,7 @@ pub enum ResponseData {
     PolicyRoutingDiagnostic(Box<PolicyRoutingDiagnosticReport>),
     ListenerDiagnostic(Box<ListenerDiagnosticReport>),
     WirelessDiagnostic(Box<WirelessDiagnosticReport>),
+    InterfaceStatsDiagnostic(Box<InterfaceStatsDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -530,6 +532,63 @@ impl WirelessAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceStatsDiagnosticReport {
+    pub summary: InterfaceStatsSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceStatsSummary {
+    pub assessment: InterfaceStatsAssessment,
+    pub interfaces: Vec<InterfaceStatsEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceStatsEntry {
+    pub name: String,
+    pub operstate: Option<String>,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
+}
+
+impl InterfaceStatsEntry {
+    #[must_use]
+    pub const fn has_errors_or_drops(&self) -> bool {
+        self.rx_errors > 0 || self.rx_dropped > 0 || self.tx_errors > 0 || self.tx_dropped > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceStatsAssessment {
+    ErrorsOrDropsPresent,
+    CountersPresent,
+    NoCounters,
+    CollectorUnavailable,
+}
+
+impl InterfaceStatsAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ErrorsOrDropsPresent => "errors_or_drops_present",
+            Self::CountersPresent => "counters_present",
+            Self::NoCounters => "no_counters",
+            Self::CollectorUnavailable => "collector_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -702,6 +761,7 @@ mod tests {
             Command::DiagnosePolicyRouting,
             Command::DiagnoseListeners,
             Command::DiagnoseWireless,
+            Command::DiagnoseInterfaceStats,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,

@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use agent_protocol::{
     DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
     FirewallAssessment, FirewallBaseChain, FirewallDiagnosticReport, FirewallRuntimeSummary,
-    FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceSummary,
+    FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceStatsAssessment,
+    InterfaceStatsDiagnosticReport, InterfaceStatsEntry, InterfaceStatsSummary, InterfaceSummary,
     ListenerAssessment, ListenerDiagnosticReport, ListenerEntry, ListenerScope, ListenerSummary,
     NeighborAssessment, NeighborDiagnosticReport, NeighborEntry, NeighborSummary,
     NetworkInterfaceSummary, PolicyRoutingAssessment, PolicyRoutingDiagnosticReport,
@@ -33,6 +34,7 @@ const MAX_ROUTE_TABLES: usize = 32;
 const MAX_LISTENERS: usize = 128;
 const MAX_WIRELESS_RADIOS: usize = 16;
 const MAX_WIRELESS_INTERFACES: usize = 32;
+const MAX_INTERFACE_STATS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -284,6 +286,16 @@ impl ToolRunner {
         Ok(build_wireless_report(evidence))
     }
 
+    /// Inspects one bounded snapshot of kernel interface counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the resolved collector cannot be executed.
+    pub async fn diagnose_interface_stats(&self) -> io::Result<InterfaceStatsDiagnosticReport> {
+        let evidence = vec![self.run(Probe::IpLinkStats).await?];
+        Ok(build_interface_stats_report(evidence))
+    }
+
     async fn collect_passive(
         &self,
         platform: &PlatformCapabilities,
@@ -451,6 +463,7 @@ enum Probe {
     IpRoute,
     IpRule,
     IpNeighbor,
+    IpLinkStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +486,7 @@ impl Probe {
             Self::IpRoute => "network.route.list",
             Self::IpRule => "network.route.rules",
             Self::IpNeighbor => "network.neighbor.list",
+            Self::IpLinkStats => "network.interface.stats",
         }
     }
 
@@ -480,9 +494,12 @@ impl Probe {
         match self {
             Self::UbusWan => "ubus",
             Self::UciFirewall => "uci",
-            Self::IpLink | Self::IpAddress | Self::IpRoute | Self::IpRule | Self::IpNeighbor => {
-                "ip"
-            }
+            Self::IpLink
+            | Self::IpAddress
+            | Self::IpRoute
+            | Self::IpRule
+            | Self::IpNeighbor
+            | Self::IpLinkStats => "ip",
         }
     }
 
@@ -495,6 +512,7 @@ impl Probe {
             Self::IpRoute => &["-j", "route", "show", "table", "all"],
             Self::IpRule => &["-j", "rule", "show"],
             Self::IpNeighbor => &["-j", "neighbor", "show"],
+            Self::IpLinkStats => &["-j", "-s", "link", "show"],
         }
     }
 }
@@ -2358,6 +2376,106 @@ fn frequency_ghz_mhz(line: &str) -> Option<u32> {
         .checked_add(fraction.checked_mul(scale)?)
 }
 
+fn build_interface_stats_report(evidence: Vec<ProbeEvidence>) -> InterfaceStatsDiagnosticReport {
+    let mut summary = InterfaceStatsSummary {
+        assessment: InterfaceStatsAssessment::CollectorUnavailable,
+        interfaces: Vec::new(),
+        truncated: false,
+    };
+    let successful = successful_output(&evidence, "network.interface.stats");
+    if let Some(output) = successful {
+        parse_interface_stats(output, &mut summary);
+    }
+    summary
+        .interfaces
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    summary.assessment = if successful.is_none() {
+        InterfaceStatsAssessment::CollectorUnavailable
+    } else if summary.interfaces.is_empty() {
+        InterfaceStatsAssessment::NoCounters
+    } else if summary
+        .interfaces
+        .iter()
+        .any(InterfaceStatsEntry::has_errors_or_drops)
+    {
+        InterfaceStatsAssessment::ErrorsOrDropsPresent
+    } else {
+        InterfaceStatsAssessment::CountersPresent
+    };
+    let affected = summary
+        .interfaces
+        .iter()
+        .filter(|interface| interface.has_errors_or_drops())
+        .count();
+    let mut findings = vec![match summary.assessment {
+        InterfaceStatsAssessment::ErrorsOrDropsPresent => format!(
+            "{affected} interfaces have cumulative kernel error or drop counters; one snapshot cannot establish a current rate"
+        ),
+        InterfaceStatsAssessment::CountersPresent => {
+            "kernel interface counters are available with no retained error/drop value above zero"
+                .into()
+        }
+        InterfaceStatsAssessment::NoCounters => {
+            "the collector returned no parseable interface counters".into()
+        }
+        InterfaceStatsAssessment::CollectorUnavailable => {
+            "kernel interface statistics evidence is unavailable".into()
+        }
+    }];
+    if summary.truncated || evidence.iter().any(|item| item.truncated) {
+        findings.push(
+            "interface statistics reached a configured byte or normalized-entry limit".into(),
+        );
+    }
+    InterfaceStatsDiagnosticReport {
+        complete: successful.is_some()
+            && !summary.truncated
+            && !evidence.iter().any(|item| item.truncated),
+        summary,
+        evidence,
+        findings,
+    }
+}
+
+fn parse_interface_stats(output: &str, summary: &mut InterfaceStatsSummary) {
+    let Ok(interfaces) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for interface in interfaces {
+        if summary.interfaces.len() >= MAX_INTERFACE_STATS {
+            summary.truncated = true;
+            break;
+        }
+        let Some(name) = bounded_json_string(&interface, "ifname", 64) else {
+            continue;
+        };
+        let Some(stats) = interface.get("stats64").or_else(|| interface.get("stats")) else {
+            continue;
+        };
+        let rx = stats.get("rx");
+        let tx = stats.get("tx");
+        summary.interfaces.push(InterfaceStatsEntry {
+            name,
+            operstate: bounded_json_string(&interface, "operstate", 32),
+            rx_bytes: nested_u64(rx, "bytes"),
+            rx_packets: nested_u64(rx, "packets"),
+            rx_errors: nested_u64(rx, "errors"),
+            rx_dropped: nested_u64(rx, "dropped"),
+            tx_bytes: nested_u64(tx, "bytes"),
+            tx_packets: nested_u64(tx, "packets"),
+            tx_errors: nested_u64(tx, "errors"),
+            tx_dropped: nested_u64(tx, "dropped"),
+        });
+    }
+}
+
+fn nested_u64(value: Option<&serde_json::Value>, key: &str) -> u64 {
+    value
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -3235,6 +3353,64 @@ printf '%s\n' \
         assert_eq!(report.summary.interfaces[0].mode.as_deref(), Some("master"));
         assert_eq!(report.summary.interfaces[0].channel, Some(6));
         assert_eq!(report.summary.interfaces[0].frequency_mhz, Some(2437));
+    }
+
+    #[tokio::test]
+    async fn interface_stats_runbook_normalizes_stats64_errors_and_drops() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ip",
+            r#"#!/bin/sh
+printf '%s\n' '[{"ifname":"eth0","operstate":"UP","stats64":{"rx":{"bytes":1000,"packets":10,"errors":2,"dropped":3},"tx":{"bytes":2000,"packets":20,"errors":0,"dropped":1}}},{"ifname":"lo","operstate":"UNKNOWN","stats64":{"rx":{"bytes":500,"packets":5,"errors":0,"dropped":0},"tx":{"bytes":500,"packets":5,"errors":0,"dropped":0}}}]'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let report = runner
+            .diagnose_interface_stats()
+            .await
+            .expect("interface stats");
+        assert_eq!(
+            report.summary.assessment,
+            InterfaceStatsAssessment::ErrorsOrDropsPresent
+        );
+        assert_eq!(report.summary.interfaces.len(), 2);
+        let eth0 = report
+            .summary
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "eth0")
+            .expect("eth0");
+        assert_eq!(eth0.rx_bytes, 1000);
+        assert_eq!(eth0.rx_errors, 2);
+        assert_eq!(eth0.tx_dropped, 1);
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn interface_stats_supports_legacy_stats_and_caps_entries() {
+        let interfaces: Vec<serde_json::Value> = (0..=MAX_INTERFACE_STATS)
+            .map(|index| {
+                serde_json::json!({
+                    "ifname": format!("eth{index}"),
+                    "stats": {
+                        "rx": {"bytes": index, "packets": 1, "errors": 0, "dropped": 0},
+                        "tx": {"bytes": index, "packets": 1, "errors": 0, "dropped": 0}
+                    }
+                })
+            })
+            .collect();
+        let report = build_interface_stats_report(vec![ok_evidence(
+            "network.interface.stats",
+            &serde_json::to_string(&interfaces).expect("stats"),
+        )]);
+        assert_eq!(report.summary.interfaces.len(), MAX_INTERFACE_STATS);
+        assert!(report.summary.truncated);
+        assert!(!report.complete);
     }
 
     #[test]

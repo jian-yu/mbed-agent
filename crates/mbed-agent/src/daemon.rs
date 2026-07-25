@@ -339,6 +339,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseWireless => {
             return handle_wireless_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseInterfaceStats => {
+            return handle_interface_stats_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -592,6 +595,7 @@ struct AgentSnapshots {
     policy_routing: Option<agent_protocol::PolicyRoutingDiagnosticReport>,
     listeners: Option<agent_protocol::ListenerDiagnosticReport>,
     wireless: Option<agent_protocol::WirelessDiagnosticReport>,
+    interface_stats: Option<agent_protocol::InterfaceStatsDiagnosticReport>,
 }
 
 async fn execute_agent_tool(
@@ -626,6 +630,9 @@ async fn execute_agent_tool(
         }
         ReadOnlyAgentTool::InspectWirelessRadios | ReadOnlyAgentTool::InspectWirelessInterfaces => {
             execute_wireless_agent_tool(call, request_id, tool, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectInterfaceCounters | ReadOnlyAgentTool::InspectInterfaceErrors => {
+            execute_interface_stats_agent_tool(call, request_id, tool, state, snapshots).await
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
@@ -867,6 +874,46 @@ async fn execute_wireless_agent_tool(
     })
 }
 
+async fn execute_interface_stats_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.interface_stats.is_none() {
+        let report = execute_agent_interface_stats_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-interface-stats-tool-snapshot"),
+            "interface-stats",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.interface_stats = Some(report);
+    }
+    let report = snapshots.interface_stats.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "interface statistics snapshot cache is unavailable",
+        )
+    })?;
+    let content =
+        bounded_interface_stats_observation(tool, report, state.config.llm.max_tool_context_bytes)
+            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
 async fn execute_wan_agent_tool(
     call: &ToolCall,
     request_id: &str,
@@ -938,10 +985,12 @@ enum ReadOnlyAgentTool {
     InspectExposedServices,
     InspectWirelessRadios,
     InspectWirelessInterfaces,
+    InspectInterfaceCounters,
+    InspectInterfaceErrors,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 17] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
@@ -957,6 +1006,8 @@ impl ReadOnlyAgentTool {
         Self::InspectExposedServices,
         Self::InspectWirelessRadios,
         Self::InspectWirelessInterfaces,
+        Self::InspectInterfaceCounters,
+        Self::InspectInterfaceErrors,
     ];
 
     const fn name(self) -> &'static str {
@@ -976,6 +1027,8 @@ impl ReadOnlyAgentTool {
             Self::InspectExposedServices => "inspect_exposed_services",
             Self::InspectWirelessRadios => "inspect_wireless_radios",
             Self::InspectWirelessInterfaces => "inspect_wireless_interfaces",
+            Self::InspectInterfaceCounters => "inspect_interface_counters",
+            Self::InspectInterfaceErrors => "inspect_interface_errors",
         }
     }
 
@@ -1025,6 +1078,12 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectWirelessInterfaces => {
                 "Inspect bounded wireless interface, mode, channel, frequency, and SSID-presence metadata without exposing SSID values or AP addresses."
+            }
+            Self::InspectInterfaceCounters => {
+                "Inspect one bounded snapshot of cumulative kernel RX/TX bytes, packets, errors, and drops without claiming a rate."
+            }
+            Self::InspectInterfaceErrors => {
+                "Inspect only interfaces whose cumulative RX/TX error or drop counters are above zero."
             }
         }
     }
@@ -1204,6 +1263,24 @@ async fn execute_agent_wireless_diagnostic(
     }
 }
 
+async fn execute_agent_interface_stats_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::InterfaceStatsDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_interface_stats(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -1365,6 +1442,16 @@ struct WirelessInterfaceObservation<'a> {
     context_truncated: bool,
 }
 
+#[derive(serde::Serialize)]
+struct InterfaceStatsObservation<'a> {
+    assessment: agent_protocol::InterfaceStatsAssessment,
+    interfaces: &'a [&'a agent_protocol::InterfaceStatsEntry],
+    source_entries: usize,
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
 fn bounded_tool_observation(
     tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
@@ -1445,7 +1532,45 @@ fn bounded_tool_observation(
         ReadOnlyAgentTool::InspectWirelessRadios | ReadOnlyAgentTool::InspectWirelessInterfaces => {
             Err("wireless observations require a wireless snapshot".into())
         }
+        ReadOnlyAgentTool::InspectInterfaceCounters | ReadOnlyAgentTool::InspectInterfaceErrors => {
+            Err("interface statistics observations require an interface statistics snapshot".into())
+        }
     }
+}
+
+fn bounded_interface_stats_observation(
+    tool: ReadOnlyAgentTool,
+    report: &agent_protocol::InterfaceStatsDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    let errors_only = tool == ReadOnlyAgentTool::InspectInterfaceErrors;
+    let interfaces: Vec<&agent_protocol::InterfaceStatsEntry> = report
+        .summary
+        .interfaces
+        .iter()
+        .filter(|interface| !errors_only || interface.has_errors_or_drops())
+        .collect();
+    for retained in (0..=interfaces.len()).rev() {
+        let result = encode_tool_observation(
+            tool.name(),
+            &InterfaceStatsObservation {
+                assessment: report.summary.assessment,
+                interfaces: &interfaces[..retained],
+                source_entries: report.summary.interfaces.len(),
+                truncated: report.summary.truncated,
+                complete: report.complete,
+                context_truncated: retained < interfaces.len(),
+            },
+            limit,
+        );
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        tool.name()
+    ))
 }
 
 fn bounded_wireless_observation(
@@ -2173,6 +2298,51 @@ async fn handle_wireless_diagnosis(id: String, state: &AppState) -> ServerRespon
     ServerResponse::success(id, ResponseData::WirelessDiagnostic(Box::new(report)))
 }
 
+async fn handle_interface_stats_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_interface_stats(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("interface statistics diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "interface statistics diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "interface-stats",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::InterfaceStatsDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -2643,6 +2813,52 @@ mod tests {
             interfaces
                 .iter()
                 .all(|interface| interface["ssid_configured"] == true)
+        }));
+    }
+
+    #[test]
+    fn interface_error_observation_filters_zero_counters_and_shrinks() {
+        let interfaces = (0..32)
+            .map(|index| agent_protocol::InterfaceStatsEntry {
+                name: format!("eth{index}"),
+                operstate: Some("UP".into()),
+                rx_bytes: 1_000_000 + index,
+                rx_packets: 10_000 + index,
+                rx_errors: index % 2,
+                rx_dropped: 0,
+                tx_bytes: 2_000_000 + index,
+                tx_packets: 20_000 + index,
+                tx_errors: 0,
+                tx_dropped: u64::from(index % 3 == 0),
+            })
+            .collect();
+        let report = agent_protocol::InterfaceStatsDiagnosticReport {
+            summary: agent_protocol::InterfaceStatsSummary {
+                assessment: agent_protocol::InterfaceStatsAssessment::ErrorsOrDropsPresent,
+                interfaces,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            complete: true,
+        };
+        let encoded = bounded_interface_stats_observation(
+            ReadOnlyAgentTool::InspectInterfaceErrors,
+            &report,
+            1024,
+        )
+        .expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["source_entries"], 32);
+        assert_eq!(value["context_truncated"], true);
+        assert!(value["interfaces"].as_array().is_some_and(|interfaces| {
+            interfaces.iter().all(|interface| {
+                interface["rx_errors"].as_u64().unwrap_or_default() > 0
+                    || interface["rx_dropped"].as_u64().unwrap_or_default() > 0
+                    || interface["tx_errors"].as_u64().unwrap_or_default() > 0
+                    || interface["tx_dropped"].as_u64().unwrap_or_default() > 0
+            })
         }));
     }
 
