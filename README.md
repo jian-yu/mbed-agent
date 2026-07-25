@@ -28,9 +28,11 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   selectors and aggregate route tables; `diagnose listeners` classifies bounded
   TCP/UDP binding exposure; `diagnose wireless` normalizes radio and interface
   state without scanning; `diagnose interface-stats` captures one bounded
-  snapshot of cumulative kernel counters. All gather bounded, read-only evidence
-  across OpenWrt and generic Linux. Focused runs execute only their required
-  collectors; the WAN run also includes firewall-backend and UCI zone evidence.
+  snapshot of cumulative kernel counters; `diagnose conntrack` reports kernel
+  flow-table capacity without enumerating flows; `diagnose qdisc` normalizes
+  bounded queueing counters. All gather bounded, read-only evidence across
+  OpenWrt and generic Linux. Focused runs execute only their required collectors;
+  the WAN run also includes firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
@@ -43,8 +45,11 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   bounded views backed by one snapshot. Listening ports and non-loopback
   exposure have address-free views; wireless tools omit SSID values and AP
   addresses. Interface counters and nonzero error/drop counters have separate
-  views backed by one snapshot. Tool arguments are parsed and validated
-  on-device, and the model can never request active probes or shell commands.
+  views backed by one snapshot. Conntrack capacity has a flow-free view, while
+  qdisc totals and pressure counters have separate views backed by one snapshot.
+  The registry now contains 20 typed tools. Tool arguments are parsed and
+  validated on-device, and the model can never request active probes or shell
+  commands.
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
 administrator elevation, and configuration transactions are planned but are not
@@ -96,6 +101,8 @@ cargo run -p mbed-agent -- diagnose policy-routing
 cargo run -p mbed-agent -- diagnose listeners
 cargo run -p mbed-agent -- diagnose wireless
 cargo run -p mbed-agent -- diagnose interface-stats
+cargo run -p mbed-agent -- diagnose conntrack
+cargo run -p mbed-agent -- diagnose qdisc
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 ```
@@ -166,6 +173,13 @@ OpenWrt and generic Linux. It accepts `stats64` and legacy `stats`, retains at
 most 32 interfaces, and reports cumulative RX/TX bytes, packets, errors, and
 drops. A single snapshot cannot establish a current traffic, loss, or error
 rate, so the diagnostic never makes rate claims.
+`diagnose conntrack` reads only `nf_conntrack_count` and `nf_conntrack_max`
+from procfs. It reports capacity utilization and a 90% near-capacity threshold
+without reading connection tuples, addresses, ports, or payload.
+`diagnose qdisc` uses one bounded `tc -j -s qdisc show` snapshot, retains at
+most 64 qdiscs, and reports packet, byte, drop, overlimit, requeue, backlog, and
+queue-length counters. These counters are cumulative; one snapshot does not
+establish a current loss or congestion rate.
 
 Completed diagnostics store only the normalized summary in `/tmp` SQLite; raw
 probe output is not persisted. History is bounded by configurable record-count

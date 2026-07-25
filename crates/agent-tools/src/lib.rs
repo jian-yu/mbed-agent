@@ -6,15 +6,17 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use agent_protocol::{
-    DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
-    FirewallAssessment, FirewallBaseChain, FirewallDiagnosticReport, FirewallRuntimeSummary,
-    FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceStatsAssessment,
+    ConntrackAssessment, ConntrackDiagnosticReport, ConntrackSummary, DhcpAssessment,
+    DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary, FirewallAssessment,
+    FirewallBaseChain, FirewallDiagnosticReport, FirewallRuntimeSummary, FirewallZoneSummary,
+    InterfaceAssessment, InterfaceDiagnosticReport, InterfaceStatsAssessment,
     InterfaceStatsDiagnosticReport, InterfaceStatsEntry, InterfaceStatsSummary, InterfaceSummary,
     ListenerAssessment, ListenerDiagnosticReport, ListenerEntry, ListenerScope, ListenerSummary,
     NeighborAssessment, NeighborDiagnosticReport, NeighborEntry, NeighborSummary,
     NetworkInterfaceSummary, PolicyRoutingAssessment, PolicyRoutingDiagnosticReport,
-    PolicyRoutingSummary, PolicyRule, ProbeEvidence, ProbeStatus, RouteDiagnosticReport,
-    RouteSummary, RouteTableSummary, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
+    PolicyRoutingSummary, PolicyRule, ProbeEvidence, ProbeStatus, QdiscAssessment,
+    QdiscDiagnosticReport, QdiscEntry, QdiscSummary, RouteDiagnosticReport, RouteSummary,
+    RouteTableSummary, WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
     WirelessAssessment, WirelessDiagnosticReport, WirelessInterfaceSummary, WirelessRadioSummary,
     WirelessSummary,
 };
@@ -35,6 +37,7 @@ const MAX_LISTENERS: usize = 128;
 const MAX_WIRELESS_RADIOS: usize = 16;
 const MAX_WIRELESS_INTERFACES: usize = 32;
 const MAX_INTERFACE_STATS: usize = 32;
+const MAX_QDISCS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -296,6 +299,32 @@ impl ToolRunner {
         Ok(build_interface_stats_report(evidence))
     }
 
+    /// Inspects the bounded kernel connection-tracking count and configured limit.
+    #[must_use]
+    pub fn diagnose_conntrack(&self) -> ConntrackDiagnosticReport {
+        let evidence = vec![
+            self.read_file(
+                "network.conntrack.count",
+                "/proc/sys/net/netfilter/nf_conntrack_count",
+            ),
+            self.read_file(
+                "network.conntrack.limit",
+                "/proc/sys/net/netfilter/nf_conntrack_max",
+            ),
+        ];
+        build_conntrack_report(evidence)
+    }
+
+    /// Inspects one bounded snapshot of queueing-discipline counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the resolved collector cannot be executed.
+    pub async fn diagnose_qdisc(&self) -> io::Result<QdiscDiagnosticReport> {
+        let evidence = vec![self.run(Probe::TcQdiscStats).await?];
+        Ok(build_qdisc_report(evidence))
+    }
+
     async fn collect_passive(
         &self,
         platform: &PlatformCapabilities,
@@ -464,6 +493,7 @@ enum Probe {
     IpRule,
     IpNeighbor,
     IpLinkStats,
+    TcQdiscStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +517,7 @@ impl Probe {
             Self::IpRule => "network.route.rules",
             Self::IpNeighbor => "network.neighbor.list",
             Self::IpLinkStats => "network.interface.stats",
+            Self::TcQdiscStats => "network.qdisc.stats",
         }
     }
 
@@ -500,6 +531,7 @@ impl Probe {
             | Self::IpRule
             | Self::IpNeighbor
             | Self::IpLinkStats => "ip",
+            Self::TcQdiscStats => "tc",
         }
     }
 
@@ -513,6 +545,7 @@ impl Probe {
             Self::IpRule => &["-j", "rule", "show"],
             Self::IpNeighbor => &["-j", "neighbor", "show"],
             Self::IpLinkStats => &["-j", "-s", "link", "show"],
+            Self::TcQdiscStats => &["-j", "-s", "qdisc", "show"],
         }
     }
 }
@@ -2376,6 +2409,176 @@ fn frequency_ghz_mhz(line: &str) -> Option<u32> {
         .checked_add(fraction.checked_mul(scale)?)
 }
 
+fn build_conntrack_report(evidence: Vec<ProbeEvidence>) -> ConntrackDiagnosticReport {
+    let count = successful_output(&evidence, "network.conntrack.count").and_then(parse_single_u64);
+    let limit = successful_output(&evidence, "network.conntrack.limit").and_then(parse_single_u64);
+    let utilization_percent = match (count, limit) {
+        (Some(count), Some(limit)) if limit > 0 => {
+            let percent = (u128::from(count) * 100 / u128::from(limit)).min(100);
+            Some(u8::try_from(percent).unwrap_or(100))
+        }
+        _ => None,
+    };
+    let assessment = match (count, limit) {
+        (None, None) => ConntrackAssessment::Unavailable,
+        (Some(_), Some(0)) => ConntrackAssessment::InvalidLimit,
+        (Some(count), Some(limit)) if count >= limit => ConntrackAssessment::AtCapacity,
+        (Some(count), Some(limit)) if u128::from(count) * 10 >= u128::from(limit) * 9 => {
+            ConntrackAssessment::NearCapacity
+        }
+        (Some(_), Some(_)) => ConntrackAssessment::Healthy,
+        _ => ConntrackAssessment::PartialEvidence,
+    };
+    let findings = vec![match assessment {
+        ConntrackAssessment::Healthy => format!(
+            "connection tracking uses {}% of the configured capacity",
+            utilization_percent.unwrap_or_default()
+        ),
+        ConntrackAssessment::NearCapacity => format!(
+            "connection tracking is near capacity at {}%; new flows may fail if usage rises",
+            utilization_percent.unwrap_or_default()
+        ),
+        ConntrackAssessment::AtCapacity => {
+            "connection tracking has reached its configured capacity; new tracked flows may fail"
+                .into()
+        }
+        ConntrackAssessment::PartialEvidence => {
+            "only one connection-tracking capacity value is available".into()
+        }
+        ConntrackAssessment::InvalidLimit => {
+            "the configured connection-tracking limit is zero".into()
+        }
+        ConntrackAssessment::Unavailable => {
+            "kernel connection-tracking capacity files are unavailable".into()
+        }
+    }];
+    ConntrackDiagnosticReport {
+        complete: count.is_some() && limit.is_some() && !evidence.iter().any(|item| item.truncated),
+        summary: ConntrackSummary {
+            assessment,
+            count,
+            limit,
+            utilization_percent,
+        },
+        evidence,
+        findings,
+    }
+}
+
+fn parse_single_u64(output: &str) -> Option<u64> {
+    output.trim().parse().ok()
+}
+
+fn build_qdisc_report(evidence: Vec<ProbeEvidence>) -> QdiscDiagnosticReport {
+    let mut summary = QdiscSummary {
+        assessment: QdiscAssessment::CollectorUnavailable,
+        qdiscs: Vec::new(),
+        truncated: false,
+    };
+    let successful = successful_output(&evidence, "network.qdisc.stats");
+    if let Some(output) = successful {
+        parse_qdiscs(output, &mut summary);
+    }
+    summary.qdiscs.sort_by(|left, right| {
+        left.device
+            .cmp(&right.device)
+            .then_with(|| left.parent.cmp(&right.parent))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    summary.assessment = if successful.is_none() {
+        QdiscAssessment::CollectorUnavailable
+    } else if summary.qdiscs.is_empty() {
+        QdiscAssessment::NoQdiscs
+    } else if summary.qdiscs.iter().any(QdiscEntry::has_pressure_counters) {
+        QdiscAssessment::PressureCountersPresent
+    } else {
+        QdiscAssessment::QdiscsPresent
+    };
+    let affected = summary
+        .qdiscs
+        .iter()
+        .filter(|qdisc| qdisc.has_pressure_counters())
+        .count();
+    let mut findings = vec![match summary.assessment {
+        QdiscAssessment::PressureCountersPresent => format!(
+            "{affected} queueing disciplines have cumulative drop, overlimit, requeue, or backlog counters; one snapshot cannot establish a current rate"
+        ),
+        QdiscAssessment::QdiscsPresent => {
+            "queueing-discipline counters are available with no retained pressure value above zero"
+                .into()
+        }
+        QdiscAssessment::NoQdiscs => {
+            "the collector returned no parseable queueing disciplines".into()
+        }
+        QdiscAssessment::CollectorUnavailable => {
+            "queueing-discipline evidence is unavailable".into()
+        }
+    }];
+    if summary.truncated || evidence.iter().any(|item| item.truncated) {
+        findings.push("qdisc statistics reached a configured byte or entry limit".into());
+    }
+    QdiscDiagnosticReport {
+        complete: successful.is_some()
+            && !summary.truncated
+            && !evidence.iter().any(|item| item.truncated),
+        summary,
+        evidence,
+        findings,
+    }
+}
+
+fn parse_qdiscs(output: &str, summary: &mut QdiscSummary) {
+    let Ok(qdiscs) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for qdisc in qdiscs {
+        if summary.qdiscs.len() >= MAX_QDISCS {
+            summary.truncated = true;
+            break;
+        }
+        let Some(device) = bounded_json_string(&qdisc, "dev", 64) else {
+            continue;
+        };
+        let Some(kind) = bounded_json_string(&qdisc, "kind", 32) else {
+            continue;
+        };
+        let stats = qdisc.get("stats");
+        let stats2 = qdisc.get("stats2");
+        summary.qdiscs.push(QdiscEntry {
+            device,
+            kind,
+            handle: bounded_json_string(&qdisc, "handle", 32),
+            parent: bounded_json_string(&qdisc, "parent", 32),
+            root: qdisc
+                .get("root")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            bytes: nested_u64(stats, "bytes").max(double_nested_u64(stats2, "basic", "bytes")),
+            packets: nested_u64(stats, "packets")
+                .max(double_nested_u64(stats2, "basic", "packets")),
+            drops: nested_u64(stats, "drops").max(double_nested_u64(stats2, "queue", "drops")),
+            overlimits: nested_u64(stats, "overlimits").max(double_nested_u64(
+                stats2,
+                "queue",
+                "overlimits",
+            )),
+            requeues: nested_u64(stats, "requeues")
+                .max(double_nested_u64(stats2, "queue", "requeues")),
+            backlog_bytes: nested_u64(stats, "backlog")
+                .max(double_nested_u64(stats2, "queue", "backlog")),
+            queue_length: nested_u64(stats, "qlen").max(double_nested_u64(stats2, "queue", "qlen")),
+        });
+    }
+}
+
+fn double_nested_u64(value: Option<&serde_json::Value>, parent: &str, key: &str) -> u64 {
+    value
+        .and_then(|value| value.get(parent))
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
 fn build_interface_stats_report(evidence: Vec<ProbeEvidence>) -> InterfaceStatsDiagnosticReport {
     let mut summary = InterfaceStatsSummary {
         assessment: InterfaceStatsAssessment::CollectorUnavailable,
@@ -3389,6 +3592,94 @@ printf '%s\n' '[{"ifname":"eth0","operstate":"UP","stats64":{"rx":{"bytes":1000,
         assert_eq!(eth0.rx_errors, 2);
         assert_eq!(eth0.tx_dropped, 1);
         assert!(report.complete);
+    }
+
+    #[test]
+    fn conntrack_capacity_uses_bounded_proc_values() {
+        let fixture = Fixture::new();
+        fixture.write("proc/sys/net/netfilter/nf_conntrack_count", "950\n");
+        fixture.write("proc/sys/net/netfilter/nf_conntrack_max", "1000\n");
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 32,
+        };
+        let report = runner.diagnose_conntrack();
+        assert_eq!(report.summary.assessment, ConntrackAssessment::NearCapacity);
+        assert_eq!(report.summary.count, Some(950));
+        assert_eq!(report.summary.limit, Some(1000));
+        assert_eq!(report.summary.utilization_percent, Some(95));
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn conntrack_capacity_rejects_zero_limit_and_reports_partial_evidence() {
+        let zero_limit = build_conntrack_report(vec![
+            ok_evidence("network.conntrack.count", "1\n"),
+            ok_evidence("network.conntrack.limit", "0\n"),
+        ]);
+        assert_eq!(
+            zero_limit.summary.assessment,
+            ConntrackAssessment::InvalidLimit
+        );
+        let partial = build_conntrack_report(vec![
+            ok_evidence("network.conntrack.count", "42\n"),
+            status_evidence("network.conntrack.limit", ProbeStatus::Unavailable),
+        ]);
+        assert_eq!(
+            partial.summary.assessment,
+            ConntrackAssessment::PartialEvidence
+        );
+        assert!(!partial.complete);
+    }
+
+    #[tokio::test]
+    async fn qdisc_runbook_normalizes_stats_and_stats2() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/tc",
+            r#"#!/bin/sh
+printf '%s\n' '[{"kind":"fq_codel","handle":"8001:","dev":"eth0","root":true,"stats":{"bytes":1000,"packets":10,"drops":2,"overlimits":3,"requeues":1,"backlog":128,"qlen":2}},{"kind":"cake","handle":"8002:","dev":"wan","parent":"1:1","stats2":{"basic":{"bytes":2000,"packets":20},"queue":{"drops":4,"overlimits":5,"requeues":2,"backlog":256,"qlen":3}}}]'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: FIXTURE_TIMEOUT,
+            max_output_bytes: 4096,
+        };
+        let report = runner.diagnose_qdisc().await.expect("qdisc");
+        assert_eq!(
+            report.summary.assessment,
+            QdiscAssessment::PressureCountersPresent
+        );
+        assert_eq!(report.summary.qdiscs.len(), 2);
+        assert_eq!(report.summary.qdiscs[0].device, "eth0");
+        assert_eq!(report.summary.qdiscs[0].drops, 2);
+        assert_eq!(report.summary.qdiscs[1].device, "wan");
+        assert_eq!(report.summary.qdiscs[1].backlog_bytes, 256);
+        assert!(report.complete);
+    }
+
+    #[test]
+    fn qdisc_normalization_caps_entries() {
+        let qdiscs: Vec<serde_json::Value> = (0..=MAX_QDISCS)
+            .map(|index| {
+                serde_json::json!({
+                    "kind": "fq_codel",
+                    "dev": format!("if{index}"),
+                    "stats": {"bytes": 0, "packets": 0, "drops": 0}
+                })
+            })
+            .collect();
+        let report = build_qdisc_report(vec![ok_evidence(
+            "network.qdisc.stats",
+            &serde_json::to_string(&qdiscs).expect("qdiscs"),
+        )]);
+        assert_eq!(report.summary.qdiscs.len(), MAX_QDISCS);
+        assert!(report.summary.truncated);
+        assert!(!report.complete);
     }
 
     #[test]

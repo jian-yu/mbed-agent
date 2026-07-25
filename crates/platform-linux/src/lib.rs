@@ -147,6 +147,7 @@ impl Discovery {
             "iw",
             "iwinfo",
             "ip",
+            "tc",
             "ss",
             "netstat",
         ];
@@ -413,9 +414,11 @@ mod tests {
         let nft_fixture = Fixture::new();
         nft_fixture.write("etc/os-release", "ID=buildroot\n");
         nft_fixture.write("usr/sbin/nft", "");
+        nft_fixture.write("sbin/tc", "");
         let nft = Discovery::new(&nft_fixture.root).discover();
         assert_eq!(nft.kind, PlatformKind::GenericLinux);
         assert_eq!(nft.firewall.backend, FirewallBackend::Nftables);
+        assert!(nft.available_commands.iter().any(|command| command == "tc"));
 
         let iptables_fixture = Fixture::new();
         iptables_fixture.write("etc/os-release", "ID=debian\n");

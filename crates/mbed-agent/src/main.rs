@@ -118,6 +118,16 @@ enum DiagnoseTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Inspect kernel connection-tracking count and capacity.
+    Conntrack {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Inspect one bounded snapshot of queueing-discipline counters.
+    Qdisc {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Show volatile diagnostic summaries from this boot.
     History {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
@@ -181,6 +191,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Diagnose {
             target: DiagnoseTarget::InterfaceStats { socket },
         } => run_client(&socket, Command::DiagnoseInterfaceStats).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Conntrack { socket },
+        } => run_client(&socket, Command::DiagnoseConntrack).await,
+        CliCommand::Diagnose {
+            target: DiagnoseTarget::Qdisc { socket },
+        } => run_client(&socket, Command::DiagnoseQdisc).await,
         CliCommand::Diagnose {
             target: DiagnoseTarget::History { limit, socket },
         } => run_client(&socket, Command::DiagnosticHistory { limit }).await,

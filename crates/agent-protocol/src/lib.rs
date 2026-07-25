@@ -27,6 +27,8 @@ pub enum Command {
     DiagnoseListeners,
     DiagnoseWireless,
     DiagnoseInterfaceStats,
+    DiagnoseConntrack,
+    DiagnoseQdisc,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -87,6 +89,8 @@ pub enum ResponseData {
     ListenerDiagnostic(Box<ListenerDiagnosticReport>),
     WirelessDiagnostic(Box<WirelessDiagnosticReport>),
     InterfaceStatsDiagnostic(Box<InterfaceStatsDiagnosticReport>),
+    ConntrackDiagnostic(Box<ConntrackDiagnosticReport>),
+    QdiscDiagnostic(Box<QdiscDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -589,6 +593,106 @@ impl InterfaceStatsAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConntrackDiagnosticReport {
+    pub summary: ConntrackSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConntrackSummary {
+    pub assessment: ConntrackAssessment,
+    pub count: Option<u64>,
+    pub limit: Option<u64>,
+    pub utilization_percent: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConntrackAssessment {
+    Healthy,
+    NearCapacity,
+    AtCapacity,
+    PartialEvidence,
+    InvalidLimit,
+    Unavailable,
+}
+
+impl ConntrackAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::NearCapacity => "near_capacity",
+            Self::AtCapacity => "at_capacity",
+            Self::PartialEvidence => "partial_evidence",
+            Self::InvalidLimit => "invalid_limit",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QdiscDiagnosticReport {
+    pub summary: QdiscSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QdiscSummary {
+    pub assessment: QdiscAssessment,
+    pub qdiscs: Vec<QdiscEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QdiscEntry {
+    pub device: String,
+    pub kind: String,
+    pub handle: Option<String>,
+    pub parent: Option<String>,
+    pub root: bool,
+    pub bytes: u64,
+    pub packets: u64,
+    pub drops: u64,
+    pub overlimits: u64,
+    pub requeues: u64,
+    pub backlog_bytes: u64,
+    pub queue_length: u64,
+}
+
+impl QdiscEntry {
+    #[must_use]
+    pub const fn has_pressure_counters(&self) -> bool {
+        self.drops > 0 || self.overlimits > 0 || self.requeues > 0 || self.backlog_bytes > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QdiscAssessment {
+    PressureCountersPresent,
+    QdiscsPresent,
+    NoQdiscs,
+    CollectorUnavailable,
+}
+
+impl QdiscAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PressureCountersPresent => "pressure_counters_present",
+            Self::QdiscsPresent => "qdiscs_present",
+            Self::NoQdiscs => "no_qdiscs",
+            Self::CollectorUnavailable => "collector_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -762,6 +866,8 @@ mod tests {
             Command::DiagnoseListeners,
             Command::DiagnoseWireless,
             Command::DiagnoseInterfaceStats,
+            Command::DiagnoseConntrack,
+            Command::DiagnoseQdisc,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,

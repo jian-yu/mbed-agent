@@ -342,6 +342,12 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseInterfaceStats => {
             return handle_interface_stats_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseConntrack => {
+            return handle_conntrack_diagnosis(request.id, state).await;
+        }
+        Command::DiagnoseQdisc => {
+            return handle_qdisc_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -596,6 +602,8 @@ struct AgentSnapshots {
     listeners: Option<agent_protocol::ListenerDiagnosticReport>,
     wireless: Option<agent_protocol::WirelessDiagnosticReport>,
     interface_stats: Option<agent_protocol::InterfaceStatsDiagnosticReport>,
+    conntrack: Option<agent_protocol::ConntrackDiagnosticReport>,
+    qdisc: Option<agent_protocol::QdiscDiagnosticReport>,
 }
 
 async fn execute_agent_tool(
@@ -633,6 +641,12 @@ async fn execute_agent_tool(
         }
         ReadOnlyAgentTool::InspectInterfaceCounters | ReadOnlyAgentTool::InspectInterfaceErrors => {
             execute_interface_stats_agent_tool(call, request_id, tool, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectConntrackCapacity => {
+            execute_conntrack_agent_tool(call, request_id, state, snapshots).await
+        }
+        ReadOnlyAgentTool::InspectQdiscStats | ReadOnlyAgentTool::InspectQdiscPressure => {
+            execute_qdisc_agent_tool(call, request_id, tool, state, snapshots).await
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
@@ -914,6 +928,82 @@ async fn execute_interface_stats_agent_tool(
     })
 }
 
+async fn execute_conntrack_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.conntrack.is_none() {
+        let report = execute_agent_conntrack_diagnostic(state).map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-conntrack-tool-snapshot"),
+            "conntrack",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.conntrack = Some(report);
+    }
+    let report = snapshots.conntrack.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "connection-tracking snapshot cache is unavailable",
+        )
+    })?;
+    let content = encode_tool_observation(
+        ReadOnlyAgentTool::InspectConntrackCapacity.name(),
+        &report.summary,
+        state.config.llm.max_tool_context_bytes,
+    )
+    .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
+async fn execute_qdisc_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.qdisc.is_none() {
+        let report = execute_agent_qdisc_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-qdisc-tool-snapshot"),
+            "qdisc",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.qdisc = Some(report);
+    }
+    let report = snapshots.qdisc.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(ErrorCode::Internal, "qdisc snapshot cache is unavailable")
+    })?;
+    let content = bounded_qdisc_observation(tool, report, state.config.llm.max_tool_context_bytes)
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
 async fn execute_wan_agent_tool(
     call: &ToolCall,
     request_id: &str,
@@ -987,10 +1077,13 @@ enum ReadOnlyAgentTool {
     InspectWirelessInterfaces,
     InspectInterfaceCounters,
     InspectInterfaceErrors,
+    InspectConntrackCapacity,
+    InspectQdiscStats,
+    InspectQdiscPressure,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 20] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
@@ -1008,6 +1101,9 @@ impl ReadOnlyAgentTool {
         Self::InspectWirelessInterfaces,
         Self::InspectInterfaceCounters,
         Self::InspectInterfaceErrors,
+        Self::InspectConntrackCapacity,
+        Self::InspectQdiscStats,
+        Self::InspectQdiscPressure,
     ];
 
     const fn name(self) -> &'static str {
@@ -1029,6 +1125,9 @@ impl ReadOnlyAgentTool {
             Self::InspectWirelessInterfaces => "inspect_wireless_interfaces",
             Self::InspectInterfaceCounters => "inspect_interface_counters",
             Self::InspectInterfaceErrors => "inspect_interface_errors",
+            Self::InspectConntrackCapacity => "inspect_conntrack_capacity",
+            Self::InspectQdiscStats => "inspect_qdisc_stats",
+            Self::InspectQdiscPressure => "inspect_qdisc_pressure",
         }
     }
 
@@ -1084,6 +1183,15 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectInterfaceErrors => {
                 "Inspect only interfaces whose cumulative RX/TX error or drop counters are above zero."
+            }
+            Self::InspectConntrackCapacity => {
+                "Inspect the kernel connection-tracking count, configured limit, and bounded utilization without exposing individual flows."
+            }
+            Self::InspectQdiscStats => {
+                "Inspect one bounded snapshot of queueing-discipline packet, byte, drop, overlimit, requeue, backlog, and queue-length counters."
+            }
+            Self::InspectQdiscPressure => {
+                "Inspect only queueing disciplines with cumulative drop, overlimit, requeue, or backlog counters above zero; one snapshot does not establish a rate."
             }
         }
     }
@@ -1281,6 +1389,33 @@ async fn execute_agent_interface_stats_diagnostic(
     }
 }
 
+fn execute_agent_conntrack_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::ConntrackDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    Ok(state.tools.diagnose_conntrack())
+}
+
+async fn execute_agent_qdisc_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::QdiscDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_qdisc(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -1452,6 +1587,16 @@ struct InterfaceStatsObservation<'a> {
     context_truncated: bool,
 }
 
+#[derive(serde::Serialize)]
+struct QdiscObservation<'a> {
+    assessment: agent_protocol::QdiscAssessment,
+    qdiscs: &'a [&'a agent_protocol::QdiscEntry],
+    source_entries: usize,
+    truncated: bool,
+    complete: bool,
+    context_truncated: bool,
+}
+
 fn bounded_tool_observation(
     tool: ReadOnlyAgentTool,
     report: &agent_protocol::WanDiagnosticReport,
@@ -1535,7 +1680,48 @@ fn bounded_tool_observation(
         ReadOnlyAgentTool::InspectInterfaceCounters | ReadOnlyAgentTool::InspectInterfaceErrors => {
             Err("interface statistics observations require an interface statistics snapshot".into())
         }
+        ReadOnlyAgentTool::InspectConntrackCapacity => {
+            Err("connection-tracking observations require a conntrack snapshot".into())
+        }
+        ReadOnlyAgentTool::InspectQdiscStats | ReadOnlyAgentTool::InspectQdiscPressure => {
+            Err("qdisc observations require a qdisc snapshot".into())
+        }
     }
+}
+
+fn bounded_qdisc_observation(
+    tool: ReadOnlyAgentTool,
+    report: &agent_protocol::QdiscDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    let pressure_only = tool == ReadOnlyAgentTool::InspectQdiscPressure;
+    let qdiscs: Vec<&agent_protocol::QdiscEntry> = report
+        .summary
+        .qdiscs
+        .iter()
+        .filter(|qdisc| !pressure_only || qdisc.has_pressure_counters())
+        .collect();
+    for retained in (0..=qdiscs.len()).rev() {
+        let result = encode_tool_observation(
+            tool.name(),
+            &QdiscObservation {
+                assessment: report.summary.assessment,
+                qdiscs: &qdiscs[..retained],
+                source_entries: report.summary.qdiscs.len(),
+                truncated: report.summary.truncated,
+                complete: report.complete,
+                context_truncated: retained < qdiscs.len(),
+            },
+            limit,
+        );
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        tool.name()
+    ))
 }
 
 fn bounded_interface_stats_observation(
@@ -2343,6 +2529,75 @@ async fn handle_interface_stats_diagnosis(id: String, state: &AppState) -> Serve
     ServerResponse::success(id, ResponseData::InterfaceStatsDiagnostic(Box::new(report)))
 }
 
+async fn handle_conntrack_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = state.tools.diagnose_conntrack();
+    persist_diagnostic(
+        &id,
+        "conntrack",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::ConntrackDiagnostic(Box::new(report)))
+}
+
+async fn handle_qdisc_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_qdisc(),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("qdisc diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "qdisc diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "qdisc",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::QdiscDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -2859,6 +3114,48 @@ mod tests {
                     || interface["tx_errors"].as_u64().unwrap_or_default() > 0
                     || interface["tx_dropped"].as_u64().unwrap_or_default() > 0
             })
+        }));
+    }
+
+    #[test]
+    fn qdisc_pressure_observation_filters_idle_entries_and_shrinks() {
+        let qdiscs = (0..64)
+            .map(|index| agent_protocol::QdiscEntry {
+                device: format!("if{index}"),
+                kind: "fq_codel".into(),
+                handle: Some(format!("{index}:")),
+                parent: None,
+                root: true,
+                bytes: 1000 + index,
+                packets: 100 + index,
+                drops: u64::from(index % 2 == 0),
+                overlimits: 0,
+                requeues: 0,
+                backlog_bytes: 0,
+                queue_length: 0,
+            })
+            .collect();
+        let report = agent_protocol::QdiscDiagnosticReport {
+            summary: agent_protocol::QdiscSummary {
+                assessment: agent_protocol::QdiscAssessment::PressureCountersPresent,
+                qdiscs,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            complete: true,
+        };
+        let encoded =
+            bounded_qdisc_observation(ReadOnlyAgentTool::InspectQdiscPressure, &report, 1024)
+                .expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["source_entries"], 64);
+        assert_eq!(value["context_truncated"], true);
+        assert!(value["qdiscs"].as_array().is_some_and(|qdiscs| {
+            qdiscs
+                .iter()
+                .all(|qdisc| qdisc["drops"].as_u64().unwrap_or_default() > 0)
         }));
     }
 
