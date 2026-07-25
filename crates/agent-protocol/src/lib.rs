@@ -21,6 +21,7 @@ pub enum Command {
     DiagnoseDhcp,
     DiagnoseRoutes,
     DiagnoseInterfaces,
+    DiagnoseNeighbors,
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -75,6 +76,7 @@ pub enum ResponseData {
     DhcpDiagnostic(Box<DhcpDiagnosticReport>),
     RouteDiagnostic(Box<RouteDiagnosticReport>),
     InterfaceDiagnostic(Box<InterfaceDiagnosticReport>),
+    NeighborDiagnostic(Box<NeighborDiagnosticReport>),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -257,6 +259,51 @@ impl InterfaceAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeighborDiagnosticReport {
+    pub summary: NeighborSummary,
+    pub evidence: Vec<ProbeEvidence>,
+    pub findings: Vec<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeighborSummary {
+    pub assessment: NeighborAssessment,
+    pub entries: Vec<NeighborEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeighborEntry {
+    pub destination: String,
+    pub device: String,
+    pub link_address: Option<String>,
+    pub states: Vec<String>,
+    pub router: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NeighborAssessment {
+    NeighborsPresent,
+    ResolutionFailuresPresent,
+    NoEntries,
+    InsufficientEvidence,
+}
+
+impl NeighborAssessment {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeighborsPresent => "neighbors_present",
+            Self::ResolutionFailuresPresent => "resolution_failures_present",
+            Self::NoEntries => "no_entries",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WanSummary {
     pub assessment: WanAssessment,
     pub status_source: Option<String>,
@@ -424,6 +471,7 @@ mod tests {
             Command::DiagnoseDhcp,
             Command::DiagnoseRoutes,
             Command::DiagnoseInterfaces,
+            Command::DiagnoseNeighbors,
         ] {
             let request = ClientRequest {
                 protocol_version: PROTOCOL_VERSION,

@@ -308,45 +308,7 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 );
             }
         },
-        Command::Status => {
-            let database_bytes = state.store.database_bytes();
-            let managed_bytes = state.budget.managed_bytes().unwrap_or(database_bytes);
-            let available = state.budget.available_bytes().unwrap_or(0);
-            let pressure = state
-                .budget
-                .pressure(managed_bytes)
-                .unwrap_or(StoragePressure::Critical);
-            let mut degraded_reasons = state.platform.warnings.clone();
-            if pressure != StoragePressure::Normal {
-                degraded_reasons.push(format!("runtime storage pressure is {pressure:?}"));
-            }
-            let logging_dropped_records = state.log_writer.dropped_records();
-            if logging_dropped_records > 0 {
-                degraded_reasons.push(format!(
-                    "logging rate limit dropped {logging_dropped_records} records"
-                ));
-            }
-            ResponseData::Status(StatusResponse {
-                daemon_version: AGENT_VERSION.into(),
-                protocol_version: PROTOCOL_VERSION,
-                uptime_secs: state.started.elapsed().as_secs(),
-                profile: state.config.profile.as_str().into(),
-                storage: StorageStatus {
-                    database_bytes,
-                    database_limit_bytes: state.store.max_database_bytes(),
-                    managed_bytes,
-                    total_budget_bytes: state.budget.total_limit_bytes(),
-                    tmp_available_bytes: available,
-                    pressure,
-                },
-                platform_kind: state.platform.kind.as_str().into(),
-                llm_enabled: state.llm.is_some(),
-                llm_provider: state.config.llm.provider.as_str().into(),
-                llm_streaming: state.config.llm.streaming,
-                logging_dropped_records,
-                degraded_reasons,
-            })
-        }
+        Command::Status => status_response(state),
         Command::DiagnoseWan { active } => {
             return handle_wan_diagnosis(request.id, active, state).await;
         }
@@ -362,6 +324,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::DiagnoseInterfaces => {
             return handle_interface_diagnosis(request.id, state).await;
         }
+        Command::DiagnoseNeighbors => {
+            return handle_neighbor_diagnosis(request.id, state).await;
+        }
         Command::DiagnosticHistory { limit } => {
             return handle_diagnostic_history(request.id, limit, state).await;
         }
@@ -373,6 +338,46 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         }
     };
     ServerResponse::success(request.id, result)
+}
+
+fn status_response(state: &AppState) -> ResponseData {
+    let database_bytes = state.store.database_bytes();
+    let managed_bytes = state.budget.managed_bytes().unwrap_or(database_bytes);
+    let available = state.budget.available_bytes().unwrap_or(0);
+    let pressure = state
+        .budget
+        .pressure(managed_bytes)
+        .unwrap_or(StoragePressure::Critical);
+    let mut degraded_reasons = state.platform.warnings.clone();
+    if pressure != StoragePressure::Normal {
+        degraded_reasons.push(format!("runtime storage pressure is {pressure:?}"));
+    }
+    let logging_dropped_records = state.log_writer.dropped_records();
+    if logging_dropped_records > 0 {
+        degraded_reasons.push(format!(
+            "logging rate limit dropped {logging_dropped_records} records"
+        ));
+    }
+    ResponseData::Status(StatusResponse {
+        daemon_version: AGENT_VERSION.into(),
+        protocol_version: PROTOCOL_VERSION,
+        uptime_secs: state.started.elapsed().as_secs(),
+        profile: state.config.profile.as_str().into(),
+        storage: StorageStatus {
+            database_bytes,
+            database_limit_bytes: state.store.max_database_bytes(),
+            managed_bytes,
+            total_budget_bytes: state.budget.total_limit_bytes(),
+            tmp_available_bytes: available,
+            pressure,
+        },
+        platform_kind: state.platform.kind.as_str().into(),
+        llm_enabled: state.llm.is_some(),
+        llm_provider: state.config.llm.provider.as_str().into(),
+        llm_streaming: state.config.llm.streaming,
+        logging_dropped_records,
+        degraded_reasons,
+    })
 }
 
 fn valid_request_id(id: &str) -> bool {
@@ -497,8 +502,7 @@ async fn run_read_only_agent(
         ModelMessage::User(prompt),
     ];
     let tools = read_only_agent_tools();
-    let mut wan_snapshot = None;
-    let mut interface_snapshot = None;
+    let mut snapshots = AgentSnapshots::default();
     let mut prompt_tokens = None;
     let mut completion_tokens = None;
 
@@ -551,15 +555,9 @@ async fn run_read_only_agent(
             tool_calls: completion.tool_calls,
         });
         messages.push(
-            execute_agent_tool(
-                &call,
-                request_id,
-                state,
-                &mut wan_snapshot,
-                &mut interface_snapshot,
-            )
-            .await
-            .map_err(|failure| failure.with_usage(prompt_tokens, completion_tokens))?,
+            execute_agent_tool(&call, request_id, state, &mut snapshots)
+                .await
+                .map_err(|failure| failure.with_usage(prompt_tokens, completion_tokens))?,
         );
     }
     Err(AgentLoopFailure::new(
@@ -573,12 +571,18 @@ const fn tool_step_available(step: u8, max_agent_steps: u8) -> bool {
     step.saturating_add(1) < max_agent_steps
 }
 
+#[derive(Default)]
+struct AgentSnapshots {
+    wan: Option<agent_protocol::WanDiagnosticReport>,
+    interfaces: Option<agent_protocol::InterfaceDiagnosticReport>,
+    neighbors: Option<agent_protocol::NeighborDiagnosticReport>,
+}
+
 async fn execute_agent_tool(
     call: &ToolCall,
     request_id: &str,
     state: &AppState,
-    wan_snapshot: &mut Option<agent_protocol::WanDiagnosticReport>,
-    interface_snapshot: &mut Option<agent_protocol::InterfaceDiagnosticReport>,
+    snapshots: &mut AgentSnapshots,
 ) -> Result<ModelMessage, AgentLoopFailure> {
     let tool = validate_read_only_tool_call(call).map_err(|reason| {
         warn!(tool = %call.name, %reason, "model requested a rejected tool call");
@@ -587,40 +591,101 @@ async fn execute_agent_tool(
             format!("model tool call was rejected: {reason}"),
         )
     })?;
-    if tool == ReadOnlyAgentTool::InspectInterfaces {
-        ensure_task_storage(state)
-            .await
-            .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
-        if interface_snapshot.is_none() {
-            let report = execute_agent_interface_diagnostic(state)
-                .await
-                .map_err(agent_tool_failure)?;
-            persist_diagnostic(
-                &format!("{request_id}-interface-tool-snapshot"),
-                "interfaces",
-                false,
-                report.summary.assessment.as_str(),
-                &report.summary,
-                state,
-            )
-            .await;
-            *interface_snapshot = Some(report);
+    match tool {
+        ReadOnlyAgentTool::InspectInterfaces => {
+            execute_interface_agent_tool(call, request_id, state, snapshots).await
         }
-        let report = interface_snapshot.as_ref().ok_or_else(|| {
-            AgentLoopFailure::new(
-                ErrorCode::Internal,
-                "interface snapshot cache is unavailable",
-            )
-        })?;
-        let content =
-            bounded_interface_observation(report, state.config.llm.max_tool_context_bytes)
-                .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
-        return Ok(ModelMessage::Tool {
-            tool_call_id: call.id.clone(),
-            content,
-        });
+        ReadOnlyAgentTool::InspectNeighbors => {
+            execute_neighbor_agent_tool(call, request_id, state, snapshots).await
+        }
+        _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
-    if wan_snapshot.is_none() {
+}
+
+async fn execute_interface_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.interfaces.is_none() {
+        let report = execute_agent_interface_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-interface-tool-snapshot"),
+            "interfaces",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.interfaces = Some(report);
+    }
+    let report = snapshots.interfaces.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "interface snapshot cache is unavailable",
+        )
+    })?;
+    let content = bounded_interface_observation(report, state.config.llm.max_tool_context_bytes)
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
+async fn execute_neighbor_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    if snapshots.neighbors.is_none() {
+        let report = execute_agent_neighbor_diagnostic(state)
+            .await
+            .map_err(agent_tool_failure)?;
+        persist_diagnostic(
+            &format!("{request_id}-neighbor-tool-snapshot"),
+            "neighbors",
+            false,
+            report.summary.assessment.as_str(),
+            &report.summary,
+            state,
+        )
+        .await;
+        snapshots.neighbors = Some(report);
+    }
+    let report = snapshots.neighbors.as_ref().ok_or_else(|| {
+        AgentLoopFailure::new(
+            ErrorCode::Internal,
+            "neighbor snapshot cache is unavailable",
+        )
+    })?;
+    let content = bounded_neighbor_observation(report, state.config.llm.max_tool_context_bytes)
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
+}
+
+async fn execute_wan_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    tool: ReadOnlyAgentTool,
+    state: &AppState,
+    snapshots: &mut AgentSnapshots,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    if snapshots.wan.is_none() {
         ensure_task_storage(state)
             .await
             .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
@@ -636,9 +701,9 @@ async fn execute_agent_tool(
             state,
         )
         .await;
-        *wan_snapshot = Some(report);
+        snapshots.wan = Some(report);
     }
-    let report = wan_snapshot.as_ref().ok_or_else(|| {
+    let report = snapshots.wan.as_ref().ok_or_else(|| {
         AgentLoopFailure::new(ErrorCode::Internal, "WAN snapshot cache is unavailable")
     })?;
     let content =
@@ -675,16 +740,18 @@ enum ReadOnlyAgentTool {
     InspectDhcp,
     InspectWanFirewall,
     InspectInterfaces,
+    InspectNeighbors,
 }
 
 impl ReadOnlyAgentTool {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::DiagnoseWan,
         Self::InspectDefaultRoutes,
         Self::InspectDns,
         Self::InspectDhcp,
         Self::InspectWanFirewall,
         Self::InspectInterfaces,
+        Self::InspectNeighbors,
     ];
 
     const fn name(self) -> &'static str {
@@ -695,6 +762,7 @@ impl ReadOnlyAgentTool {
             Self::InspectDhcp => "inspect_dhcp",
             Self::InspectWanFirewall => "inspect_wan_firewall",
             Self::InspectInterfaces => "inspect_interfaces",
+            Self::InspectNeighbors => "inspect_neighbors",
         }
     }
 
@@ -717,6 +785,9 @@ impl ReadOnlyAgentTool {
             }
             Self::InspectInterfaces => {
                 "Inventory bounded kernel network interface, link, carrier, address, bridge/VLAN kind, and master state without changing devices."
+            }
+            Self::InspectNeighbors => {
+                "Inspect bounded ARP and IPv6 NDP neighbor state without generating traffic; link-layer addresses are withheld from model context."
             }
         }
     }
@@ -806,6 +877,24 @@ async fn execute_agent_interface_diagnostic(
     }
 }
 
+async fn execute_agent_neighbor_diagnostic(
+    state: &AppState,
+) -> Result<agent_protocol::NeighborDiagnosticReport, AgentToolError> {
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return Err(AgentToolError::Busy);
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_neighbors(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(error)) => Err(AgentToolError::Failed(error)),
+        Err(_) => Err(AgentToolError::TimedOut),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct WanObservation<'a> {
     interface: &'a str,
@@ -855,6 +944,24 @@ struct FirewallObservation<'a> {
 struct InterfaceObservation<'a> {
     assessment: agent_protocol::InterfaceAssessment,
     interfaces: &'a [agent_protocol::NetworkInterfaceSummary],
+    truncated: bool,
+    findings: &'a [String],
+    complete: bool,
+    context_truncated: bool,
+}
+
+#[derive(serde::Serialize)]
+struct NeighborObservationEntry<'a> {
+    destination: &'a str,
+    device: &'a str,
+    states: &'a [String],
+    router: bool,
+}
+
+#[derive(serde::Serialize)]
+struct NeighborObservation<'a> {
+    assessment: agent_protocol::NeighborAssessment,
+    entries: Vec<NeighborObservationEntry<'a>>,
     truncated: bool,
     findings: &'a [String],
     complete: bool,
@@ -925,7 +1032,46 @@ fn bounded_tool_observation(
         ReadOnlyAgentTool::InspectInterfaces => {
             Err("interface observations require an interface snapshot".into())
         }
+        ReadOnlyAgentTool::InspectNeighbors => {
+            Err("neighbor observations require a neighbor snapshot".into())
+        }
     }
+}
+
+fn bounded_neighbor_observation(
+    report: &agent_protocol::NeighborDiagnosticReport,
+    limit: usize,
+) -> Result<String, String> {
+    for retained in (0..=report.summary.entries.len()).rev() {
+        let entries = report.summary.entries[..retained]
+            .iter()
+            .map(|entry| NeighborObservationEntry {
+                destination: &entry.destination,
+                device: &entry.device,
+                states: &entry.states,
+                router: entry.router,
+            })
+            .collect();
+        let result = encode_tool_observation(
+            ReadOnlyAgentTool::InspectNeighbors.name(),
+            &NeighborObservation {
+                assessment: report.summary.assessment,
+                entries,
+                truncated: report.summary.truncated,
+                findings: &report.findings,
+                complete: report.complete,
+                context_truncated: retained < report.summary.entries.len(),
+            },
+            limit,
+        );
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(format!(
+        "{} observation metadata exceeds llm.max_tool_context_bytes {limit}",
+        ReadOnlyAgentTool::InspectNeighbors.name()
+    ))
 }
 
 fn bounded_interface_observation(
@@ -1198,6 +1344,51 @@ async fn handle_interface_diagnosis(id: String, state: &AppState) -> ServerRespo
     ServerResponse::success(id, ResponseData::InterfaceDiagnostic(Box::new(report)))
 }
 
+async fn handle_neighbor_diagnosis(id: String, state: &AppState) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let Ok(_permit) = state.diagnostic_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "the configured diagnostic task limit has been reached",
+        );
+    };
+    let report = match tokio::time::timeout(
+        Duration::from_secs(state.config.runtime.task_timeout_secs),
+        state.tools.diagnose_neighbors(&state.platform),
+    )
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                format!("neighbor diagnosis failed: {error}"),
+            );
+        }
+        Err(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "neighbor diagnosis exceeded the configured task timeout",
+            );
+        }
+    };
+    persist_diagnostic(
+        &id,
+        "neighbors",
+        false,
+        report.summary.assessment.as_str(),
+        &report.summary,
+        state,
+    )
+    .await;
+    ServerResponse::success(id, ResponseData::NeighborDiagnostic(Box::new(report)))
+}
+
 async fn persist_diagnostic<T: serde::Serialize>(
     id: &str,
     kind: &str,
@@ -1468,6 +1659,39 @@ mod tests {
             value["interfaces"]
                 .as_array()
                 .is_some_and(|interfaces| interfaces.len() < 16)
+        );
+    }
+
+    #[test]
+    fn neighbor_tool_observation_withholds_mac_and_shrinks_to_budget() {
+        let entries = (1..=20)
+            .map(|host| agent_protocol::NeighborEntry {
+                destination: format!("192.0.2.{host}"),
+                device: "eth0".into(),
+                link_address: Some("00:11:22:33:44:55".into()),
+                states: vec!["REACHABLE".into()],
+                router: host == 1,
+            })
+            .collect();
+        let report = agent_protocol::NeighborDiagnosticReport {
+            summary: agent_protocol::NeighborSummary {
+                assessment: agent_protocol::NeighborAssessment::NeighborsPresent,
+                entries,
+                truncated: false,
+            },
+            evidence: Vec::new(),
+            findings: vec!["neighbors present".into()],
+            complete: true,
+        };
+        let encoded = bounded_neighbor_observation(&report, 1024).expect("bounded observation");
+        assert!(encoded.len() <= 1024);
+        assert!(!encoded.contains("00:11:22:33:44:55"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("observation JSON");
+        assert_eq!(value["context_truncated"], true);
+        assert!(
+            value["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.len() < 20)
         );
     }
 

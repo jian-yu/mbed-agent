@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use agent_protocol::{
     DhcpAssessment, DhcpDiagnosticReport, DhcpSummary, DnsDiagnosticReport, DnsSummary,
     FirewallZoneSummary, InterfaceAssessment, InterfaceDiagnosticReport, InterfaceSummary,
+    NeighborAssessment, NeighborDiagnosticReport, NeighborEntry, NeighborSummary,
     NetworkInterfaceSummary, ProbeEvidence, ProbeStatus, RouteDiagnosticReport, RouteSummary,
     WanAssessment, WanDiagnosticReport, WanRoute, WanSummary,
 };
@@ -19,6 +20,8 @@ use tokio::time::timeout;
 const WAN_INTERFACE: &str = "wan";
 const MAX_INTERFACES: usize = 32;
 const MAX_ADDRESSES_PER_INTERFACE: usize = 8;
+const MAX_NEIGHBORS: usize = 64;
+const MAX_NEIGHBOR_STATES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -147,11 +150,29 @@ impl ToolRunner {
         Ok(build_interface_report(evidence))
     }
 
+    /// Inventories the bounded kernel ARP/NDP neighbor cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the resolved collector cannot be executed.
+    pub async fn diagnose_neighbors(
+        &self,
+        platform: &PlatformCapabilities,
+    ) -> io::Result<NeighborDiagnosticReport> {
+        let evidence = self
+            .collect_passive(platform, DiagnosticScope::Neighbors)
+            .await?;
+        Ok(build_neighbor_report(evidence))
+    }
+
     async fn collect_passive(
         &self,
         platform: &PlatformCapabilities,
         scope: DiagnosticScope,
     ) -> io::Result<Vec<ProbeEvidence>> {
+        if scope == DiagnosticScope::Neighbors {
+            return Ok(vec![self.run(Probe::IpNeighbor).await?]);
+        }
         let mut evidence = Vec::with_capacity(12);
         if platform.kind == PlatformKind::OpenWrt && scope != DiagnosticScope::Interfaces {
             evidence.push(self.run(Probe::UbusWan).await?);
@@ -310,6 +331,7 @@ enum Probe {
     IpAddress,
     IpRoute,
     IpRule,
+    IpNeighbor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +341,7 @@ enum DiagnosticScope {
     Dhcp,
     Routes,
     Interfaces,
+    Neighbors,
 }
 
 impl Probe {
@@ -330,6 +353,7 @@ impl Probe {
             Self::IpAddress => "network.interface.address",
             Self::IpRoute => "network.route.list",
             Self::IpRule => "network.route.rules",
+            Self::IpNeighbor => "network.neighbor.list",
         }
     }
 
@@ -337,7 +361,9 @@ impl Probe {
         match self {
             Self::UbusWan => "ubus",
             Self::UciFirewall => "uci",
-            Self::IpLink | Self::IpAddress | Self::IpRoute | Self::IpRule => "ip",
+            Self::IpLink | Self::IpAddress | Self::IpRoute | Self::IpRule | Self::IpNeighbor => {
+                "ip"
+            }
         }
     }
 
@@ -349,6 +375,7 @@ impl Probe {
             Self::IpAddress => &["-j", "address", "show"],
             Self::IpRoute => &["-j", "route", "show", "table", "all"],
             Self::IpRule => &["-j", "rule", "show"],
+            Self::IpNeighbor => &["-j", "neighbor", "show"],
         }
     }
 }
@@ -1188,6 +1215,143 @@ fn bounded_json_string(value: &serde_json::Value, key: &str, limit: usize) -> Op
         .map(str::to_owned)
 }
 
+fn build_neighbor_report(evidence: Vec<ProbeEvidence>) -> NeighborDiagnosticReport {
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    let has_evidence = successful_output(&evidence, "network.neighbor.list").is_some();
+    if let Some(output) = successful_output(&evidence, "network.neighbor.list") {
+        parse_neighbors(output, &mut entries, &mut truncated);
+    }
+    entries.sort_by(|left, right| {
+        left.device
+            .cmp(&right.device)
+            .then_with(|| left.destination.cmp(&right.destination))
+    });
+    let has_failures = entries.iter().any(|entry| {
+        entry
+            .states
+            .iter()
+            .any(|state| matches!(state.as_str(), "FAILED" | "INCOMPLETE"))
+    });
+    let assessment = if !has_evidence {
+        NeighborAssessment::InsufficientEvidence
+    } else if has_failures {
+        NeighborAssessment::ResolutionFailuresPresent
+    } else if entries.is_empty() {
+        NeighborAssessment::NoEntries
+    } else {
+        NeighborAssessment::NeighborsPresent
+    };
+    let mut findings = vec![match assessment {
+        NeighborAssessment::NeighborsPresent => {
+            "the kernel neighbor cache contains ARP/NDP entries; reachability beyond the cache was not tested"
+        }
+        NeighborAssessment::ResolutionFailuresPresent => {
+            "one or more ARP/NDP entries are incomplete or failed; this does not by itself identify the root cause"
+        }
+        NeighborAssessment::NoEntries => {
+            "the kernel neighbor cache is empty; no active traffic was generated to populate it"
+        }
+        NeighborAssessment::InsufficientEvidence => {
+            "kernel ARP/NDP neighbor evidence is unavailable"
+        }
+    }
+    .into()];
+    if truncated || evidence.iter().any(|item| item.truncated) {
+        findings
+            .push("neighbor inventory reached a configured byte or normalized-entry limit".into());
+    }
+    NeighborDiagnosticReport {
+        summary: NeighborSummary {
+            assessment,
+            entries,
+            truncated,
+        },
+        complete: has_evidence && !truncated && !evidence.iter().any(|item| item.truncated),
+        evidence,
+        findings,
+    }
+}
+
+fn parse_neighbors(output: &str, entries: &mut Vec<NeighborEntry>, truncated: &mut bool) {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return;
+    };
+    for item in items {
+        if entries.len() >= MAX_NEIGHBORS {
+            *truncated = true;
+            break;
+        }
+        let Some(destination) = item
+            .get("dst")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|destination| destination.parse::<IpAddr>().ok())
+            .map(|destination| destination.to_string())
+        else {
+            continue;
+        };
+        let Some(device) = bounded_json_string(&item, "dev", 64) else {
+            continue;
+        };
+        let mut states = Vec::new();
+        if let Some(state) = item.get("state") {
+            if let Some(state) = state.as_str() {
+                push_neighbor_state(&mut states, state);
+            } else if let Some(values) = state.as_array() {
+                for state in values.iter().filter_map(serde_json::Value::as_str) {
+                    if states.len() >= MAX_NEIGHBOR_STATES {
+                        *truncated = true;
+                        break;
+                    }
+                    push_neighbor_state(&mut states, state);
+                }
+            }
+        }
+        let link_address = bounded_json_string(&item, "lladdr", 64)
+            .filter(|address| valid_link_address(address))
+            .map(|address| address.to_ascii_lowercase());
+        let entry = NeighborEntry {
+            destination,
+            device,
+            link_address,
+            states,
+            router: item
+                .get("router")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        };
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+}
+
+fn push_neighbor_state(states: &mut Vec<String>, state: &str) {
+    let state = state.to_ascii_uppercase();
+    if matches!(
+        state.as_str(),
+        "NONE"
+            | "INCOMPLETE"
+            | "REACHABLE"
+            | "STALE"
+            | "DELAY"
+            | "PROBE"
+            | "FAILED"
+            | "NOARP"
+            | "PERMANENT"
+    ) {
+        push_unique(states, state);
+    }
+}
+
+fn valid_link_address(address: &str) -> bool {
+    !address.is_empty()
+        && address.len() <= 64
+        && address
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'-' | b'.'))
+}
+
 fn assess_routes(summary: &WanSummary) -> WanAssessment {
     if summary.status_source.is_none() {
         WanAssessment::InsufficientEvidence
@@ -1703,6 +1867,61 @@ printf '%s\n' '[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],
         assert_eq!(eth0.carrier, Some(true));
         assert_eq!(eth0.addresses, ["192.0.2.10/24", "2001:db8::10/64"]);
         assert!(eth0.dynamic_address);
+    }
+
+    #[tokio::test]
+    async fn neighbor_runbook_normalizes_arp_and_ndp_without_active_probes() {
+        let fixture = Fixture::new();
+        fixture.executable(
+            "bin/ip",
+            r#"#!/bin/sh
+printf '%s\n' '[{"dst":"192.0.2.1","dev":"eth0","lladdr":"00:11:22:AA:BB:CC","state":["REACHABLE"]},{"dst":"2001:db8::1","dev":"eth0","state":["INCOMPLETE"],"router":true},{"dst":"not-an-ip","dev":"eth0","lladdr":"must-not-pass","state":["FAILED"]}]'
+"#,
+        );
+        let runner = ToolRunner {
+            root: fixture.root.clone(),
+            command_dirs: vec![PathBuf::from("/bin")],
+            timeout: Duration::from_secs(3),
+            max_output_bytes: 4096,
+        };
+        let report = runner
+            .diagnose_neighbors(&platform(FirewallBackend::Nftables))
+            .await
+            .expect("neighbor diagnosis");
+        assert_eq!(
+            report.summary.assessment,
+            NeighborAssessment::ResolutionFailuresPresent
+        );
+        assert!(report.complete);
+        assert_eq!(report.evidence.len(), 1);
+        assert_eq!(report.evidence[0].probe, "network.neighbor.list");
+        assert_eq!(report.summary.entries.len(), 2);
+        assert_eq!(
+            report.summary.entries[0].link_address.as_deref(),
+            Some("00:11:22:aa:bb:cc")
+        );
+        assert!(report.summary.entries[1].router);
+        assert_eq!(report.summary.entries[1].states, ["INCOMPLETE"]);
+    }
+
+    #[test]
+    fn neighbor_inventory_caps_normalized_entries() {
+        let neighbors: Vec<serde_json::Value> = (0..=MAX_NEIGHBORS)
+            .map(|index| {
+                serde_json::json!({
+                    "dst": format!("192.0.2.{}", index % 254 + 1),
+                    "dev": format!("eth{}", index / 254),
+                    "state": ["STALE"]
+                })
+            })
+            .collect();
+        let report = build_neighbor_report(vec![ok_evidence(
+            "network.neighbor.list",
+            &serde_json::to_string(&neighbors).expect("neighbors"),
+        )]);
+        assert_eq!(report.summary.entries.len(), MAX_NEIGHBORS);
+        assert!(report.summary.truncated);
+        assert!(!report.complete);
     }
 
     #[test]
