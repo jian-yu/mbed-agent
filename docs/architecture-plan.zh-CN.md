@@ -982,8 +982,7 @@ kill/重启和 `/tmp` 压力时，同一次开机内未确认变更可自动恢�
 当前实现进度：已落地有界 ChangePlan/typed object diff、内容/版本摘要校验、
 语义风险只升不降、绑定 actor/boot/生命周期的规范化计划摘要，以及禁止跳过
 审批、staging、validation、rollback arm 和 verification 的状态机。计划摘要不是
-approval token；带设备启动期密钥的一次性 token、SQLite 状态持久化和独立
-rollback helper 仍按本阶段后续切片实现，在此之前不开放任何写工具。
+approval token；在此之前不开放任何写工具。
 ChangePlan 只能由 daemon 的领域 planner 根据新鲜 before/after typed 对象生成，
 是返回给调用方的预览和内部持久化状态，不作为模型或 Channel 可直接提交执行的
 输入；风险信号同样由本地语义比较器产生。
@@ -993,6 +992,10 @@ ChangePlan 只能由 daemon 的领域 planner 根据新鲜 before/after typed �
 rollback arm 只能通过带未来 monotonic deadline 的专用事务完成。记录数与计划
 payload 分别受 `storage.max_change_set_records` 和
 `storage.max_change_plan_bytes` 限制，设备重启随 `/tmp` 一起清空。
+管理员密码校验与 boot-bound `device-admin` 已实现；有界 snapshot/journal、
+同一二进制隐藏 `rollback-helper`、独立 watchdog 和原子恢复也已实现。当前仍未
+开放公共写工具，因为 approval token 签发、领域执行编排、apply 后验证与
+confirmed-commit 尚未连成完整运行时闭环。
 
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
@@ -1078,12 +1081,16 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 这样既尽早验证最危险的执行与回滚问题，也保证后续新增配置域只是实现 typed
 adapter 和领域验证器，而不是复制权限、事务与审计代码。
 
-截至 ADR 0024，防火墙统一 typed model 与显式 CRUD/move planner 已完成：zone、
+截至 ADR 0025，防火墙统一 typed model 与显式 CRUD/move planner 已完成：zone、
 forwarding、filter rule、同类型 address/MAC/port set、masquerade/SNAT/DNAT/
 redirect 均进入统一 schema；CIDR、MAC、协议、端口、接口、zone、conntrack、
 ICMP、限速、日志和顺序在本地严格校验。update/delete/move 绑定新鲜对象摘要，
-风险由语义 diff 与管理路径上下文本地计算。fw3/fw4、nftables/iptables 渲染、
-native check 和 apply 仍作为下一纵向切片，未完成前公共写接口保持关闭。
+风险由语义 diff 与管理路径上下文本地计算。OpenWrt 21.02 fw3 与新版 fw4 的
+UCI staging renderer 已完成：现有 section 由同次 `uci show firewall` 与 typed
+inventory 联合解析，未知平台扩展 option 保留，写入只发生在 `/tmp` staging
+副本；fw3 固定执行 IPv4/IPv6 render check，fw4 固定执行 `fw4 check`。
+nftables/iptables renderer、ChangeSet 执行编排、live apply/verify/confirm 尚是
+下一纵向切片，未完成前公共写接口保持关闭。
 
 ## 21. 参考项目与官方资料
 

@@ -7,7 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+agent-core.workspace = true
+agent-protocol.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

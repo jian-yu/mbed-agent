@@ -3,7 +3,36 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod firewall;
+
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;
+const DISCOVERED_COMMANDS: &[&str] = &[
+    "ubus",
+    "uci",
+    "fw3",
+    "fw4",
+    "iptables",
+    "iptables-save",
+    "iptables-restore",
+    "ip6tables",
+    "ip6tables-save",
+    "ip6tables-restore",
+    "nft",
+    "swconfig",
+    "opkg",
+    "apk",
+    "apt-get",
+    "dnf",
+    "pacman",
+    "systemctl",
+    "openrc",
+    "iw",
+    "iwinfo",
+    "ip",
+    "tc",
+    "ss",
+    "netstat",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Independent discovered capabilities, not state flags.
@@ -128,31 +157,9 @@ impl Discovery {
                 .and_then(release_major)
                 .is_some_and(|major| major >= MINIMUM_OPENWRT_MAJOR);
 
-        let commands = [
-            "ubus",
-            "uci",
-            "fw3",
-            "fw4",
-            "iptables-save",
-            "ip6tables-save",
-            "nft",
-            "swconfig",
-            "opkg",
-            "apk",
-            "apt-get",
-            "dnf",
-            "pacman",
-            "systemctl",
-            "openrc",
-            "iw",
-            "iwinfo",
-            "ip",
-            "tc",
-            "ss",
-            "netstat",
-        ];
-        let available_commands: Vec<String> = commands
-            .into_iter()
+        let available_commands: Vec<String> = DISCOVERED_COMMANDS
+            .iter()
+            .copied()
             .filter(|command| self.command_exists(command))
             .map(str::to_owned)
             .collect();

@@ -39,6 +39,12 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   interfaces, zones, conntrack state, ICMP types, rate limiting, logging, and
   ordering. Updates/deletes/moves require fresh object digests; local semantic
   analysis raises exposure, management-path, and disruptive changes to R3.
+- OpenWrt firewall staging now renders those plans into bounded UCI batches for
+  both 21.02 fw3 and newer fw4 systems. Existing named/anonymous sections are
+  resolved from a fresh local `uci show firewall` snapshot, unknown vendor
+  options are preserved, unsafe selectors fail closed, and fixed native
+  fw3 IPv4/IPv6 render checks or `fw4 check` must precede activation. This
+  staging slice does not yet install or reload the live firewall.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -96,6 +102,8 @@ Bounded snapshots and the independent rollback watchdog are recorded in
 [ADR 0023](docs/adr/0023-bounded-independent-rollback.md).
 The cross-platform typed firewall model and planner are recorded in
 [ADR 0024](docs/adr/0024-typed-firewall-planner.md).
+OpenWrt fw3/fw4 UCI staging and native validation are recorded in
+[ADR 0025](docs/adr/0025-openwrt-firewall-staging.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
