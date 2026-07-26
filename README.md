@@ -45,6 +45,13 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   options are preserved, unsafe selectors fail closed, and fixed native
   fw3 IPv4/IPv6 render checks or `fw4 check` must precede activation. This
   staging slice does not yet install or reload the live firewall.
+- Generic Linux nftables staging now projects only Agent-owned objects into one
+  fixed, ownership-marked `inet mbed_agent` table. It renders isolated filter,
+  zone/forwarding, network/MAC/port sets, reject/log/rate/state matches, and
+  masquerade/SNAT/DNAT/redirect state for fixed `nft --check` and atomic load
+  operations. Existing host tables are never rewritten. Its explicit
+  additive-coexistence capability notes that Agent drops are final while
+  accepts cannot override a later distribution-owned drop.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -104,6 +111,8 @@ The cross-platform typed firewall model and planner are recorded in
 [ADR 0024](docs/adr/0024-typed-firewall-planner.md).
 OpenWrt fw3/fw4 UCI staging and native validation are recorded in
 [ADR 0025](docs/adr/0025-openwrt-firewall-staging.md).
+Generic Linux isolated nftables staging is recorded in
+[ADR 0026](docs/adr/0026-generic-linux-nftables-staging.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

@@ -1089,8 +1089,14 @@ ICMP、限速、日志和顺序在本地严格校验。update/delete/move 绑定
 UCI staging renderer 已完成：现有 section 由同次 `uci show firewall` 与 typed
 inventory 联合解析，未知平台扩展 option 保留，写入只发生在 `/tmp` staging
 副本；fw3 固定执行 IPv4/IPv6 render check，fw4 固定执行 `fw4 check`。
-nftables/iptables renderer、ChangeSet 执行编排、live apply/verify/confirm 尚是
-下一纵向切片，未完成前公共写接口保持关闭。
+普通 Linux nftables staging renderer 也已完成：只接受 Agent-owned 对象并完整
+替换带 ownership comment 的固定 `inet mbed_agent` table，发行版/第三方 table
+不读取后重写；zone/forwarding、filter、network/MAC/port set、reject/log/rate/
+state 与 masquerade/SNAT/DNAT/redirect 均走 typed renderer，并生成固定
+`nft --check --file`/`nft --file` 契约。隔离 base chain 明确标记为 additive
+coexistence：drop 是最终裁决，但 accept 不能越过其他更晚 base chain 的 drop。
+iptables renderer、ChangeSet 执行编排、live apply/verify/confirm 尚是下一纵向
+切片，未完成前公共写接口保持关闭。
 
 ## 21. 参考项目与官方资料
 
