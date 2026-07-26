@@ -1078,6 +1078,13 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 这样既尽早验证最危险的执行与回滚问题，也保证后续新增配置域只是实现 typed
 adapter 和领域验证器，而不是复制权限、事务与审计代码。
 
+截至 ADR 0024，防火墙统一 typed model 与显式 CRUD/move planner 已完成：zone、
+forwarding、filter rule、同类型 address/MAC/port set、masquerade/SNAT/DNAT/
+redirect 均进入统一 schema；CIDR、MAC、协议、端口、接口、zone、conntrack、
+ICMP、限速、日志和顺序在本地严格校验。update/delete/move 绑定新鲜对象摘要，
+风险由语义 diff 与管理路径上下文本地计算。fw3/fw4、nftables/iptables 渲染、
+native check 和 apply 仍作为下一纵向切片，未完成前公共写接口保持关闭。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。

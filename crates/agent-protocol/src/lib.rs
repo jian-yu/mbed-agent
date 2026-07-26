@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -286,6 +287,236 @@ pub struct ChangeRiskSignals {
     pub changes_secret: bool,
     pub changes_device_authentication: bool,
     pub irreversible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "spec", rename_all = "snake_case")]
+pub enum FirewallObject {
+    Zone(FirewallZone),
+    Forwarding(FirewallForwarding),
+    FilterRule(FirewallFilterRule),
+    AddressSet(FirewallAddressSet),
+    NatRule(FirewallNatRule),
+}
+
+impl FirewallObject {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Zone(value) => &value.id,
+            Self::Forwarding(value) => &value.id,
+            Self::FilterRule(value) => &value.id,
+            Self::AddressSet(value) => &value.id,
+            Self::NatRule(value) => &value.id,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Zone(_) => "zone",
+            Self::Forwarding(_) => "forwarding",
+            Self::FilterRule(_) => "filter_rule",
+            Self::AddressSet(_) => "address_set",
+            Self::NatRule(_) => "nat_rule",
+        }
+    }
+
+    #[must_use]
+    pub const fn ownership(&self) -> ObjectOwnership {
+        match self {
+            Self::Zone(value) => value.ownership,
+            Self::Forwarding(value) => value.ownership,
+            Self::FilterRule(value) => value.ownership,
+            Self::AddressSet(value) => value.ownership,
+            Self::NatRule(value) => value.ownership,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallZone {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub networks: Vec<String>,
+    pub input: FirewallVerdict,
+    pub output: FirewallVerdict,
+    pub forward: FirewallVerdict,
+    pub masquerade: bool,
+    pub mtu_fix: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallForwarding {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub source_zone: String,
+    pub destination_zone: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallFilterRule {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub direction: FirewallDirection,
+    pub matches: FirewallMatch,
+    pub verdict: FirewallVerdict,
+    pub reject_with: Option<FirewallRejectKind>,
+    pub rate_limit: Option<FirewallRateLimit>,
+    pub log: Option<FirewallLog>,
+    pub order: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallAddressSet {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub family: FirewallFamily,
+    pub entries: Vec<FirewallSetEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallNatRule {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub kind: FirewallNatKind,
+    pub matches: FirewallMatch,
+    pub translation_address: Option<IpAddr>,
+    pub translation_port: Option<PortRange>,
+    pub order: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallMatch {
+    pub family: FirewallFamily,
+    pub source_zones: Vec<String>,
+    pub destination_zones: Vec<String>,
+    pub input_interfaces: Vec<String>,
+    pub output_interfaces: Vec<String>,
+    pub source_networks: Vec<IpNetwork>,
+    pub destination_networks: Vec<IpNetwork>,
+    pub source_macs: Vec<String>,
+    pub protocols: Vec<FirewallProtocol>,
+    pub source_ports: Vec<PortRange>,
+    pub destination_ports: Vec<PortRange>,
+    pub icmp_types: Vec<u8>,
+    pub conntrack_states: Vec<FirewallConntrackState>,
+    pub source_sets: Vec<String>,
+    pub destination_sets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallFamily {
+    #[default]
+    Any,
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallDirection {
+    Input,
+    Output,
+    Forward,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallVerdict {
+    Accept,
+    Drop,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallRejectKind {
+    TcpReset,
+    IcmpPortUnreachable,
+    IcmpHostUnreachable,
+    Icmp6PortUnreachable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallProtocol {
+    Tcp,
+    Udp,
+    Icmp,
+    Icmpv6,
+    Esp,
+    Ah,
+    Gre,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallConntrackState {
+    New,
+    Established,
+    Related,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallNatKind {
+    Masquerade,
+    SourceNat,
+    DestinationNat,
+    Redirect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum FirewallSetEntry {
+    Network(IpNetwork),
+    Mac(String),
+    Port(PortRange),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct IpNetwork {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallRateLimit {
+    pub packets_per_second: u32,
+    pub burst: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallLog {
+    pub prefix: String,
+    pub level: FirewallLogLevel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallLogLevel {
+    Emergency,
+    Alert,
+    Critical,
+    Error,
+    Warning,
+    Notice,
+    Info,
+    Debug,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1157,5 +1388,25 @@ mod tests {
     fn sensitive_strings_are_redacted_from_debug_output() {
         let secret = SensitiveString::new("do-not-log".into());
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn typed_firewall_object_round_trip_preserves_ownership_and_policy() {
+        let object = FirewallObject::Zone(FirewallZone {
+            id: "guest".into(),
+            ownership: ObjectOwnership::PlatformNative,
+            enabled: true,
+            networks: vec!["guest".into()],
+            input: FirewallVerdict::Reject,
+            output: FirewallVerdict::Accept,
+            forward: FirewallVerdict::Drop,
+            masquerade: false,
+            mtu_fix: true,
+        });
+        let encoded = serde_json::to_string(&object).expect("encode");
+        let decoded: FirewallObject = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, object);
+        assert_eq!(decoded.kind(), "zone");
+        assert_eq!(decoded.id(), "guest");
     }
 }

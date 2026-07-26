@@ -3446,6 +3446,7 @@ mod tests {
         ));
         let mut config = AgentConfig::default();
         config.storage.path = root.join("agent.db");
+        disable_test_free_space_guard(&mut config);
         config.llm.model = "mock".into();
         config.llm.streaming = false;
         config.llm.max_agent_steps = 4;
@@ -3478,7 +3479,7 @@ mod tests {
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
-        assert!(response.ok);
+        assert!(response.ok, "unexpected Agent response: {response:?}");
         let Some(ResponseData::Completion(completion)) = response.result else {
             panic!("expected completion");
         };
@@ -3521,6 +3522,7 @@ mod tests {
         ));
         let mut config = AgentConfig::default();
         config.storage.path = root.join("agent.db");
+        disable_test_free_space_guard(&mut config);
         config.runtime.task_timeout_secs = 1;
         config.llm.model = "mock".into();
         config.llm.streaming = false;
@@ -3625,5 +3627,10 @@ mod tests {
             ..agent_core::config::LoggingConfig::default()
         };
         logging::BoundedMakeWriter::new(&config).expect("test log writer")
+    }
+
+    fn disable_test_free_space_guard(config: &mut AgentConfig) {
+        config.storage.min_tmp_free_bytes = 0;
+        config.storage.min_tmp_free_percent = 0;
     }
 }

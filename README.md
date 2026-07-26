@@ -33,6 +33,12 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
 - Bounded rollback bundles now use typed, compiled target/reload mappings,
   SHA-256 snapshot verification, `O_NOFOLLOW`, durable atomic replacement, and
   a hidden independent `rollback-helper` mode in the same executable.
+- The firewall domain now has a platform-neutral typed model and explicit CRUD
+  planner for zones, forwarding, filter rules, homogeneous sets, and
+  masquerade/SNAT/DNAT/redirect. Matches cover CIDR, MAC, protocol, ports,
+  interfaces, zones, conntrack state, ICMP types, rate limiting, logging, and
+  ordering. Updates/deletes/moves require fresh object digests; local semantic
+  analysis raises exposure, management-path, and disruptive changes to R3.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -88,6 +94,8 @@ Boot-bound local administrator elevation is recorded in
 [ADR 0022](docs/adr/0022-boot-bound-administrator-elevation.md).
 Bounded snapshots and the independent rollback watchdog are recorded in
 [ADR 0023](docs/adr/0023-bounded-independent-rollback.md).
+The cross-platform typed firewall model and planner are recorded in
+[ADR 0024](docs/adr/0024-typed-firewall-planner.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
