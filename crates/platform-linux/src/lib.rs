@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod firewall;
+pub mod firewall_iptables;
 pub mod firewall_nft;
+mod firewall_project;
 
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;
 const DISCOVERED_COMMANDS: &[&str] = &[

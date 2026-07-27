@@ -7,14 +7,17 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-use agent_core::{FirewallInventory, FirewallMutationPlan, validate_firewall_object};
+use agent_core::{FirewallInventory, FirewallMutationPlan};
 use agent_protocol::{
-    ChangeOperation, FirewallAddressSet, FirewallDirection, FirewallFamily, FirewallFilterRule,
-    FirewallLogLevel, FirewallMatch, FirewallNatKind, FirewallNatRule, FirewallObject,
-    FirewallProtocol, FirewallRejectKind, FirewallSetEntry, FirewallVerdict, IpNetwork,
-    ObjectOwnership, PortRange,
+    FirewallAddressSet, FirewallDirection, FirewallFamily, FirewallFilterRule, FirewallLogLevel,
+    FirewallMatch, FirewallNatKind, FirewallNatRule, FirewallObject, FirewallProtocol,
+    FirewallRejectKind, FirewallSetEntry, FirewallVerdict, IpNetwork, PortRange,
 };
 use thiserror::Error;
+
+use crate::firewall_project::{FirewallProjectionError, project_agent_objects};
+#[cfg(test)]
+use agent_protocol::ObjectOwnership;
 
 const TABLE_NAME: &str = "mbed_agent";
 const OWNERSHIP_COMMENT: &str = "mbed-agent-owned:v1";
@@ -100,7 +103,11 @@ pub fn render_nftables_firewall_stage(
     plan: &FirewallMutationPlan,
     table_state: NftablesTableState,
 ) -> Result<NftablesFirewallStage, NftablesRenderError> {
-    let projected = project_agent_objects(inventory, plan)?;
+    let projected = project_agent_objects(inventory, plan).map_err(|error| match error {
+        FirewallProjectionError::InvalidObject => NftablesRenderError::InvalidObject,
+        FirewallProjectionError::Ownership => NftablesRenderError::Ownership,
+        FirewallProjectionError::PlanMismatch => NftablesRenderError::PlanMismatch,
+    })?;
     let context = RenderContext::new(&projected)?;
     let mut ruleset = String::new();
     if table_state == NftablesTableState::AgentOwned {
@@ -122,95 +129,6 @@ pub fn render_nftables_firewall_stage(
         activation: NftablesOperation::Load,
         coexistence: NftablesCoexistence::IsolatedAdditive,
     })
-}
-
-fn project_agent_objects(
-    inventory: &FirewallInventory,
-    plan: &FirewallMutationPlan,
-) -> Result<Vec<FirewallObject>, NftablesRenderError> {
-    let mut objects = HashMap::new();
-    for object in &inventory.objects {
-        validate_firewall_object(object).map_err(|_| NftablesRenderError::InvalidObject)?;
-        if object.ownership() == ObjectOwnership::AgentOwned {
-            objects.insert(
-                (object.kind().to_owned(), object.id().to_owned()),
-                object.clone(),
-            );
-        }
-    }
-    for change in &plan.changes {
-        if let Some(before) = &change.before {
-            validate_firewall_object(before).map_err(|_| NftablesRenderError::InvalidObject)?;
-        }
-        if let Some(after) = &change.after {
-            validate_firewall_object(after).map_err(|_| NftablesRenderError::InvalidObject)?;
-        }
-        let changed = change
-            .after
-            .as_ref()
-            .or(change.before.as_ref())
-            .ok_or(NftablesRenderError::PlanMismatch)?;
-        if change.diff.object.kind != changed.kind()
-            || change.diff.object.id != changed.id()
-            || change.diff.object.ownership != ObjectOwnership::AgentOwned
-            || changed.ownership() != ObjectOwnership::AgentOwned
-            || change
-                .before
-                .as_ref()
-                .is_some_and(|object| object.ownership() != ObjectOwnership::AgentOwned)
-            || change
-                .after
-                .as_ref()
-                .is_some_and(|object| object.ownership() != ObjectOwnership::AgentOwned)
-        {
-            return Err(NftablesRenderError::Ownership);
-        }
-        let key = (changed.kind().to_owned(), changed.id().to_owned());
-        match change.diff.operation {
-            ChangeOperation::Create => {
-                let after = change
-                    .after
-                    .as_ref()
-                    .filter(|_| change.before.is_none())
-                    .ok_or(NftablesRenderError::PlanMismatch)?;
-                if objects.insert(key, after.clone()).is_some() {
-                    return Err(NftablesRenderError::PlanMismatch);
-                }
-            }
-            ChangeOperation::Update | ChangeOperation::Move => {
-                let before = change
-                    .before
-                    .as_ref()
-                    .ok_or(NftablesRenderError::PlanMismatch)?;
-                let after = change
-                    .after
-                    .as_ref()
-                    .ok_or(NftablesRenderError::PlanMismatch)?;
-                if objects.get(&key) != Some(before) {
-                    return Err(NftablesRenderError::PlanMismatch);
-                }
-                objects.insert(key, after.clone());
-            }
-            ChangeOperation::Delete => {
-                let before = change
-                    .before
-                    .as_ref()
-                    .filter(|_| change.after.is_none())
-                    .ok_or(NftablesRenderError::PlanMismatch)?;
-                if objects.get(&key) != Some(before) {
-                    return Err(NftablesRenderError::PlanMismatch);
-                }
-                objects.remove(&key);
-            }
-        }
-    }
-    let mut projected: Vec<FirewallObject> = objects.into_values().collect();
-    projected.sort_by(|left, right| {
-        left.kind()
-            .cmp(right.kind())
-            .then_with(|| left.id().cmp(right.id()))
-    });
-    Ok(projected)
 }
 
 struct NftSet {

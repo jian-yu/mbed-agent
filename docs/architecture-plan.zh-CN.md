@@ -1095,8 +1095,13 @@ inventory 联合解析，未知平台扩展 option 保留，写入只发生在 `
 state 与 masquerade/SNAT/DNAT/redirect 均走 typed renderer，并生成固定
 `nft --check --file`/`nft --file` 契约。隔离 base chain 明确标记为 additive
 coexistence：drop 是最终裁决，但 accept 不能越过其他更晚 base chain 的 drop。
-iptables renderer、ChangeSet 执行编排、live apply/verify/confirm 尚是下一纵向
-切片，未完成前公共写接口保持关闭。
+iptables/ip6tables staging renderer 同样已完成：每个地址族只拥有六个固定
+filter/mangle/nat chain，首次在 builtin chain 末尾添加一次带 ownership comment
+的 jump，之后利用 `*-restore --noflush` 仅重建自有 chain，不回放或 flush 主机
+规则；typed set 有界展开，双栈 filter、zone/forwarding、TCPMSS、masquerade/
+SNAT/DNAT/redirect 均支持，且 IPv4/IPv6 的 `--test` 必须先全部通过。由于跨
+table/地址族不是单一原子提交，该后端强制独立 rollback。ChangeSet 执行编排、
+live apply/verify/confirm 尚是下一纵向切片，未完成前公共写接口保持关闭。
 
 ## 21. 参考项目与官方资料
 

@@ -52,6 +52,12 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   operations. Existing host tables are never rewritten. Its explicit
   additive-coexistence capability notes that Agent drops are final while
   accepts cannot override a later distribution-owned drop.
+- Generic Linux iptables/ip6tables staging now owns six fixed filter, mangle,
+  and NAT chains per address family. It appends one ownership-marked hook,
+  rebuilds only those chains through no-flush restore, expands typed
+  network/MAC/port sets within hard limits, supports dual-stack filtering and
+  NAT, and requires both restore `--test` checks plus independent rollback.
+  Partial, duplicated, or foreign same-name chain state is never adopted.
 - Runtime discovery for OpenWrt version, fw3/iptables, fw4/nftables, swconfig/DSA, ubus/UCI/procd, and opkg/apk.
 - First-class generic Linux discovery using iproute2, native nftables/iptables,
   systemd-resolved, NetworkManager, and `/etc/resolv.conf`, without attempting
@@ -113,6 +119,8 @@ OpenWrt fw3/fw4 UCI staging and native validation are recorded in
 [ADR 0025](docs/adr/0025-openwrt-firewall-staging.md).
 Generic Linux isolated nftables staging is recorded in
 [ADR 0026](docs/adr/0026-generic-linux-nftables-staging.md).
+Generic Linux isolated iptables/ip6tables staging is recorded in
+[ADR 0027](docs/adr/0027-generic-linux-iptables-staging.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
