@@ -1010,6 +1010,11 @@ verification 和 confirmation 的唯一顺序，并覆盖故障注入。当前�
 工具，因为具体平台 execution port、受限命令执行、daemon apply/confirm API 与
 apply 后业务探针尚未全部接通。
 
+受限原生命令层已实现 closed enum：只支持 UCI/fw3/fw4、nftables 和双栈
+iptables 的固定检查与加载动作；清空环境并直接启动进程，不使用 shell。stdin、
+stdout/stderr、超时以及 `/tmp` staging 文件均有硬上限，canonical path 校验会拒绝
+符号链接和父目录逃逸。该层不是独立写 API，只能由后续 execution port 调用。
+
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
 1. **防火墙完整策略**：OpenWrt UCI fw3/fw4 与普通 Linux nftables/iptables

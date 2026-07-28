@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod firewall;
+pub mod firewall_command;
 pub mod firewall_inventory;
 pub mod firewall_iptables;
 pub mod firewall_nft;
