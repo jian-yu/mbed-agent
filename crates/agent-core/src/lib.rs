@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod changes;
 pub mod config;
+pub mod execution;
 pub mod firewall;
 pub mod resources;
 pub mod rollback;
@@ -12,6 +13,10 @@ pub use changes::{
     ChangePlanError, ChangeTransitionError, assess_plan, plan_digest, transition_change_set,
 };
 pub use config::{AgentConfig, ConfigError, Profile};
+pub use execution::{
+    ChangeExecutionError, ChangeExecutionPort, ExecutionOutcome, ExecutionPortError,
+    ExecutionStage, confirm_awaiting_execution, execute_approved_change,
+};
 pub use firewall::{
     FirewallInventory, FirewallMutation, FirewallMutationPlan, FirewallPlanError,
     FirewallPlannedChange, FirewallRiskContext, firewall_object_digest, plan_firewall_mutations,

@@ -1003,9 +1003,12 @@ OpenWrt 防火墙已可从同一份有界 `uci show firewall` 快照重建 typed
 精确 section binding、全部已占用 section 和只读 vendor section。解析不执行
 shell，Agent-owned section 出现无法精确表达的漂移会整体失败；snapshot 字段
 不可由外部构造或修改，staging 会再次核对 before/after digest 并防止确定性
-section 名覆盖 vendor 配置。当前仍未开放公共写工具，因为领域执行编排、普通
-Linux 运行态 inventory/rollback adapter、apply 后验证与 confirmed-commit 尚未
-连成完整运行时闭环。
+section 名覆盖 vendor 配置。普通 Linux 已实现 boot-bound `/tmp` canonical
+inventory，并与 Agent-owned nftables/iptables 原生摘要相互校验。领域无关执行
+协调器现已固定二次检查、staging、native validation、rollback arm、activation、
+verification 和 confirmation 的唯一顺序，并覆盖故障注入。当前仍未开放公共写
+工具，因为具体平台 execution port、受限命令执行、daemon apply/confirm API 与
+apply 后业务探针尚未全部接通。
 
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
