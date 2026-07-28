@@ -125,6 +125,9 @@ Generic Linux isolated iptables/ip6tables staging is recorded in
 [ADR 0027](docs/adr/0027-generic-linux-iptables-staging.md).
 The same-binary ChangeSet inspection and approval control surface is recorded in
 [ADR 0028](docs/adr/0028-changeset-cli-approval-control.md).
+Bounded fresh OpenWrt UCI inventory reconstruction and snapshot-bound rendering
+are recorded in
+[ADR 0029](docs/adr/0029-openwrt-firewall-fresh-inventory.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

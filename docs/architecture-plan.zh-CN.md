@@ -997,9 +997,14 @@ payload 分别受 `storage.max_change_set_records` 和
 同一 `mbed-agent` 二进制现已提供 ChangeSet 查看、拒绝和审批控制面：审批前会
 重新解析并校验规范化计划及 actor/boot/risk/lifetime/digest 绑定，只有当前
 `device-admin` 可签发 256-bit 一次性 token，SQLite 仅保存 token digest。
-审批不会提前进入 `Approved`，必须由后续 apply 原子消费精确 token。当前仍未
-开放公共写工具，因为领域执行编排、运行态 rollback adapter、apply 后验证与
-confirmed-commit 尚未连成完整运行时闭环。
+审批不会提前进入 `Approved`，必须由后续 apply 原子消费精确 token。
+OpenWrt 防火墙已可从同一份有界 `uci show firewall` 快照重建 typed inventory、
+精确 section binding、全部已占用 section 和只读 vendor section。解析不执行
+shell，Agent-owned section 出现无法精确表达的漂移会整体失败；snapshot 字段
+不可由外部构造或修改，staging 会再次核对 before/after digest 并防止确定性
+section 名覆盖 vendor 配置。当前仍未开放公共写工具，因为领域执行编排、普通
+Linux 运行态 inventory/rollback adapter、apply 后验证与 confirmed-commit 尚未
+连成完整运行时闭环。
 
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 

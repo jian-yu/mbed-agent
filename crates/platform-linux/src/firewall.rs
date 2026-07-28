@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use agent_core::{FirewallInventory, FirewallMutationPlan, validate_firewall_object};
+use agent_core::{
+    FirewallInventory, FirewallMutationPlan, firewall_object_digest, validate_firewall_object,
+};
 use agent_protocol::{
     ChangeOperation, FirewallDirection, FirewallFamily, FirewallFilterRule, FirewallMatch,
     FirewallNatKind, FirewallNatRule, FirewallObject, FirewallProtocol, FirewallSetEntry,
@@ -14,13 +16,13 @@ use agent_protocol::{
 };
 use thiserror::Error;
 
+use crate::firewall_inventory::OpenWrtFirewallInventorySnapshot;
+use crate::firewall_uci::{UciSection, parse_uci_show, safe_uci_identifier, valid_section};
 use crate::{FirewallBackend, PlatformCapabilities, PlatformKind};
 
 const MAX_BINDINGS: usize = 256;
 const MAX_PRESENT_OPTIONS: usize = 64;
 const MAX_BATCH_BYTES: usize = 128 * 1024;
-const MAX_UCI_SHOW_BYTES: usize = 256 * 1024;
-const MAX_UCI_SHOW_LINES: usize = 4_096;
 
 /// A firewall backend that is safe to use for configuration writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,8 +125,8 @@ pub fn inspect_openwrt_object_bindings(
     let mut claimed = HashSet::new();
     for object in &inventory.objects {
         validate_firewall_object(object).map_err(|_| FirewallRenderError::InvalidObject)?;
-        let candidates: Vec<&ParsedUciSection> = sections
-            .values()
+        let candidates: Vec<&UciSection> = sections
+            .iter()
             .filter(|section| section_matches_object(section, object))
             .collect();
         if candidates.len() > 1 {
@@ -161,19 +163,121 @@ pub fn inspect_openwrt_object_bindings(
 ///
 /// Returns an error for unsafe/stale bindings, unsupported UCI semantics, invalid objects,
 /// duplicate sections, or an oversized output artifact.
-pub fn render_openwrt_firewall_stage(
+#[cfg(test)]
+fn render_openwrt_firewall_stage(
     plan: &FirewallMutationPlan,
     bindings: &[OpenWrtObjectBinding],
+    backend: FirewallBackend,
+) -> Result<OpenWrtFirewallStage, FirewallRenderError> {
+    render_openwrt_firewall_stage_inner(plan, bindings, &[], backend)
+}
+
+/// Renders against a fresh inventory snapshot while reserving every existing UCI section.
+///
+/// # Errors
+///
+/// Returns a closed error when the snapshot, plan, or backend cannot be represented safely.
+pub fn render_openwrt_firewall_stage_from_snapshot(
+    plan: &FirewallMutationPlan,
+    snapshot: &OpenWrtFirewallInventorySnapshot,
+    backend: FirewallBackend,
+) -> Result<OpenWrtFirewallStage, FirewallRenderError> {
+    validate_plan_against_snapshot(plan, snapshot)?;
+    render_openwrt_firewall_stage_inner(
+        plan,
+        snapshot.bindings(),
+        snapshot.occupied_sections(),
+        backend,
+    )
+}
+
+fn validate_plan_against_snapshot(
+    plan: &FirewallMutationPlan,
+    snapshot: &OpenWrtFirewallInventorySnapshot,
+) -> Result<(), FirewallRenderError> {
+    if plan.changes.is_empty() || plan.changes.len() > 32 {
+        return Err(FirewallRenderError::PlanMismatch);
+    }
+    let inventory: HashMap<(&str, &str), &FirewallObject> = snapshot
+        .inventory()
+        .objects
+        .iter()
+        .map(|object| ((object.kind(), object.id()), object))
+        .collect();
+    if inventory.len() != snapshot.inventory().objects.len() {
+        return Err(FirewallRenderError::DuplicateInventoryObject);
+    }
+    let mut touched = HashSet::new();
+    for change in &plan.changes {
+        let object = change
+            .after
+            .as_ref()
+            .or(change.before.as_ref())
+            .ok_or(FirewallRenderError::PlanMismatch)?;
+        let key = (object.kind(), object.id());
+        if !touched.insert(key)
+            || change.diff.object.kind != key.0
+            || change.diff.object.id != key.1
+            || change.diff.object.ownership != object.ownership()
+        {
+            return Err(FirewallRenderError::PlanMismatch);
+        }
+        let before_digest = change
+            .before
+            .as_ref()
+            .map(firewall_object_digest)
+            .transpose()
+            .map_err(|_| FirewallRenderError::InvalidObject)?;
+        let after_digest = change
+            .after
+            .as_ref()
+            .map(firewall_object_digest)
+            .transpose()
+            .map_err(|_| FirewallRenderError::InvalidObject)?;
+        if change.diff.before_digest != before_digest
+            || change.diff.after_digest != after_digest
+            || change.diff.object.expected_version != before_digest
+        {
+            return Err(FirewallRenderError::PlanMismatch);
+        }
+        match change.diff.operation {
+            ChangeOperation::Create
+                if change.before.is_none()
+                    && change.after.is_some()
+                    && !inventory.contains_key(&key) => {}
+            ChangeOperation::Update | ChangeOperation::Move
+                if change.before.as_ref() == inventory.get(&key).copied()
+                    && change.after.is_some() => {}
+            ChangeOperation::Delete
+                if change.before.as_ref() == inventory.get(&key).copied()
+                    && change.after.is_none() => {}
+            _ => return Err(FirewallRenderError::PlanMismatch),
+        }
+    }
+    Ok(())
+}
+
+fn render_openwrt_firewall_stage_inner(
+    plan: &FirewallMutationPlan,
+    bindings: &[OpenWrtObjectBinding],
+    occupied_sections: &[String],
     backend: FirewallBackend,
 ) -> Result<OpenWrtFirewallStage, FirewallRenderError> {
     if !matches!(backend, FirewallBackend::Fw3 | FirewallBackend::Fw4) {
         return Err(FirewallRenderError::WrongBackend);
     }
     let bindings = validate_bindings(bindings)?;
-    let mut reserved_sections: HashSet<String> = bindings
-        .values()
-        .map(|binding| binding.section.clone())
-        .collect();
+    let mut reserved_sections: HashSet<String> = occupied_sections.iter().cloned().collect();
+    if reserved_sections.len() != occupied_sections.len() {
+        return Err(FirewallRenderError::DuplicateSection);
+    }
+    for binding in bindings.values() {
+        if occupied_sections.is_empty() {
+            reserved_sections.insert(binding.section.clone());
+        } else if !reserved_sections.contains(&binding.section) {
+            return Err(FirewallRenderError::UnsafeBinding);
+        }
+    }
     let mut batch = String::new();
 
     for change in &plan.changes {
@@ -243,130 +347,17 @@ pub fn render_openwrt_firewall_stage(
     })
 }
 
-struct ParsedUciSection {
-    selector: String,
-    section_type: String,
-    options: HashMap<String, String>,
-}
-
-fn parse_uci_show(
-    uci_show: &str,
-) -> Result<HashMap<String, ParsedUciSection>, FirewallRenderError> {
-    if uci_show.len() > MAX_UCI_SHOW_BYTES
-        || uci_show.lines().count() > MAX_UCI_SHOW_LINES
-        || uci_show.lines().any(|line| line.len() > 2_048)
-    {
-        return Err(FirewallRenderError::Capacity);
-    }
-    let mut sections = HashMap::new();
-    let mut ignored_sections = HashSet::new();
-    let mut defined_sections = HashSet::new();
-    for line in uci_show.lines().filter(|line| !line.trim().is_empty()) {
-        let (key, raw_value) = line
-            .split_once('=')
-            .ok_or(FirewallRenderError::MalformedUci)?;
-        let key = key
-            .strip_prefix("firewall.")
-            .ok_or(FirewallRenderError::MalformedUci)?;
-        if key.contains('.') {
-            continue;
-        }
-        let section_type = parse_uci_atom(raw_value)?;
-        if !safe_uci_identifier(&section_type) || !valid_section(key, &section_type) {
-            return Err(FirewallRenderError::MalformedUci);
-        }
-        if !defined_sections.insert(key) {
-            return Err(FirewallRenderError::MalformedUci);
-        }
-        if !matches!(
-            section_type.as_str(),
-            "zone" | "forwarding" | "rule" | "ipset" | "redirect" | "nat"
-        ) {
-            ignored_sections.insert(key);
-            continue;
-        }
-        if sections
-            .insert(
-                key.into(),
-                ParsedUciSection {
-                    selector: key.into(),
-                    section_type,
-                    options: HashMap::new(),
-                },
-            )
-            .is_some()
-        {
-            return Err(FirewallRenderError::MalformedUci);
-        }
-    }
-    if sections.len() > MAX_BINDINGS {
-        return Err(FirewallRenderError::Capacity);
-    }
-    for line in uci_show.lines().filter(|line| !line.trim().is_empty()) {
-        let (key, raw_value) = line
-            .split_once('=')
-            .ok_or(FirewallRenderError::MalformedUci)?;
-        let key = key
-            .strip_prefix("firewall.")
-            .ok_or(FirewallRenderError::MalformedUci)?;
-        let Some((selector, option)) = key.rsplit_once('.') else {
-            continue;
-        };
-        if !safe_uci_identifier(option) {
-            return Err(FirewallRenderError::MalformedUci);
-        }
-        let Some(section) = sections.get_mut(selector) else {
-            if ignored_sections.contains(selector) {
-                continue;
-            }
-            return Err(FirewallRenderError::MalformedUci);
-        };
-        let value = if matches!(option, "name" | "src" | "dest") {
-            parse_uci_atom(raw_value).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if section.options.len() >= MAX_PRESENT_OPTIONS
-            || section.options.insert(option.into(), value).is_some()
-        {
-            return Err(FirewallRenderError::MalformedUci);
-        }
-    }
-    Ok(sections)
-}
-
-fn parse_uci_atom(value: &str) -> Result<String, FirewallRenderError> {
-    let value = value.trim();
-    let value = if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-        &value[1..value.len() - 1]
-    } else if value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
-    }) {
-        value
-    } else {
-        return Err(FirewallRenderError::MalformedUci);
-    };
-    if value.len() > 1_024
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\'' | b'\\'))
-    {
-        return Err(FirewallRenderError::MalformedUci);
-    }
-    Ok(value.into())
-}
-
-fn section_matches_object(section: &ParsedUciSection, object: &FirewallObject) -> bool {
+fn section_matches_object(section: &UciSection, object: &FirewallObject) -> bool {
     if !valid_section_type(&section.section_type, object.kind()) {
         return false;
     }
-    let name_matches = section.options.get("name").map(String::as_str) == Some(object.id());
+    let name_matches = section.first("name") == Some(object.id());
     match object {
         FirewallObject::Forwarding(forwarding) => {
             name_matches
                 || (!section.options.contains_key("name")
-                    && section.options.get("src") == Some(&forwarding.source_zone)
-                    && section.options.get("dest") == Some(&forwarding.destination_zone))
+                    && section.first("src") == Some(&forwarding.source_zone)
+                    && section.first("dest") == Some(&forwarding.destination_zone))
         }
         FirewallObject::FilterRule(_) | FirewallObject::NatRule(_) => {
             name_matches
@@ -377,7 +368,7 @@ fn section_matches_object(section: &ParsedUciSection, object: &FirewallObject) -
     }
 }
 
-fn fallback_section_id(section: &ParsedUciSection) -> Option<String> {
+fn fallback_section_id(section: &UciSection) -> Option<String> {
     let index = section
         .selector
         .strip_prefix('@')?
@@ -973,21 +964,6 @@ fn agent_section_name(kind: &str, digest: &str) -> Result<String, FirewallRender
     ))
 }
 
-fn valid_section(section: &str, section_type: &str) -> bool {
-    if safe_uci_identifier(section) {
-        return true;
-    }
-    let Some(index) = section
-        .strip_prefix('@')
-        .and_then(|value| value.strip_prefix(section_type))
-        .and_then(|value| value.strip_prefix('['))
-        .and_then(|value| value.strip_suffix(']'))
-    else {
-        return false;
-    };
-    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 fn valid_section_type(section_type: &str, kind: &str) -> bool {
     matches!(
         (kind, section_type),
@@ -997,14 +973,6 @@ fn valid_section_type(section_type: &str, kind: &str) -> bool {
             | ("address_set", "ipset")
             | ("nat_rule", "redirect" | "nat")
     )
-}
-
-fn safe_uci_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn safe_identifier(value: &str) -> bool {
@@ -1107,6 +1075,12 @@ pub enum FirewallRenderError {
     AmbiguousBinding,
     #[error("UCI firewall inventory output is malformed")]
     MalformedUci,
+    #[error("an Agent-owned UCI firewall section cannot be represented safely: {0}")]
+    UnsupportedManagedSection(String),
+    #[error("typed firewall inventory contains a duplicate object identity")]
+    DuplicateInventoryObject,
+    #[error("typed firewall inventory is ambiguous")]
+    AmbiguousInventory,
     #[error("unsafe value cannot be represented in a UCI batch")]
     UnsafeValue,
     #[error("OpenWrt UCI cannot safely represent: {0}")]
@@ -1131,6 +1105,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::firewall_inventory::inspect_openwrt_firewall_inventory;
     use crate::{
         FirewallCapabilities, InitSystem, NetworkDeviceModel, PackageManager, PlatformCapabilities,
     };
@@ -1261,6 +1236,48 @@ mod tests {
         assert!(stage.uci_batch.contains(".entry='198.51.100.0/24'"));
         assert!(stage.uci_batch.contains(".ipset='blocked-nets src'"));
         assert!(!stage.uci_batch.contains(".storage="));
+    }
+
+    #[test]
+    fn fresh_snapshot_reserves_even_a_conflicting_existing_managed_section() {
+        let desired = FirewallObject::FilterRule(FirewallFilterRule {
+            id: "new-rule".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            direction: FirewallDirection::Input,
+            matches: FirewallMatch::default(),
+            verdict: FirewallVerdict::Drop,
+            reject_with: None,
+            rate_limit: None,
+            log: None,
+            order: 10,
+        });
+        let digest = firewall_object_digest(&desired).expect("digest");
+        let section = format!("mbed_r_{}", &digest[..16]);
+        let show = format!(
+            "firewall.{section}=rule\n\
+             firewall.{section}.name='existing-rule'\n\
+             firewall.{section}.enabled='1'\n\
+             firewall.{section}.family='any'\n\
+             firewall.{section}.target='DROP'\n"
+        );
+        let snapshot = inspect_openwrt_firewall_inventory(&show).expect("fresh snapshot");
+        let plan = plan_firewall_mutations(
+            snapshot.inventory(),
+            &[FirewallMutation::Create(desired)],
+            &FirewallRiskContext::default(),
+        )
+        .expect("plan");
+        assert_eq!(
+            render_openwrt_firewall_stage_from_snapshot(&plan, &snapshot, FirewallBackend::Fw4),
+            Err(FirewallRenderError::DuplicateSection)
+        );
+        let mut forged = plan;
+        forged.changes[0].diff.after_digest = Some("f".repeat(64));
+        assert_eq!(
+            render_openwrt_firewall_stage_from_snapshot(&forged, &snapshot, FirewallBackend::Fw4),
+            Err(FirewallRenderError::PlanMismatch)
+        );
     }
 
     #[test]
