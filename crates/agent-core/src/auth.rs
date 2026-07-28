@@ -144,6 +144,11 @@ pub struct AuthManager {
 
 impl AuthManager {
     #[must_use]
+    pub fn boot_id(&self) -> &str {
+        &self.boot_id
+    }
+
+    #[must_use]
     pub fn disabled(boot_id: String) -> Self {
         Self {
             verifier: None,

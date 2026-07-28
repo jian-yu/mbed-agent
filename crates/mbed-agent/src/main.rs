@@ -64,6 +64,11 @@ enum CliCommand {
         #[command(subcommand)]
         target: AuthTarget,
     },
+    /// Inspect and authorize bounded configuration changes.
+    Change {
+        #[command(subcommand)]
+        target: ChangeTarget,
+    },
     #[command(hide = true)]
     RollbackHelper {
         transaction_id: String,
@@ -173,6 +178,28 @@ enum AuthTarget {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ChangeTarget {
+    /// Show one typed plan and its current volatile state.
+    Get {
+        change_set_id: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Issue a one-use approval token for an exact plan as device-admin.
+    Approve {
+        change_set_id: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Reject a pending plan owned by the local actor.
+    Reject {
+        change_set_id: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Args::parse().command {
@@ -255,6 +282,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await
         }
+        CliCommand::Change { target } => run_change_target(target).await,
         CliCommand::RollbackHelper {
             transaction_id,
             config,
@@ -272,6 +300,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )?;
             Ok(())
         }
+    }
+}
+
+async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
+    match target {
+        ChangeTarget::Get {
+            change_set_id,
+            socket,
+        } => run_client(&socket, Command::ChangeGet { change_set_id }).await,
+        ChangeTarget::Approve {
+            change_set_id,
+            socket,
+        } => run_client(&socket, Command::ChangeApprove { change_set_id }).await,
+        ChangeTarget::Reject {
+            change_set_id,
+            socket,
+        } => run_client(&socket, Command::ChangeReject { change_set_id }).await,
     }
 }
 
@@ -314,10 +359,11 @@ async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error
     stream.write_all(&payload).await?;
 
     let mut reader = BufReader::new(stream);
-    let mut response = String::new();
+    let mut response = Zeroizing::new(String::new());
     reader.read_line(&mut response).await?;
     let response: ServerResponse = serde_json::from_str(&response)?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    let rendered = Zeroizing::new(serde_json::to_string_pretty(&response)?);
+    println!("{}", rendered.as_str());
     if response.ok {
         Ok(())
     } else {

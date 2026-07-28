@@ -993,8 +993,12 @@ rollback arm 只能通过带未来 monotonic deadline 的专用事务完成。�
 payload 分别受 `storage.max_change_set_records` 和
 `storage.max_change_plan_bytes` 限制，设备重启随 `/tmp` 一起清空。
 管理员密码校验与 boot-bound `device-admin` 已实现；有界 snapshot/journal、
-同一二进制隐藏 `rollback-helper`、独立 watchdog 和原子恢复也已实现。当前仍未
-开放公共写工具，因为 approval token 签发、领域执行编排、apply 后验证与
+同一二进制隐藏 `rollback-helper`、独立 watchdog 和原子恢复也已实现。
+同一 `mbed-agent` 二进制现已提供 ChangeSet 查看、拒绝和审批控制面：审批前会
+重新解析并校验规范化计划及 actor/boot/risk/lifetime/digest 绑定，只有当前
+`device-admin` 可签发 256-bit 一次性 token，SQLite 仅保存 token digest。
+审批不会提前进入 `Approved`，必须由后续 apply 原子消费精确 token。当前仍未
+开放公共写工具，因为领域执行编排、运行态 rollback adapter、apply 后验证与
 confirmed-commit 尚未连成完整运行时闭环。
 
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）

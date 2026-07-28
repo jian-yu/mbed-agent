@@ -35,6 +35,9 @@ pub enum Command {
     DiagnoseConntrack,
     DiagnoseQdisc,
     Elevate { password: SensitiveString },
+    ChangeGet { change_set_id: String },
+    ChangeApprove { change_set_id: String },
+    ChangeReject { change_set_id: String },
     DiagnosticHistory { limit: u16 },
     TaskHistory { limit: u16 },
     Complete { prompt: String },
@@ -98,6 +101,8 @@ pub enum ResponseData {
     ConntrackDiagnostic(Box<ConntrackDiagnosticReport>),
     QdiscDiagnostic(Box<QdiscDiagnosticReport>),
     Elevation(ElevationResponse),
+    ChangeSet(ChangeSetResponse),
+    ChangeApproval(ChangeApprovalResponse),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -141,6 +146,26 @@ pub struct ElevationResponse {
     pub actor_id: String,
     pub role: String,
     pub boot_id: String,
+    pub expires_monotonic_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeSetResponse {
+    pub change_set_id: String,
+    pub plan_digest: String,
+    pub plan: ChangePlan,
+    pub state: ChangeSetState,
+    pub rollback_deadline_monotonic_ms: Option<u64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeApprovalResponse {
+    pub approval_id: String,
+    pub change_set_id: String,
+    pub plan_digest: String,
+    pub token: SensitiveString,
     pub expires_monotonic_ms: u64,
 }
 
@@ -1289,6 +1314,8 @@ pub struct ProtocolError {
 pub enum ErrorCode {
     InvalidRequest,
     Unauthorized,
+    NotFound,
+    Conflict,
     UnsupportedProtocol,
     Internal,
     ResourceExhausted,
@@ -1302,6 +1329,8 @@ impl ErrorCode {
         match self {
             Self::InvalidRequest => "invalid_request",
             Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::Internal => "internal",
             Self::ResourceExhausted => "resource_exhausted",
@@ -1333,6 +1362,15 @@ mod tests {
             Command::DiagnoseQdisc,
             Command::Elevate {
                 password: SensitiveString::new("secret".into()),
+            },
+            Command::ChangeGet {
+                change_set_id: "change-1".into(),
+            },
+            Command::ChangeApprove {
+                change_set_id: "change-1".into(),
+            },
+            Command::ChangeReject {
+                change_set_id: "change-1".into(),
             },
         ] {
             let request = ClientRequest {

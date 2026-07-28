@@ -93,8 +93,10 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   commands.
 
 Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
-Channel-facing elevation, and configuration transactions are planned but are
-not implemented yet. The configuration roadmap is intentionally broader than a
+Channel-facing elevation, and configuration execution are not implemented yet.
+The local CLI now exposes actor/boot/plan-bound ChangeSet inspection, rejection,
+and device-admin approval with a one-use token; apply remains closed until the
+full executor is connected. The configuration roadmap is intentionally broader than a
 few fixed operations: it targets capability-gated typed CRUD for firewall,
 interfaces/addresses, bridges/VLANs, routes, DNS/DHCP, wireless, controlled
 services, QoS, and WireGuard. OpenWrt will use UCI and its native fw3/fw4/netifd
@@ -121,6 +123,8 @@ Generic Linux isolated nftables staging is recorded in
 [ADR 0026](docs/adr/0026-generic-linux-nftables-staging.md).
 Generic Linux isolated iptables/ip6tables staging is recorded in
 [ADR 0027](docs/adr/0027-generic-linux-iptables-staging.md).
+The same-binary ChangeSet inspection and approval control surface is recorded in
+[ADR 0028](docs/adr/0028-changeset-cli-approval-control.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -186,6 +190,21 @@ on daemon restart. Failed authentication is rate-limited per actor with
 `auth.max_failures` and `auth.lockout_secs`. The same authenticator is designed
 for verified MQTT, WeCom, and WeChat actors, but those adapters are not connected
 yet. Passwords are never accepted as command-line arguments.
+
+Daemon-created plans can be inspected, approved, or rejected through the same
+binary:
+
+```sh
+cargo run -p mbed-agent -- change get CHANGE_SET_ID
+cargo run -p mbed-agent -- change approve CHANGE_SET_ID
+cargo run -p mbed-agent -- change reject CHANGE_SET_ID
+```
+
+Approval requires a current local `device-admin` elevation. Its response contains
+the raw one-use token exactly once; only its digest is retained in `/tmp`
+SQLite. Approval does not apply the plan, and no public apply command is exposed
+until staging, native validation, independent rollback, runtime verification,
+and confirmation are connected.
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart

@@ -2,22 +2,29 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_core::{AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, TmpBudget};
+use agent_core::{
+    AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, TmpBudget, plan_digest,
+};
 use agent_protocol::{
-    ClientRequest, Command, CompletionResponse, DiagnosticHistoryEntry, ErrorCode,
-    PROTOCOL_VERSION, ResponseData, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
+    ChangeApprovalResponse, ChangePlan, ChangeSetResponse, ChangeSetState, ClientRequest, Command,
+    CompletionResponse, DiagnosticHistoryEntry, ErrorCode, PROTOCOL_VERSION, ResponseData,
+    SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
     TaskHistoryEntry,
 };
 use agent_provider::{
     CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
     ToolDefinition,
 };
-use agent_store::{DiagnosticRecord, Store, TaskRecord};
+use agent_store::{
+    ApprovalRecord, ChangeSetRecord, DiagnosticRecord, Store, StoreError, TaskRecord,
+};
 use agent_tools::ToolRunner;
 use platform_linux::PlatformCapabilities;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -31,6 +38,7 @@ use zeroize::Zeroizing;
 use crate::logging;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LOCAL_CLI_ACTOR: &str = "cli/local";
 
 struct AppState {
     config: AgentConfig,
@@ -309,7 +317,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<AppState>) -> io::Resul
                 format!("invalid JSON request: {error}"),
             ),
         };
-        let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        let mut encoded = Zeroizing::new(serde_json::to_vec(&response).map_err(io::Error::other)?);
         encoded.push(b'\n');
         write_half.write_all(&encoded).await?;
     }
@@ -352,6 +360,15 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::Status => status_response(state),
         Command::Elevate { password } => {
             return handle_elevation(request.id, password.into_inner(), state).await;
+        }
+        Command::ChangeGet { change_set_id } => {
+            return handle_change_get(request.id, change_set_id, state).await;
+        }
+        Command::ChangeApprove { change_set_id } => {
+            return handle_change_approve(request.id, change_set_id, state).await;
+        }
+        Command::ChangeReject { change_set_id } => {
+            return handle_change_reject(request.id, change_set_id, state).await;
         }
         Command::DiagnoseWan { active } => {
             return handle_wan_diagnosis(request.id, active, state).await;
@@ -406,7 +423,6 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
 }
 
 async fn handle_elevation(id: String, password: String, state: &AppState) -> ServerResponse {
-    const LOCAL_CLI_ACTOR: &str = "cli/local";
     let password = Zeroizing::new(password);
     let auth = Arc::clone(&state.auth);
     let now_monotonic_ms = u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -468,6 +484,382 @@ async fn handle_elevation(id: String, password: String, state: &AppState) -> Ser
             )
         }
     }
+}
+
+async fn handle_change_get(id: String, change_set_id: String, state: &AppState) -> ServerResponse {
+    if !valid_change_set_id(&change_set_id) {
+        return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
+    }
+    let store = Arc::clone(&state.store);
+    let lookup_id = change_set_id.clone();
+    match tokio::task::spawn_blocking(move || store.change_set(&lookup_id)).await {
+        Ok(Ok(Some(record))) => match change_set_response(record, LOCAL_CLI_ACTOR, state) {
+            Ok(response) => ServerResponse::success(id, ResponseData::ChangeSet(response)),
+            Err(response) => response.with_id(id),
+        },
+        Ok(Ok(None)) => ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found"),
+        Ok(Err(error)) => store_error_response(id, &error),
+        Err(error) => {
+            error!(%error, "ChangeSet lookup worker failed");
+            ServerResponse::error(id, ErrorCode::Internal, "ChangeSet storage is unavailable")
+        }
+    }
+}
+
+async fn handle_change_approve(
+    id: String,
+    change_set_id: String,
+    state: &AppState,
+) -> ServerResponse {
+    if !valid_change_set_id(&change_set_id) {
+        return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
+    }
+    let capability_now = process_monotonic_ms(state);
+    match state.auth.is_device_admin(LOCAL_CLI_ACTOR, capability_now) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Unauthorized,
+                "device-admin elevation is required",
+            );
+        }
+        Err(error) => {
+            error!(%error, "administrator capability check failed");
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            );
+        }
+    }
+    let now = match boot_monotonic_ms() {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+
+    let Some(record) = load_change_set(&id, &change_set_id, state).await else {
+        return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
+    };
+    if let Err(response) = change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+        return response.with_id(id);
+    }
+    if record.state != ChangeSetState::AwaitingApproval {
+        return ServerResponse::error(
+            id,
+            ErrorCode::Conflict,
+            "ChangeSet is not awaiting approval",
+        );
+    }
+    if now >= record.expires_monotonic_ms {
+        return ServerResponse::error(id, ErrorCode::Conflict, "ChangeSet plan has expired");
+    }
+
+    let approval_id = match random_hex(16) {
+        Ok(value) => value,
+        Err(response) => return response.with_id(id),
+    };
+    let token = match random_hex(32) {
+        Ok(value) => value,
+        Err(response) => return response.with_id(id),
+    };
+    let expires_monotonic_ms = now
+        .saturating_add(state.config.auth.approval_ttl_secs.saturating_mul(1_000))
+        .min(record.expires_monotonic_ms);
+    let approval = ApprovalRecord {
+        id: approval_id.clone(),
+        change_set_id: record.id.clone(),
+        actor_id: record.actor_id.clone(),
+        plan_digest: record.plan_digest.clone(),
+        boot_id: record.boot_id.clone(),
+        token_digest: sha256_hex(token.as_bytes()),
+        expires_monotonic_ms,
+        consumed_monotonic_ms: None,
+        created_at: 0,
+    };
+    let store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || store.issue_approval(&approval, now)).await {
+        Ok(Ok(())) => {
+            info!(
+                change_set_id = %record.id,
+                approval_id,
+                "one-use configuration approval issued"
+            );
+            ServerResponse::success(
+                id,
+                ResponseData::ChangeApproval(ChangeApprovalResponse {
+                    approval_id,
+                    change_set_id: record.id,
+                    plan_digest: record.plan_digest,
+                    token: SensitiveString::new(token),
+                    expires_monotonic_ms,
+                }),
+            )
+        }
+        Ok(Err(error)) => store_error_response(id, &error),
+        Err(error) => {
+            error!(%error, "approval storage worker failed");
+            ServerResponse::error(id, ErrorCode::Internal, "approval storage is unavailable")
+        }
+    }
+}
+
+async fn handle_change_reject(
+    id: String,
+    change_set_id: String,
+    state: &AppState,
+) -> ServerResponse {
+    if !valid_change_set_id(&change_set_id) {
+        return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
+    }
+    let Some(record) = load_change_set(&id, &change_set_id, state).await else {
+        return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
+    };
+    let mut response = match change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+        Ok(response) => response,
+        Err(error) => return error.with_id(id),
+    };
+    let now = match boot_monotonic_ms() {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let store = Arc::clone(&state.store);
+    let record_for_transition = record.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        store.transition_change_set(
+            &record_for_transition.id,
+            record_for_transition.state,
+            ChangeSetState::Rejected,
+            &record_for_transition.plan_digest,
+            &record_for_transition.boot_id,
+            now,
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(_)) => {
+            response.state = ChangeSetState::Rejected;
+            ServerResponse::success(id, ResponseData::ChangeSet(response))
+        }
+        Ok(Err(error)) => store_error_response(id, &error),
+        Err(error) => {
+            error!(%error, "ChangeSet rejection worker failed");
+            ServerResponse::error(id, ErrorCode::Internal, "ChangeSet storage is unavailable")
+        }
+    }
+}
+
+async fn load_change_set(
+    request_id: &str,
+    change_set_id: &str,
+    state: &AppState,
+) -> Option<ChangeSetRecord> {
+    let store = Arc::clone(&state.store);
+    let change_set_id = change_set_id.to_owned();
+    match tokio::task::spawn_blocking(move || store.change_set(&change_set_id)).await {
+        Ok(Ok(record)) => record,
+        Ok(Err(error)) => {
+            error!(request_id, %error, "ChangeSet lookup failed");
+            None
+        }
+        Err(error) => {
+            error!(request_id, %error, "ChangeSet lookup worker failed");
+            None
+        }
+    }
+}
+
+fn change_set_response(
+    record: ChangeSetRecord,
+    actor_id: &str,
+    state: &AppState,
+) -> Result<ChangeSetResponse, PendingResponseError> {
+    validate_owned_change_set(&record, actor_id, state)?;
+    let plan: ChangePlan = serde_json::from_slice(&record.plan_payload)
+        .map_err(|_| PendingResponseError::internal("stored ChangeSet plan is corrupt"))?;
+    let digest = plan_digest(&plan)
+        .map_err(|_| PendingResponseError::internal("stored ChangeSet plan is invalid"))?;
+    if digest != record.plan_digest
+        || plan.plan_id != record.id
+        || plan.actor_id != record.actor_id
+        || plan.boot_id != record.boot_id
+        || plan.risk != record.risk
+        || plan.expires_monotonic_ms != record.expires_monotonic_ms
+    {
+        return Err(PendingResponseError::internal(
+            "stored ChangeSet security binding is invalid",
+        ));
+    }
+    Ok(ChangeSetResponse {
+        change_set_id: record.id,
+        plan_digest: record.plan_digest,
+        plan,
+        state: record.state,
+        rollback_deadline_monotonic_ms: record.rollback_deadline_monotonic_ms,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    })
+}
+
+fn validate_owned_change_set(
+    record: &ChangeSetRecord,
+    actor_id: &str,
+    state: &AppState,
+) -> Result<(), PendingResponseError> {
+    if record.actor_id != actor_id {
+        return Err(PendingResponseError::not_found());
+    }
+    if record.boot_id != state.auth.boot_id() {
+        return Err(PendingResponseError::conflict(
+            "ChangeSet belongs to a previous device boot",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PendingResponseError {
+    code: ErrorCode,
+    message: &'static str,
+}
+
+impl PendingResponseError {
+    const fn internal(message: &'static str) -> Self {
+        Self {
+            code: ErrorCode::Internal,
+            message,
+        }
+    }
+
+    const fn not_found() -> Self {
+        Self {
+            code: ErrorCode::NotFound,
+            message: "ChangeSet not found",
+        }
+    }
+
+    const fn conflict(message: &'static str) -> Self {
+        Self {
+            code: ErrorCode::Conflict,
+            message,
+        }
+    }
+
+    fn with_id(self, id: String) -> ServerResponse {
+        ServerResponse::error(id, self.code, self.message)
+    }
+}
+
+fn valid_change_set_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.is_ascii()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
+        })
+}
+
+fn process_monotonic_ms(state: &AppState) -> u64 {
+    u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn boot_monotonic_ms() -> Result<u64, PendingResponseError> {
+    boot_monotonic_ms_platform()
+}
+
+#[cfg(target_os = "linux")]
+fn boot_monotonic_ms_platform() -> Result<u64, PendingResponseError> {
+    const MAX_UPTIME_BYTES: u64 = 128;
+    let mut uptime = String::new();
+    fs::File::open("/proc/uptime")
+        .and_then(|file| {
+            file.take(MAX_UPTIME_BYTES.saturating_add(1))
+                .read_to_string(&mut uptime)
+        })
+        .map_err(|_| PendingResponseError::internal("system monotonic clock is unavailable"))?;
+    if uptime.len() as u64 > MAX_UPTIME_BYTES {
+        return Err(PendingResponseError::internal(
+            "system monotonic clock is invalid",
+        ));
+    }
+    let value = uptime
+        .split_ascii_whitespace()
+        .next()
+        .ok_or_else(|| PendingResponseError::internal("system monotonic clock is invalid"))?;
+    parse_uptime_ms(value)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn boot_monotonic_ms_platform() -> Result<u64, PendingResponseError> {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    Ok(u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_uptime_ms(value: &str) -> Result<u64, PendingResponseError> {
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if seconds.is_empty()
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(PendingResponseError::internal(
+            "system monotonic clock is invalid",
+        ));
+    }
+    let seconds = seconds
+        .parse::<u64>()
+        .map_err(|_| PendingResponseError::internal("system monotonic clock is invalid"))?;
+    let mut milliseconds = 0_u64;
+    let mut place = 100_u64;
+    for digit in fraction.bytes().take(3) {
+        milliseconds = milliseconds.saturating_add(u64::from(digit.saturating_sub(b'0')) * place);
+        place /= 10;
+    }
+    Ok(seconds.saturating_mul(1_000).saturating_add(milliseconds))
+}
+
+fn random_hex(bytes: usize) -> Result<String, PendingResponseError> {
+    let mut random = vec![0_u8; bytes];
+    SystemRandom::new().fill(&mut random).map_err(|_| {
+        PendingResponseError::internal("operating system randomness is unavailable")
+    })?;
+    let mut encoded = String::with_capacity(bytes.saturating_mul(2));
+    for byte in random {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    let hash = ring::digest::digest(&ring::digest::SHA256, value);
+    let mut encoded = String::with_capacity(64);
+    for byte in hash.as_ref() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn store_error_response(id: String, error: &StoreError) -> ServerResponse {
+    let (code, message) = match error {
+        StoreError::ChangeSetConflict
+        | StoreError::ChangeSetExpired
+        | StoreError::ApprovalRejected
+        | StoreError::InvalidTransition(_)
+        | StoreError::RollbackDeadlineRequired
+        | StoreError::InvalidRollbackDeadline => (ErrorCode::Conflict, error.to_string()),
+        StoreError::ChangeSetCapacity | StoreError::PayloadTooLarge { .. } => {
+            (ErrorCode::ResourceExhausted, error.to_string())
+        }
+        _ => {
+            error!(%error, "configuration state storage failed");
+            (
+                ErrorCode::Internal,
+                "configuration state storage is unavailable".into(),
+            )
+        }
+    };
+    ServerResponse::error(id, code, message)
 }
 
 fn status_response(state: &AppState) -> ResponseData {
@@ -2901,6 +3293,15 @@ mod tests {
     }
 
     #[test]
+    fn linux_boot_uptime_parser_is_bounded_and_exact_to_milliseconds() {
+        assert_eq!(parse_uptime_ms("123.45").expect("uptime"), 123_450);
+        assert_eq!(parse_uptime_ms("7").expect("integer uptime"), 7_000);
+        assert_eq!(parse_uptime_ms("1.2349").expect("truncate sub-ms"), 1_234);
+        assert!(parse_uptime_ms("-1.0").is_err());
+        assert!(parse_uptime_ms("not-a-clock").is_err());
+    }
+
+    #[test]
     fn read_only_tool_calls_require_allowlisted_names_and_empty_objects() {
         for tool in ReadOnlyAgentTool::ALL {
             let valid = ToolCall {
@@ -3359,6 +3760,162 @@ mod tests {
         );
 
         drop(state);
+        fs::remove_dir_all(root).expect("remove test runtime");
+    }
+
+    fn approval_test_plan(now_monotonic_ms: u64) -> ChangePlan {
+        ChangePlan {
+            schema_version: agent_protocol::CHANGE_PLAN_SCHEMA_VERSION,
+            plan_id: "change-approval-1".into(),
+            boot_id: "test-boot".into(),
+            actor_id: LOCAL_CLI_ACTOR.into(),
+            created_monotonic_ms: now_monotonic_ms,
+            expires_monotonic_ms: now_monotonic_ms.saturating_add(60_000),
+            risk: agent_protocol::RiskLevel::R2,
+            changes: vec![agent_protocol::ChangeDiff {
+                object: agent_protocol::ConfigObjectRef {
+                    domain: agent_protocol::ConfigDomain::Firewall,
+                    kind: "rule".into(),
+                    id: "managed-rule".into(),
+                    expected_version: None,
+                    ownership: agent_protocol::ObjectOwnership::AgentOwned,
+                },
+                operation: agent_protocol::ChangeOperation::Create,
+                before_digest: None,
+                after_digest: Some("a".repeat(64)),
+                summary: "create a managed firewall rule".into(),
+                sensitive_fields_redacted: false,
+                risk_signals: agent_protocol::ChangeRiskSignals::default(),
+            }],
+            validation_checks: vec!["validate staged firewall".into()],
+            verification_checks: vec!["verify managed firewall rule".into()],
+            rollback_required: true,
+        }
+    }
+
+    fn approval_test_state(root: &Path) -> (Arc<Store>, AppState) {
+        let mut config = AgentConfig::default();
+        config.storage.path = root.join("agent.db");
+        config.auth.enabled = true;
+        let encoded =
+            agent_core::generate_password_hash(b"test administrator password").expect("hash");
+        let budget = TmpBudget::new(config.storage.clone()).expect("budget");
+        let store = Arc::new(
+            Store::open(&config.storage.path, config.storage.max_database_bytes).expect("store"),
+        );
+        let auth = AuthManager::new(
+            AdminPasswordVerifier::parse(&encoded).expect("verifier"),
+            "test-boot".into(),
+            300,
+            3,
+            60,
+        );
+        let state = AppState {
+            platform: PlatformCapabilities::discover(),
+            budget,
+            store: Arc::clone(&store),
+            tools: ToolRunner::system(Duration::from_millis(100), 4096),
+            diagnostic_slots: Semaphore::new(1),
+            llm: None,
+            llm_slots: Semaphore::new(1),
+            log_writer: test_log_writer(root),
+            started: Instant::now(),
+            auth: Arc::new(auth),
+            config,
+        };
+        (store, state)
+    }
+
+    #[tokio::test]
+    async fn change_approval_is_admin_actor_plan_and_boot_bound() {
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/change-approval-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let (store, state) = approval_test_state(&root);
+        let plan_now = boot_monotonic_ms().expect("boot monotonic clock");
+        let plan = approval_test_plan(plan_now);
+        let digest = plan_digest(&plan).expect("valid plan");
+        store
+            .insert_change_set(
+                &ChangeSetRecord {
+                    id: plan.plan_id.clone(),
+                    plan_digest: digest.clone(),
+                    plan_payload: serde_json::to_vec(&plan).expect("plan payload"),
+                    state: ChangeSetState::Planned,
+                    actor_id: plan.actor_id.clone(),
+                    boot_id: plan.boot_id.clone(),
+                    risk: plan.risk,
+                    expires_monotonic_ms: plan.expires_monotonic_ms,
+                    rollback_deadline_monotonic_ms: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                state.config.storage.max_change_set_records,
+                usize::try_from(state.config.storage.max_change_plan_bytes).expect("plan limit"),
+                plan_now,
+            )
+            .expect("insert ChangeSet");
+        store
+            .transition_change_set(
+                &plan.plan_id,
+                ChangeSetState::Planned,
+                ChangeSetState::AwaitingApproval,
+                &digest,
+                &plan.boot_id,
+                plan_now,
+            )
+            .expect("await approval");
+
+        let denied =
+            handle_change_approve("approve-denied".into(), plan.plan_id.clone(), &state).await;
+        assert_eq!(
+            denied.error.expect("admin required").code,
+            ErrorCode::Unauthorized
+        );
+        handle_elevation(
+            "elevate".into(),
+            "test administrator password".into(),
+            &state,
+        )
+        .await;
+        let approved = handle_change_approve("approve".into(), plan.plan_id.clone(), &state).await;
+        let Some(ResponseData::ChangeApproval(approval)) = approved.result else {
+            panic!("expected approval response");
+        };
+        assert_eq!(approval.change_set_id, plan.plan_id);
+        assert_eq!(approval.plan_digest, digest);
+        assert_eq!(approval.token.expose().len(), 64);
+        let database = fs::read(&state.config.storage.path).expect("database bytes");
+        assert!(
+            !database
+                .windows(approval.token.expose().len())
+                .any(|window| window == approval.token.expose().as_bytes())
+        );
+
+        let now = boot_monotonic_ms().expect("boot monotonic clock");
+        let consumption = agent_store::ApprovalConsumption {
+            approval_id: &approval.approval_id,
+            change_set_id: &approval.change_set_id,
+            actor_id: LOCAL_CLI_ACTOR,
+            plan_digest: &approval.plan_digest,
+            boot_id: "test-boot",
+            token_digest: &sha256_hex(approval.token.expose().as_bytes()),
+        };
+        assert_eq!(
+            store
+                .consume_approval(&consumption, now)
+                .expect("consume approval"),
+            ChangeSetState::Approved
+        );
+        assert!(matches!(
+            store.consume_approval(&consumption, now),
+            Err(StoreError::ApprovalRejected)
+        ));
+
+        drop(state);
+        drop(store);
         fs::remove_dir_all(root).expect("remove test runtime");
     }
 
