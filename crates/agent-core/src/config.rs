@@ -116,18 +116,9 @@ impl AgentConfig {
                 "storage.max_artifact_files must be between 1 and 4096".into(),
             ));
         }
-        if self.storage.max_diagnostic_records == 0
-            || self.storage.max_task_records == 0
-            || self.storage.max_change_set_records == 0
-            || self.storage.max_diagnostic_record_bytes == 0
-            || self.storage.max_change_plan_bytes == 0
-            || self.storage.max_firewall_state_bytes == 0
-            || self.storage.max_diagnostic_record_bytes > self.storage.max_database_bytes
-            || self.storage.max_change_plan_bytes > self.storage.max_database_bytes
-            || self.storage.max_firewall_state_bytes > self.storage.max_database_bytes
-        {
+        if !storage_record_limits_valid(&self.storage) {
             return Err(ConfigError::Validation(
-                "task, diagnostic, ChangeSet, and firewall state limits must be non-zero and fit the database budget"
+                "task, diagnostic, ChangeSet, firewall state, and execution plan limits must be non-zero and fit the database budget"
                     .into(),
             ));
         }
@@ -186,6 +177,20 @@ impl AgentConfig {
         }
         Ok(())
     }
+}
+
+fn storage_record_limits_valid(storage: &StorageConfig) -> bool {
+    storage.max_diagnostic_records > 0
+        && storage.max_task_records > 0
+        && storage.max_change_set_records > 0
+        && storage.max_diagnostic_record_bytes > 0
+        && storage.max_change_plan_bytes > 0
+        && storage.max_firewall_state_bytes > 0
+        && storage.max_firewall_execution_plan_bytes > 0
+        && storage.max_diagnostic_record_bytes <= storage.max_database_bytes
+        && storage.max_change_plan_bytes <= storage.max_database_bytes
+        && storage.max_firewall_state_bytes <= storage.max_database_bytes
+        && storage.max_firewall_execution_plan_bytes <= storage.max_database_bytes
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -450,6 +455,7 @@ pub struct StorageConfig {
     pub max_change_set_records: u32,
     pub max_change_plan_bytes: u64,
     pub max_firewall_state_bytes: u64,
+    pub max_firewall_execution_plan_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -471,6 +477,7 @@ impl Default for StorageConfig {
             max_change_set_records: 32,
             max_change_plan_bytes: 64 * 1024,
             max_firewall_state_bytes: 256 * 1024,
+            max_firewall_execution_plan_bytes: 256 * 1024,
         }
     }
 }
@@ -633,6 +640,13 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.storage.max_firewall_state_bytes = config.storage.max_database_bytes + 1;
+        assert!(config.validate().is_err());
+
+        config.storage.max_firewall_state_bytes = 1024;
+        config.storage.max_firewall_execution_plan_bytes = 0;
+        assert!(config.validate().is_err());
+
+        config.storage.max_firewall_execution_plan_bytes = config.storage.max_database_bytes + 1;
         assert!(config.validate().is_err());
     }
 

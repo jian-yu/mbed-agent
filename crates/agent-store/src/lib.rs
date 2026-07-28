@@ -386,6 +386,88 @@ impl Store {
             .map_err(StoreError::Sqlite)
     }
 
+    /// Attaches one bounded executable firewall payload to an exact planned `ChangeSet`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized/empty payload, stale security binding, duplicate
+    /// attachment, wrong state, or `SQLite` failure.
+    pub fn attach_firewall_execution_plan(
+        &self,
+        change_set_id: &str,
+        plan_digest: &str,
+        boot_id: &str,
+        payload: &[u8],
+        max_payload_bytes: usize,
+    ) -> Result<(), StoreError> {
+        if payload.is_empty() || payload.len() > max_payload_bytes {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload.len(),
+                limit: max_payload_bytes,
+            });
+        }
+        validate_bounded_field("change_set.id", change_set_id, 128)?;
+        validate_bounded_field("change_set.boot_id", boot_id, 128)?;
+        validate_digest_field("change_set.plan_digest", plan_digest)?;
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "INSERT INTO change_execution_plans
+                 (change_set_id, domain, plan_digest, boot_id, payload, created_at)
+                 SELECT id, 'firewall', plan_digest, boot_id, ?1, unixepoch()
+                 FROM change_sets
+                 WHERE id = ?2 AND state = 'planned' AND plan_digest = ?3 AND boot_id = ?4",
+                params![payload, change_set_id, plan_digest, boot_id],
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(ref failure, _)
+                    if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    StoreError::ChangeSetConflict
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        if changed != 1 {
+            return Err(StoreError::ChangeSetConflict);
+        }
+        Ok(())
+    }
+
+    /// Loads an executable firewall payload only through its exact digest and boot binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized stored payload or `SQLite` failure.
+    pub fn firewall_execution_plan(
+        &self,
+        change_set_id: &str,
+        plan_digest: &str,
+        boot_id: &str,
+        max_payload_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let connection = self.connection()?;
+        let payload: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT payload FROM change_execution_plans
+                 WHERE change_set_id = ?1 AND domain = 'firewall'
+                   AND plan_digest = ?2 AND boot_id = ?3",
+                params![change_set_id, plan_digest, boot_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if payload
+            .as_ref()
+            .is_some_and(|value| value.len() > max_payload_bytes)
+        {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload.as_ref().map_or(0, Vec::len),
+                limit: max_payload_bytes,
+            });
+        }
+        Ok(payload)
+    }
+
     /// Atomically advances a `ChangeSet` if its state, plan digest, and boot match.
     ///
     /// # Errors
@@ -730,6 +812,14 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
              );
              CREATE INDEX IF NOT EXISTS change_sets_updated_at
                  ON change_sets(updated_at DESC);
+             CREATE TABLE IF NOT EXISTS change_execution_plans (
+                 change_set_id TEXT PRIMARY KEY REFERENCES change_sets(id) ON DELETE CASCADE,
+                 domain TEXT NOT NULL CHECK(domain IN ('firewall')),
+                 plan_digest TEXT NOT NULL,
+                 boot_id TEXT NOT NULL,
+                 payload BLOB NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
              CREATE TABLE IF NOT EXISTS approvals (
                  id TEXT PRIMARY KEY,
                  change_set_id TEXT NOT NULL REFERENCES change_sets(id) ON DELETE CASCADE,
@@ -743,7 +833,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
              );
              CREATE INDEX IF NOT EXISTS approvals_change_set_id
                  ON approvals(change_set_id);
-             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1), (2), (3), (4);",
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1), (2), (3), (4), (5);",
         )
         .map_err(StoreError::Sqlite)
 }
@@ -1146,6 +1236,52 @@ mod tests {
             consumed_monotonic_ms: None,
             created_at: 0,
         }
+    }
+
+    #[test]
+    fn executable_firewall_payload_is_bound_once_to_a_planned_change_set() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-agent-execution-plan-{nonce}"));
+        let store = Store::open(&root.join("agent.db"), 1024 * 1024).expect("open store");
+        store
+            .insert_change_set(&change_set_record("change-exec", 1_000), 4, 4096, 100)
+            .expect("insert");
+        store
+            .attach_firewall_execution_plan(
+                "change-exec",
+                PLAN_DIGEST,
+                "boot-1",
+                b"typed-payload",
+                32,
+            )
+            .expect("attach");
+        assert_eq!(
+            store
+                .firewall_execution_plan("change-exec", PLAN_DIGEST, "boot-1", 32)
+                .expect("load"),
+            Some(b"typed-payload".to_vec())
+        );
+        assert!(matches!(
+            store.attach_firewall_execution_plan(
+                "change-exec",
+                PLAN_DIGEST,
+                "boot-1",
+                b"replacement",
+                32,
+            ),
+            Err(StoreError::ChangeSetConflict)
+        ));
+        assert_eq!(
+            store
+                .firewall_execution_plan("change-exec", PLAN_DIGEST, "wrong-boot", 32)
+                .expect("wrong binding"),
+            None
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn approval_consumption<'a>(

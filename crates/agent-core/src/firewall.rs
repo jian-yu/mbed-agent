@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use agent_protocol::{
-    ChangeDiff, ChangeOperation, ChangeRiskSignals, ConfigDomain, ConfigObjectRef,
+    ChangeDiff, ChangeOperation, ChangePlan, ChangeRiskSignals, ConfigDomain, ConfigObjectRef,
     FirewallAddressSet, FirewallFilterRule, FirewallForwarding, FirewallMatch, FirewallNatKind,
     FirewallNatRule, FirewallObject, FirewallProtocol, FirewallSetEntry, FirewallVerdict,
     FirewallZone, IpNetwork, ObjectOwnership, PortRange, RiskLevel,
@@ -47,17 +47,142 @@ pub struct FirewallRiskContext {
     pub management_interfaces: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirewallPlannedChange {
     pub before: Option<FirewallObject>,
     pub after: Option<FirewallObject>,
     pub diff: ChangeDiff,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirewallMutationPlan {
     pub risk: RiskLevel,
     pub changes: Vec<FirewallPlannedChange>,
+}
+
+pub const FIREWALL_EXECUTION_PLAN_SCHEMA_VERSION: u16 = 1;
+const MAX_FIREWALL_EXECUTION_PLAN_BYTES: usize = 256 * 1024;
+
+/// Stored executable payload paired with the exact user-visible `ChangePlan`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FirewallExecutionPlan {
+    pub schema_version: u16,
+    pub preview: ChangePlan,
+    pub typed: FirewallMutationPlan,
+}
+
+impl FirewallExecutionPlan {
+    /// Validates every preview diff against its complete typed before/after objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed preview, schema/risk/diff mismatch, invalid object,
+    /// forged digest, unsupported ownership, or encoded payload overflow.
+    pub fn validate(&self) -> Result<(), FirewallExecutionPlanError> {
+        if self.schema_version != FIREWALL_EXECUTION_PLAN_SCHEMA_VERSION {
+            return Err(FirewallExecutionPlanError::UnsupportedSchema);
+        }
+        crate::plan_digest(&self.preview)
+            .map_err(|_| FirewallExecutionPlanError::InvalidPreview)?;
+        if self.preview.risk != self.typed.risk
+            || self.preview.changes.len() != self.typed.changes.len()
+            || self.typed.changes.is_empty()
+            || self.typed.changes.len() > MAX_MUTATIONS
+        {
+            return Err(FirewallExecutionPlanError::PlanMismatch);
+        }
+        for (preview, typed) in self.preview.changes.iter().zip(&self.typed.changes) {
+            validate_execution_change(preview, typed)?;
+        }
+        let encoded = serde_json::to_vec(self).map_err(|_| FirewallExecutionPlanError::Encode)?;
+        if encoded.len() > MAX_FIREWALL_EXECUTION_PLAN_BYTES {
+            return Err(FirewallExecutionPlanError::Capacity);
+        }
+        Ok(())
+    }
+
+    /// Encodes one fully validated execution payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation or bounded canonical encoding fails.
+    pub fn encode(&self) -> Result<Vec<u8>, FirewallExecutionPlanError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| FirewallExecutionPlanError::Encode)
+    }
+
+    /// Decodes and fully revalidates a bounded execution payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized, malformed, or semantically inconsistent input.
+    pub fn decode(encoded: &[u8]) -> Result<Self, FirewallExecutionPlanError> {
+        if encoded.is_empty() || encoded.len() > MAX_FIREWALL_EXECUTION_PLAN_BYTES {
+            return Err(FirewallExecutionPlanError::Capacity);
+        }
+        let plan: Self =
+            serde_json::from_slice(encoded).map_err(|_| FirewallExecutionPlanError::Decode)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+
+fn validate_execution_change(
+    preview: &ChangeDiff,
+    typed: &FirewallPlannedChange,
+) -> Result<(), FirewallExecutionPlanError> {
+    if preview != &typed.diff {
+        return Err(FirewallExecutionPlanError::PlanMismatch);
+    }
+    let object = typed
+        .after
+        .as_ref()
+        .or(typed.before.as_ref())
+        .ok_or(FirewallExecutionPlanError::PlanMismatch)?;
+    if preview.object.domain != ConfigDomain::Firewall
+        || preview.object.kind != object.kind()
+        || preview.object.id != object.id()
+        || preview.object.ownership != object.ownership()
+        || object.ownership() == ObjectOwnership::Unmanaged
+    {
+        return Err(FirewallExecutionPlanError::PlanMismatch);
+    }
+    if let Some(before) = &typed.before {
+        validate_firewall_object(before).map_err(|_| FirewallExecutionPlanError::InvalidObject)?;
+    }
+    if let Some(after) = &typed.after {
+        validate_firewall_object(after).map_err(|_| FirewallExecutionPlanError::InvalidObject)?;
+    }
+    let before_digest = typed
+        .before
+        .as_ref()
+        .map(firewall_object_digest)
+        .transpose()
+        .map_err(|_| FirewallExecutionPlanError::InvalidObject)?;
+    let after_digest = typed
+        .after
+        .as_ref()
+        .map(firewall_object_digest)
+        .transpose()
+        .map_err(|_| FirewallExecutionPlanError::InvalidObject)?;
+    if preview.before_digest != before_digest
+        || preview.after_digest != after_digest
+        || preview.object.expected_version != before_digest
+    {
+        return Err(FirewallExecutionPlanError::DigestMismatch);
+    }
+    let valid_shape = match preview.operation {
+        ChangeOperation::Create => typed.before.is_none() && typed.after.is_some(),
+        ChangeOperation::Update | ChangeOperation::Move => {
+            typed.before.is_some() && typed.after.is_some()
+        }
+        ChangeOperation::Delete => typed.before.is_some() && typed.after.is_none(),
+    };
+    if !valid_shape {
+        return Err(FirewallExecutionPlanError::PlanMismatch);
+    }
+    Ok(())
 }
 
 /// Validates and plans explicit firewall CRUD mutations against a fresh inventory.
@@ -781,6 +906,26 @@ fn lower_hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+pub enum FirewallExecutionPlanError {
+    #[error("firewall execution plan schema is unsupported")]
+    UnsupportedSchema,
+    #[error("firewall execution plan preview is invalid")]
+    InvalidPreview,
+    #[error("firewall execution plan does not match its preview")]
+    PlanMismatch,
+    #[error("firewall execution plan contains an invalid typed object")]
+    InvalidObject,
+    #[error("firewall execution plan object digest does not match")]
+    DigestMismatch,
+    #[error("firewall execution plan exceeds its capacity")]
+    Capacity,
+    #[error("failed to encode firewall execution plan")]
+    Encode,
+    #[error("failed to decode firewall execution plan")]
+    Decode,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum FirewallPlanError {
     #[error("firewall plan exceeds its capacity")]
     Capacity,
@@ -824,7 +969,8 @@ pub enum FirewallPlanError {
 mod tests {
     use super::*;
     use agent_protocol::{
-        FirewallDirection, FirewallFamily, FirewallLog, FirewallLogLevel, FirewallRateLimit,
+        CHANGE_PLAN_SCHEMA_VERSION, FirewallDirection, FirewallFamily, FirewallLog,
+        FirewallLogLevel, FirewallRateLimit,
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -859,6 +1005,67 @@ mod tests {
             }),
             order: 100,
         })
+    }
+
+    #[test]
+    fn executable_plan_binds_preview_to_complete_typed_objects() {
+        let inventory = FirewallInventory {
+            objects: Vec::new(),
+        };
+        let zone = FirewallObject::Zone(FirewallZone {
+            id: "guest".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            networks: vec!["br-guest".into()],
+            input: FirewallVerdict::Drop,
+            output: FirewallVerdict::Accept,
+            forward: FirewallVerdict::Drop,
+            masquerade: false,
+            mtu_fix: false,
+        });
+        let typed = plan_firewall_mutations(
+            &inventory,
+            &[FirewallMutation::Create(zone)],
+            &FirewallRiskContext::default(),
+        )
+        .expect("typed plan");
+        let preview = ChangePlan {
+            schema_version: CHANGE_PLAN_SCHEMA_VERSION,
+            plan_id: "firewall-plan-1".into(),
+            boot_id: "boot-1".into(),
+            actor_id: "cli-local".into(),
+            created_monotonic_ms: 10,
+            expires_monotonic_ms: 1_000,
+            risk: typed.risk,
+            changes: typed
+                .changes
+                .iter()
+                .map(|change| change.diff.clone())
+                .collect(),
+            validation_checks: vec!["native firewall check".into()],
+            verification_checks: vec!["managed object exists".into()],
+            rollback_required: true,
+        };
+        let execution = FirewallExecutionPlan {
+            schema_version: FIREWALL_EXECUTION_PLAN_SCHEMA_VERSION,
+            preview,
+            typed,
+        };
+        let encoded = execution.encode().expect("encode");
+        assert_eq!(
+            FirewallExecutionPlan::decode(&encoded).expect("decode"),
+            execution
+        );
+
+        let mut tampered = execution;
+        let Some(FirewallObject::Zone(zone)) = tampered.typed.changes[0].after.as_mut() else {
+            panic!("zone");
+        };
+        zone.output = FirewallVerdict::Drop;
+        assert_eq!(
+            tampered.validate(),
+            Err(FirewallExecutionPlanError::DigestMismatch)
+        );
     }
 
     fn inventory_with_zones(mut objects: Vec<FirewallObject>) -> FirewallInventory {

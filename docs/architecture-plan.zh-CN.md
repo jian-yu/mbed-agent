@@ -556,6 +556,7 @@ max_diagnostic_record_bytes = 32768
 max_change_set_records = 32
 max_change_plan_bytes = 65536
 max_firewall_state_bytes = 262144
+max_firewall_execution_plan_bytes = 262144
 
 [auth]
 enabled = false
@@ -1014,6 +1015,12 @@ apply 后业务探针尚未全部接通。
 iptables 的固定检查与加载动作；清空环境并直接启动进程，不使用 shell。stdin、
 stdout/stderr、超时以及 `/tmp` staging 文件均有硬上限，canonical path 校验会拒绝
 符号链接和父目录逃逸。该层不是独立写 API，只能由后续 execution port 调用。
+
+防火墙可执行载荷也已与展示用 ChangePlan 分离落入 `/tmp` SQLite：版本化封装保存
+完整 typed before/after 对象，但 attachment 只能在 `Planned` 状态按 ChangeSet
+ID、plan digest 和 boot ID 一次性写入。encode/decode 都重新核对 preview diff、
+语义风险、ownership、operation shape、对象 schema 与内容摘要，Channel 不能在
+apply 时补交或替换 desired object。
 
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
