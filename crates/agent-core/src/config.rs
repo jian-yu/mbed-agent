@@ -121,11 +121,13 @@ impl AgentConfig {
             || self.storage.max_change_set_records == 0
             || self.storage.max_diagnostic_record_bytes == 0
             || self.storage.max_change_plan_bytes == 0
+            || self.storage.max_firewall_state_bytes == 0
             || self.storage.max_diagnostic_record_bytes > self.storage.max_database_bytes
             || self.storage.max_change_plan_bytes > self.storage.max_database_bytes
+            || self.storage.max_firewall_state_bytes > self.storage.max_database_bytes
         {
             return Err(ConfigError::Validation(
-                "task, diagnostic, and ChangeSet limits must be non-zero and fit the database budget"
+                "task, diagnostic, ChangeSet, and firewall state limits must be non-zero and fit the database budget"
                     .into(),
             ));
         }
@@ -447,6 +449,7 @@ pub struct StorageConfig {
     pub max_diagnostic_record_bytes: u64,
     pub max_change_set_records: u32,
     pub max_change_plan_bytes: u64,
+    pub max_firewall_state_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -467,6 +470,7 @@ impl Default for StorageConfig {
             max_diagnostic_record_bytes: 32 * 1024,
             max_change_set_records: 32,
             max_change_plan_bytes: 64 * 1024,
+            max_firewall_state_bytes: 256 * 1024,
         }
     }
 }
@@ -619,6 +623,16 @@ mod tests {
 
         config.storage.max_change_set_records = 1;
         config.storage.max_change_plan_bytes = config.storage.max_database_bytes + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn volatile_firewall_state_must_fit_database_budget() {
+        let mut config = AgentConfig::default();
+        config.storage.max_firewall_state_bytes = 0;
+        assert!(config.validate().is_err());
+
+        config.storage.max_firewall_state_bytes = config.storage.max_database_bytes + 1;
         assert!(config.validate().is_err());
     }
 

@@ -799,7 +799,9 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "agent-protocol",
+ "ring",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

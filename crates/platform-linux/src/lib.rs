@@ -8,6 +8,7 @@ pub mod firewall_inventory;
 pub mod firewall_iptables;
 pub mod firewall_nft;
 mod firewall_project;
+pub mod firewall_runtime;
 mod firewall_uci;
 
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;

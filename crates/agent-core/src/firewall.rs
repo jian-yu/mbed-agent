@@ -8,6 +8,7 @@ use agent_protocol::{
     FirewallZone, IpNetwork, ObjectOwnership, PortRange, RiskLevel,
 };
 use ring::digest::{SHA256, digest};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_OBJECTS: usize = 256;
@@ -16,7 +17,7 @@ const MAX_MATCH_VALUES: usize = 32;
 const MAX_SET_ENTRIES: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirewallInventory {
     pub objects: Vec<FirewallObject>,
 }

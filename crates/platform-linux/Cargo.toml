@@ -10,6 +10,8 @@ rust-version.workspace = true
 agent-core.workspace = true
 agent-protocol.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
 thiserror.workspace = true
 
 [lints]

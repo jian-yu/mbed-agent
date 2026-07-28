@@ -13,6 +13,7 @@ use agent_protocol::{
     FirewallMatch, FirewallNatKind, FirewallNatRule, FirewallObject, FirewallProtocol,
     FirewallRejectKind, FirewallSetEntry, FirewallVerdict, IpNetwork, PortRange,
 };
+use ring::digest::{SHA256, digest};
 use thiserror::Error;
 
 use crate::firewall_project::{FirewallProjectionError, project_agent_objects};
@@ -191,6 +192,61 @@ pub fn inspect_iptables_family_state(
     }
 }
 
+/// Returns a stable digest of only the Agent-owned chains, their rules, and exact hook jumps.
+///
+/// Distribution-owned rules and packet counters are deliberately excluded so unrelated host
+/// firewall activity does not invalidate the canonical Agent inventory.
+///
+/// # Errors
+///
+/// Returns an error unless all fixed chains and ownership-marked jumps are present exactly once.
+pub fn iptables_owned_state_digest(save: &str) -> Result<String, IptablesRenderError> {
+    if inspect_iptables_family_state(save)? != IptablesFamilyState::AgentOwned {
+        return Err(IptablesRenderError::ForeignChains);
+    }
+    let mut current_table = "";
+    let mut normalized = String::new();
+    for line in save.lines() {
+        let line = line.trim();
+        if let Some(table) = line.strip_prefix('*') {
+            current_table = table;
+            continue;
+        }
+        if line == "COMMIT" {
+            current_table = "";
+            continue;
+        }
+        for binding in CHAINS {
+            if current_table != binding.table {
+                continue;
+            }
+            let declaration = line
+                .strip_prefix(':')
+                .and_then(|value| value.split_whitespace().next())
+                == Some(binding.managed);
+            let managed_rule = line
+                .strip_prefix("-A ")
+                .and_then(|value| value.split_whitespace().next())
+                == Some(binding.managed);
+            if declaration {
+                writeln!(normalized, "{}|chain|{}", binding.table, binding.managed)
+                    .map_err(|_| IptablesRenderError::Output)?;
+            } else if managed_rule || hook_marker_matches(line, binding) {
+                writeln!(normalized, "{}|rule|{line}", binding.table)
+                    .map_err(|_| IptablesRenderError::Output)?;
+            }
+        }
+    }
+    if normalized.len() > MAX_SAVE_BYTES {
+        return Err(IptablesRenderError::Capacity);
+    }
+    let mut output = String::with_capacity(64);
+    for byte in digest(&SHA256, normalized.as_bytes()).as_ref() {
+        let _ = write!(output, "{byte:02x}");
+    }
+    Ok(output)
+}
+
 /// Renders complete projected state into IPv4 and IPv6 no-flush restore artifacts.
 ///
 /// Only Agent-owned typed objects participate. Existing distribution chains and rules are never
@@ -201,7 +257,7 @@ pub fn inspect_iptables_family_state(
 ///
 /// Returns an error for ownership/version mismatch, unsupported semantics, unsafe values,
 /// expansion overflow, or an oversized artifact.
-pub fn render_iptables_firewall_stage(
+pub(crate) fn render_iptables_firewall_stage(
     inventory: &FirewallInventory,
     plan: &FirewallMutationPlan,
     ipv4_state: IptablesFamilyState,
@@ -1204,6 +1260,26 @@ mod tests {
         assert_eq!(
             inspect_iptables_family_state("*filter\0"),
             Err(IptablesRenderError::MalformedInspection)
+        );
+    }
+
+    #[test]
+    fn owned_digest_ignores_unrelated_rules_and_chain_counters() {
+        let first = owned_save();
+        let unrelated = first
+            .replace(":INPUT ACCEPT [0:0]", ":INPUT ACCEPT [42:1024]")
+            .replace(
+                "-A INPUT -m comment",
+                "-A INPUT -s 192.0.2.1 -j DROP\n-A INPUT -m comment",
+            );
+        assert_eq!(
+            iptables_owned_state_digest(&first),
+            iptables_owned_state_digest(&unrelated)
+        );
+        let changed = first.replacen("COMMIT", "-A MBED_INPUT -s 198.51.100.1 -j DROP\nCOMMIT", 1);
+        assert_ne!(
+            iptables_owned_state_digest(&first),
+            iptables_owned_state_digest(&changed)
         );
     }
 

@@ -555,6 +555,7 @@ max_diagnostic_records = 128
 max_diagnostic_record_bytes = 32768
 max_change_set_records = 32
 max_change_plan_bytes = 65536
+max_firewall_state_bytes = 262144
 
 [auth]
 enabled = false

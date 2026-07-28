@@ -13,6 +13,7 @@ use agent_protocol::{
     FirewallMatch, FirewallNatKind, FirewallNatRule, FirewallObject, FirewallProtocol,
     FirewallRejectKind, FirewallSetEntry, FirewallVerdict, IpNetwork, PortRange,
 };
+use ring::digest::{SHA256, digest};
 use thiserror::Error;
 
 use crate::firewall_project::{FirewallProjectionError, project_agent_objects};
@@ -88,6 +89,35 @@ pub fn inspect_nftables_table_state(
     }
 }
 
+/// Returns a stable digest of the complete fixed Agent-owned table listing.
+///
+/// Whitespace at line boundaries and blank lines are ignored, while all native
+/// statements inside the table remain part of the digest.
+///
+/// # Errors
+///
+/// Returns an error unless the listing is bounded and has the exact ownership marker.
+pub fn nftables_owned_state_digest(listing: &str) -> Result<String, NftablesRenderError> {
+    if inspect_nftables_table_state(Some(listing))? != NftablesTableState::AgentOwned {
+        return Err(NftablesRenderError::ForeignTable);
+    }
+    let normalized = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(hex_digest(normalized.as_bytes()))
+}
+
+fn hex_digest(value: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in digest(&SHA256, value).as_ref() {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
 /// Renders the complete projected Agent-owned firewall into an atomic nftables ruleset.
 ///
 /// The plan is applied in memory to the fresh inventory. Only Agent-owned objects participate;
@@ -98,7 +128,7 @@ pub fn inspect_nftables_table_state(
 ///
 /// Returns an error for ownership violations, stale plan/object disagreement, unsupported
 /// semantics, name collisions, expansion overflow, or an oversized ruleset.
-pub fn render_nftables_firewall_stage(
+pub(crate) fn render_nftables_firewall_stage(
     inventory: &FirewallInventory,
     plan: &FirewallMutationPlan,
     table_state: NftablesTableState,
@@ -933,6 +963,24 @@ mod tests {
         assert_eq!(
             inspect_nftables_table_state(Some("table ip mbed_agent {\n}\n")),
             Err(NftablesRenderError::MalformedInspection)
+        );
+    }
+
+    #[test]
+    fn owned_state_digest_normalizes_only_line_boundaries() {
+        let first =
+            "table inet mbed_agent {\n comment \"mbed-agent-owned:v1\"\n chain input { }\n}\n";
+        let whitespace =
+            "\n table inet mbed_agent { \n\tcomment \"mbed-agent-owned:v1\"\nchain input { }\n }\n";
+        let changed =
+            "table inet mbed_agent {\n comment \"mbed-agent-owned:v1\"\n chain input { drop }\n}\n";
+        assert_eq!(
+            nftables_owned_state_digest(first),
+            nftables_owned_state_digest(whitespace)
+        );
+        assert_ne!(
+            nftables_owned_state_digest(first),
+            nftables_owned_state_digest(changed)
         );
     }
 

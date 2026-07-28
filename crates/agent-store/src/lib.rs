@@ -7,6 +7,8 @@ use agent_protocol::{ChangeSetState, RiskLevel};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
+const FIREWALL_RUNTIME_STATE_KEY: &str = "firewall_runtime_state_v1";
+
 pub struct Store {
     connection: Mutex<Connection>,
     path: PathBuf,
@@ -596,6 +598,65 @@ impl Store {
         Ok(ChangeSetState::Approved)
     }
 
+    /// Atomically replaces the boot-bound generic firewall canonical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload exceeds its configured cap or `SQLite` cannot write it.
+    pub fn replace_firewall_runtime_state(
+        &self,
+        payload: &[u8],
+        max_payload_bytes: usize,
+    ) -> Result<(), StoreError> {
+        if payload.is_empty() || payload.len() > max_payload_bytes {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload.len(),
+                limit: max_payload_bytes,
+            });
+        }
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                     updated_at = excluded.updated_at",
+                params![FIREWALL_RUNTIME_STATE_KEY, payload],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Loads the bounded boot-bound generic firewall canonical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored value exceeds its configured cap or `SQLite` cannot read.
+    pub fn firewall_runtime_state(
+        &self,
+        max_payload_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let connection = self.connection()?;
+        let payload: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                [FIREWALL_RUNTIME_STATE_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if payload
+            .as_ref()
+            .is_some_and(|value| value.len() > max_payload_bytes)
+        {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload.as_ref().map_or(0, Vec::len),
+                limit: max_payload_bytes,
+            });
+        }
+        Ok(payload)
+    }
+
     pub fn database_bytes(&self) -> u64 {
         file_len(&self.path)
             .saturating_add(file_len(&PathBuf::from(format!(
@@ -931,6 +992,37 @@ mod tests {
         store.health_check().expect("healthy store");
         assert_eq!(store.max_database_bytes(), 1024 * 1024);
         assert!(store.database_bytes() > 0);
+        drop(store);
+        fs::remove_dir_all(root).expect("remove store test directory");
+    }
+
+    #[test]
+    fn replaces_and_bounds_volatile_firewall_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-agent-firewall-state-{nonce}"));
+        let store = Store::open(&root.join("agent.db"), 1024 * 1024).expect("open store");
+        assert_eq!(store.firewall_runtime_state(16).expect("empty"), None);
+        store
+            .replace_firewall_runtime_state(b"first", 16)
+            .expect("first state");
+        store
+            .replace_firewall_runtime_state(b"second", 16)
+            .expect("replace state");
+        assert_eq!(
+            store.firewall_runtime_state(16).expect("load"),
+            Some(b"second".to_vec())
+        );
+        assert!(matches!(
+            store.replace_firewall_runtime_state(b"too-large", 4),
+            Err(StoreError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            store.firewall_runtime_state(4),
+            Err(StoreError::PayloadTooLarge { .. })
+        ));
         drop(store);
         fs::remove_dir_all(root).expect("remove store test directory");
     }
