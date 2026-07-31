@@ -11,6 +11,7 @@ use tokio::net::UnixStream;
 use zeroize::{Zeroize, Zeroizing};
 
 mod daemon;
+mod firewall_execution;
 mod logging;
 
 #[derive(Debug, Parser)]
@@ -192,6 +193,20 @@ enum ChangeTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Consume a one-use approval token from stdin and execute its exact plan.
+    Apply {
+        change_set_id: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Re-verify and confirm a high-risk change before its rollback deadline.
+    Confirm {
+        change_set_id: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Reject a pending plan owned by the local actor.
     Reject {
         change_set_id: String,
@@ -313,6 +328,26 @@ async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
             change_set_id,
             socket,
         } => run_client(&socket, Command::ChangeApprove { change_set_id }).await,
+        ChangeTarget::Apply {
+            change_set_id,
+            approval_id,
+            socket,
+        } => {
+            let token = read_secret_stdin("approval token")?;
+            run_client(
+                &socket,
+                Command::ChangeApply {
+                    change_set_id,
+                    approval_id,
+                    approval_token: SensitiveString::new(token),
+                },
+            )
+            .await
+        }
+        ChangeTarget::Confirm {
+            change_set_id,
+            socket,
+        } => run_client(&socket, Command::ChangeConfirm { change_set_id }).await,
         ChangeTarget::Reject {
             change_set_id,
             socket,
@@ -340,6 +375,15 @@ fn read_password_stdin() -> Result<Zeroizing<Vec<u8>>, Box<dyn Error>> {
         return Err("administrator password must not be empty".into());
     }
     Ok(password)
+}
+
+fn read_secret_stdin(label: &str) -> Result<String, Box<dyn Error>> {
+    let mut secret = read_password_stdin()?;
+    String::from_utf8(std::mem::take(&mut secret)).map_err(|error| {
+        let mut invalid = error.into_bytes();
+        invalid.zeroize();
+        format!("{label} must be valid UTF-8").into()
+    })
 }
 
 async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error>> {

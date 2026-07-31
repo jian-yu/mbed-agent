@@ -21,7 +21,9 @@ pub enum Command {
     Ping,
     Status,
     Capabilities,
-    DiagnoseWan { active: bool },
+    DiagnoseWan {
+        active: bool,
+    },
     DiagnoseDns,
     DiagnoseDhcp,
     DiagnoseRoutes,
@@ -34,13 +36,35 @@ pub enum Command {
     DiagnoseInterfaceStats,
     DiagnoseConntrack,
     DiagnoseQdisc,
-    Elevate { password: SensitiveString },
-    ChangeGet { change_set_id: String },
-    ChangeApprove { change_set_id: String },
-    ChangeReject { change_set_id: String },
-    DiagnosticHistory { limit: u16 },
-    TaskHistory { limit: u16 },
-    Complete { prompt: String },
+    Elevate {
+        password: SensitiveString,
+    },
+    ChangeGet {
+        change_set_id: String,
+    },
+    ChangeApprove {
+        change_set_id: String,
+    },
+    ChangeApply {
+        change_set_id: String,
+        approval_id: String,
+        approval_token: SensitiveString,
+    },
+    ChangeConfirm {
+        change_set_id: String,
+    },
+    ChangeReject {
+        change_set_id: String,
+    },
+    DiagnosticHistory {
+        limit: u16,
+    },
+    TaskHistory {
+        limit: u16,
+    },
+    Complete {
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1367,6 +1391,14 @@ mod tests {
                 change_set_id: "change-1".into(),
             },
             Command::ChangeApprove {
+                change_set_id: "change-1".into(),
+            },
+            Command::ChangeApply {
+                change_set_id: "change-1".into(),
+                approval_id: "0123456789abcdef0123456789abcdef".into(),
+                approval_token: SensitiveString::new("one-use-secret".into()),
+            },
+            Command::ChangeConfirm {
                 change_set_id: "change-1".into(),
             },
             Command::ChangeReject {

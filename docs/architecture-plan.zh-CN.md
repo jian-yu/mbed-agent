@@ -1027,8 +1027,12 @@ OpenWrt 原生 transaction 已接通实际 UCI staging 与安装原语：读取 
 inventory，并执行 fw3 双栈 print 或 fw4 check。安装入口只在 validated 状态可用，
 且会在 Flash 原子 rename 前再次比较 live `uci show` 和源文件 SHA-256，发现并发
 漂移即拒绝。安装后 reload 并重建 typed inventory 验证；staging 在失败和 drop 时
-清理。daemon 仍需把 rollback helper 的成功 arm 证明、SQLite 状态转换和 approval
-token 消费接到该入口后，才会对 CLI/Channel 开放。
+清理。daemon 已用单写锁把一次性 approval token 原子消费、SQLite 安全状态转换、
+rollback bundle、同一二进制独立 helper 与该原生事务接成闭环，并开放 `change apply`。
+token 只从 stdin 读取，不进入 argv；仅 OpenWrt 21.02+ 的 fw3/fw4 capability 可进入
+当前写路径。R3 变更进入 `awaiting_confirmation`，`change confirm` 会重新读取 live
+UCI 并逐一核对所有受影响对象后才原子确认 watchdog；超时或执行/验证失败由 helper
+恢复。普通 Linux nftables/iptables execution port 仍按同一闭环继续接入。
 
 独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
 通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突

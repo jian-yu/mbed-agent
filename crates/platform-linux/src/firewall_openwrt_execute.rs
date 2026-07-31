@@ -5,7 +5,10 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use agent_core::{FirewallExecutionPlan, FirewallInventory, project_firewall_inventory};
+use agent_core::{
+    FirewallExecutionPlan, FirewallInventory, project_firewall_inventory,
+    verify_firewall_plan_result,
+};
 use ring::digest::{SHA256, digest};
 use thiserror::Error;
 
@@ -337,6 +340,28 @@ impl<R: FirewallCommandExecutor> OpenWrtFirewallTransaction<R> {
             Err(OpenWrtExecutionError::InvalidState)
         }
     }
+}
+
+/// Re-inspects live UCI state and verifies every object touched by an approved execution plan.
+///
+/// # Errors
+///
+/// Returns an error for command, decoding, inventory, or approved-result mismatch failures.
+pub fn verify_openwrt_firewall_plan(
+    runner: &impl FirewallCommandExecutor,
+    execution: &FirewallExecutionPlan,
+) -> Result<(), OpenWrtExecutionError> {
+    execution
+        .validate()
+        .map_err(|_| OpenWrtExecutionError::InvalidPlan)?;
+    let actual = runner
+        .execute(&FirewallCommand::UciShowFirewall, None)?
+        .stdout;
+    let snapshot = inspect_openwrt_firewall_inventory(
+        std::str::from_utf8(&actual).map_err(|_| OpenWrtExecutionError::MalformedInspection)?,
+    )?;
+    verify_firewall_plan_result(snapshot.inventory(), &execution.typed)
+        .map_err(|_| OpenWrtExecutionError::VerificationFailed)
 }
 
 impl<R> Drop for OpenWrtFirewallTransaction<R> {

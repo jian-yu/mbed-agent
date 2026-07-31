@@ -200,6 +200,8 @@ binary:
 ```sh
 cargo run -p mbed-agent -- change get CHANGE_SET_ID
 cargo run -p mbed-agent -- change approve CHANGE_SET_ID
+cargo run -p mbed-agent -- change apply CHANGE_SET_ID --approval-id APPROVAL_ID < approval-token.txt
+cargo run -p mbed-agent -- change confirm CHANGE_SET_ID
 cargo run -p mbed-agent -- change reject CHANGE_SET_ID
 ```
 

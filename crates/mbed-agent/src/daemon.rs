@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::{
-    AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, TmpBudget, plan_digest,
+    AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, FirewallExecutionPlan, TmpBudget,
+    confirm_awaiting_execution, execute_approved_change, plan_digest,
 };
 use agent_protocol::{
     ChangeApprovalResponse, ChangePlan, ChangeSetResponse, ChangeSetState, ClientRequest, Command,
@@ -26,15 +27,17 @@ use agent_store::{
     ApprovalRecord, ChangeSetRecord, DiagnosticRecord, Store, StoreError, TaskRecord,
 };
 use agent_tools::ToolRunner;
-use platform_linux::PlatformCapabilities;
+use platform_linux::firewall_command::FirewallCommandRunner;
+use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
+use crate::firewall_execution::{OpenWrtExecutionPort, OpenWrtExecutionPortConfig};
 use crate::logging;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,6 +45,7 @@ const LOCAL_CLI_ACTOR: &str = "cli/local";
 
 struct AppState {
     config: AgentConfig,
+    config_path: std::path::PathBuf,
     platform: PlatformCapabilities,
     budget: TmpBudget,
     store: Arc<Store>,
@@ -52,6 +56,7 @@ struct AppState {
     log_writer: logging::BoundedMakeWriter,
     started: Instant,
     auth: Arc<AuthManager>,
+    configuration_lock: Mutex<()>,
 }
 
 pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -106,6 +111,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let listener = bind_socket(&config.server.socket_path, config.server.socket_mode)?;
     let state = Arc::new(AppState {
         config,
+        config_path: config_path.to_path_buf(),
         platform,
         budget,
         store,
@@ -116,6 +122,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         log_writer,
         started: Instant::now(),
         auth,
+        configuration_lock: Mutex::new(()),
     });
     let mut cleanup_interval =
         tokio::time::interval(Duration::from_secs(state.budget.cleanup_interval_secs()));
@@ -324,6 +331,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<AppState>) -> io::Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Closed protocol dispatch remains auditable in one match.
 async fn handle_request(request: ClientRequest, state: &AppState) -> ServerResponse {
     if request.protocol_version != PROTOCOL_VERSION {
         return ServerResponse::error(
@@ -366,6 +374,23 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         }
         Command::ChangeApprove { change_set_id } => {
             return handle_change_approve(request.id, change_set_id, state).await;
+        }
+        Command::ChangeApply {
+            change_set_id,
+            approval_id,
+            approval_token,
+        } => {
+            return handle_change_apply(
+                request.id,
+                change_set_id,
+                approval_id,
+                approval_token,
+                state,
+            )
+            .await;
+        }
+        Command::ChangeConfirm { change_set_id } => {
+            return handle_change_confirm(request.id, change_set_id, state).await;
         }
         Command::ChangeReject { change_set_id } => {
             return handle_change_reject(request.id, change_set_id, state).await;
@@ -604,6 +629,314 @@ async fn handle_change_approve(
     }
 }
 
+async fn handle_change_apply(
+    id: String,
+    change_set_id: String,
+    approval_id: String,
+    approval_token: SensitiveString,
+    state: &AppState,
+) -> ServerResponse {
+    if !valid_change_set_id(&change_set_id)
+        || !valid_execution_transaction_id(&change_set_id)
+        || !valid_approval_id(&approval_id)
+    {
+        return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid change approval");
+    }
+    let _configuration_guard = state.configuration_lock.lock().await;
+    let now = match boot_monotonic_ms() {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let Some(record) = load_change_set(&id, &change_set_id, state).await else {
+        return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
+    };
+    let response = match change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+        Ok(response) => response,
+        Err(error) => return error.with_id(id),
+    };
+    if record.state != ChangeSetState::AwaitingApproval || now >= record.expires_monotonic_ms {
+        return ServerResponse::error(
+            id,
+            ErrorCode::Conflict,
+            "ChangeSet is not awaiting a valid approval",
+        );
+    }
+    let execution = match load_firewall_execution_plan(&record, state).await {
+        Ok(execution) if execution.preview == response.plan => execution,
+        Ok(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "stored execution plan binding is invalid",
+            );
+        }
+        Err(response) => return response.with_id(id),
+    };
+    let backend = match openwrt_write_backend(state) {
+        Ok(backend) => backend,
+        Err(response) => return response.with_id(id),
+    };
+    if !state.config_path.is_file() {
+        return ServerResponse::error(
+            id,
+            ErrorCode::Conflict,
+            "daemon configuration must exist before arming the rollback helper",
+        );
+    }
+    let token_digest = sha256_hex(approval_token.expose().as_bytes());
+    if let Err(error) =
+        consume_change_approval(approval_id, token_digest, record.clone(), now, state).await
+    {
+        return error.with_id(id);
+    }
+    drop(approval_token);
+
+    let deadline = now.saturating_add(
+        state
+            .config
+            .runtime
+            .rollback_confirm_timeout_secs
+            .saturating_mul(1_000),
+    );
+    let port_config = openwrt_port_config(record.clone(), execution, backend, now, state);
+    let confirmation_required = record.risk >= agent_protocol::RiskLevel::R3;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut port = OpenWrtExecutionPort::apply(port_config)?;
+        execute_approved_change(&mut port, now, deadline, confirmation_required)
+            .map_err(|_| agent_core::ExecutionPortError)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(result)) => {
+            info!(change_set_id = %record.id, ?result, "configuration change executed");
+            current_change_set_response(id, &record.id, state).await
+        }
+        Ok(Err(_)) => {
+            error!(change_set_id = %record.id, "configuration change execution failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Conflict,
+                "configuration execution failed; inspect the ChangeSet state",
+            )
+        }
+        Err(error) => {
+            error!(change_set_id = %record.id, %error, "configuration execution worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "configuration executor is unavailable",
+            )
+        }
+    }
+}
+
+async fn consume_change_approval(
+    approval_id: String,
+    token_digest: String,
+    record: ChangeSetRecord,
+    now_monotonic_ms: u64,
+    state: &AppState,
+) -> Result<(), PendingResponseError> {
+    let store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || {
+        store.consume_approval(
+            &agent_store::ApprovalConsumption {
+                approval_id: &approval_id,
+                change_set_id: &record.id,
+                actor_id: &record.actor_id,
+                plan_digest: &record.plan_digest,
+                boot_id: &record.boot_id,
+                token_digest: &token_digest,
+            },
+            now_monotonic_ms,
+        )
+    })
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(StoreError::ApprovalRejected)) => Err(PendingResponseError::conflict(
+            "change approval is invalid, expired, or already consumed",
+        )),
+        Ok(Err(error)) => {
+            error!(%error, "approval consumption failed");
+            Err(PendingResponseError::internal(
+                "approval storage is unavailable",
+            ))
+        }
+        Err(error) => {
+            error!(%error, "approval consumption worker failed");
+            Err(PendingResponseError::internal(
+                "approval storage is unavailable",
+            ))
+        }
+    }
+}
+
+async fn handle_change_confirm(
+    id: String,
+    change_set_id: String,
+    state: &AppState,
+) -> ServerResponse {
+    if !valid_change_set_id(&change_set_id) || !valid_execution_transaction_id(&change_set_id) {
+        return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
+    }
+    let capability_now = process_monotonic_ms(state);
+    match state.auth.is_device_admin(LOCAL_CLI_ACTOR, capability_now) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Unauthorized,
+                "device-admin elevation is required",
+            );
+        }
+        Err(error) => {
+            error!(%error, "administrator capability check failed");
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            );
+        }
+    }
+    let _configuration_guard = state.configuration_lock.lock().await;
+    let now = match boot_monotonic_ms() {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let Some(record) = load_change_set(&id, &change_set_id, state).await else {
+        return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
+    };
+    if let Err(error) = change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+        return error.with_id(id);
+    }
+    if record.state != ChangeSetState::AwaitingConfirmation
+        || record
+            .rollback_deadline_monotonic_ms
+            .is_none_or(|deadline| now >= deadline)
+    {
+        return ServerResponse::error(
+            id,
+            ErrorCode::Conflict,
+            "ChangeSet is not awaiting confirmation or its deadline passed",
+        );
+    }
+    let execution = match load_firewall_execution_plan(&record, state).await {
+        Ok(execution) => execution,
+        Err(response) => return response.with_id(id),
+    };
+    let backend = match openwrt_write_backend(state) {
+        Ok(backend) => backend,
+        Err(response) => return response.with_id(id),
+    };
+    let port_config = openwrt_port_config(record.clone(), execution, backend, now, state);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut port = OpenWrtExecutionPort::confirmation(port_config);
+        confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(result)) => {
+            info!(change_set_id = %record.id, ?result, "configuration change confirmed");
+            current_change_set_response(id, &record.id, state).await
+        }
+        Ok(Err(_)) => {
+            error!(change_set_id = %record.id, "configuration confirmation failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Conflict,
+                "configuration confirmation failed; inspect the ChangeSet state",
+            )
+        }
+        Err(error) => {
+            error!(change_set_id = %record.id, %error, "configuration confirmation worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "configuration executor is unavailable",
+            )
+        }
+    }
+}
+
+async fn load_firewall_execution_plan(
+    record: &ChangeSetRecord,
+    state: &AppState,
+) -> Result<FirewallExecutionPlan, PendingResponseError> {
+    let max_bytes = usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
+        .map_err(|_| PendingResponseError::internal("execution plan limit is invalid"))?;
+    let store = Arc::clone(&state.store);
+    let record = record.clone();
+    let payload = tokio::task::spawn_blocking(move || {
+        store.firewall_execution_plan(&record.id, &record.plan_digest, &record.boot_id, max_bytes)
+    })
+    .await
+    .map_err(|_| PendingResponseError::internal("execution plan storage is unavailable"))?
+    .map_err(|_| PendingResponseError::internal("execution plan storage is unavailable"))?
+    .ok_or_else(|| PendingResponseError::conflict("ChangeSet has no executable firewall plan"))?;
+    FirewallExecutionPlan::decode(&payload)
+        .map_err(|_| PendingResponseError::internal("stored execution plan is invalid"))
+}
+
+fn openwrt_write_backend(state: &AppState) -> Result<FirewallBackend, PendingResponseError> {
+    if state.platform.kind != PlatformKind::OpenWrt || !state.platform.release_supported {
+        return Err(PendingResponseError::conflict(
+            "this execution path requires supported OpenWrt 21.02 or newer",
+        ));
+    }
+    match state.platform.firewall.backend {
+        backend @ (FirewallBackend::Fw3 | FirewallBackend::Fw4) => Ok(backend),
+        _ => Err(PendingResponseError::conflict(
+            "no supported writable OpenWrt firewall backend is available",
+        )),
+    }
+}
+
+fn openwrt_port_config(
+    record: ChangeSetRecord,
+    execution: FirewallExecutionPlan,
+    backend: FirewallBackend,
+    now_monotonic_ms: u64,
+    state: &AppState,
+) -> OpenWrtExecutionPortConfig {
+    let runtime_root = state.budget.root().to_path_buf();
+    let max_input = usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
+        .unwrap_or(usize::MAX);
+    OpenWrtExecutionPortConfig {
+        runner: FirewallCommandRunner::system(
+            runtime_root.clone(),
+            Duration::from_secs(state.config.runtime.tool_timeout_secs),
+            max_input,
+            state.config.runtime.max_tool_output_bytes,
+        ),
+        store: Arc::clone(&state.store),
+        runtime_root,
+        config_path: state.config_path.clone(),
+        change_set_id: record.id,
+        plan_digest: record.plan_digest,
+        boot_id: record.boot_id,
+        now_monotonic_ms,
+        rollback_timeout_secs: state.config.runtime.rollback_confirm_timeout_secs,
+        max_rollback_bytes: state.config.storage.max_rollback_bytes,
+        backend,
+        execution,
+    }
+}
+
+async fn current_change_set_response(
+    id: String,
+    change_set_id: &str,
+    state: &AppState,
+) -> ServerResponse {
+    let Some(record) = load_change_set(&id, change_set_id, state).await else {
+        return ServerResponse::error(id, ErrorCode::Internal, "ChangeSet state is unavailable");
+    };
+    match change_set_response(record, LOCAL_CLI_ACTOR, state) {
+        Ok(response) => ServerResponse::success(id, ResponseData::ChangeSet(response)),
+        Err(error) => error.with_id(id),
+    }
+}
+
 async fn handle_change_reject(
     id: String,
     change_set_id: String,
@@ -757,6 +1090,18 @@ fn valid_change_set_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
         })
+}
+
+fn valid_approval_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_execution_transaction_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn process_monotonic_ms(state: &AppState) -> u64 {
@@ -3726,6 +4071,8 @@ mod tests {
             log_writer: test_log_writer(&root),
             started: Instant::now(),
             auth: Arc::new(auth),
+            config_path: root.join("config.toml"),
+            configuration_lock: Mutex::new(()),
             config,
         };
 
@@ -3821,6 +4168,8 @@ mod tests {
             log_writer: test_log_writer(root),
             started: Instant::now(),
             auth: Arc::new(auth),
+            config_path: root.join("config.toml"),
+            configuration_lock: Mutex::new(()),
             config,
         };
         (store, state)
@@ -3944,6 +4293,8 @@ mod tests {
             log_writer: test_log_writer(&root),
             started: Instant::now(),
             auth: Arc::new(AuthManager::disabled("test-boot".into())),
+            config_path: root.join("config.toml"),
+            configuration_lock: Mutex::new(()),
             config,
         };
 
@@ -3957,6 +4308,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn agent_loop_reuses_one_snapshot_across_multiple_tools() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
@@ -4033,6 +4385,8 @@ mod tests {
             log_writer: test_log_writer(&root),
             started: Instant::now(),
             auth: Arc::new(AuthManager::disabled("test-boot".into())),
+            config_path: root.join("config.toml"),
+            configuration_lock: Mutex::new(()),
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
@@ -4109,6 +4463,8 @@ mod tests {
             log_writer: test_log_writer(&root),
             started: Instant::now(),
             auth: Arc::new(AuthManager::disabled("test-boot".into())),
+            config_path: root.join("config.toml"),
+            configuration_lock: Mutex::new(()),
             config,
         };
 

@@ -345,6 +345,55 @@ pub fn project_firewall_inventory(
     Ok(FirewallInventory { objects })
 }
 
+/// Verifies that every object touched by a validated plan has its approved live value.
+///
+/// Unrelated objects are intentionally ignored because they may change after activation; the
+/// exact touched-object check still prevents confirmation of a partially applied or reverted plan.
+///
+/// # Errors
+///
+/// Returns an error for malformed inventories/plans, duplicate identities, missing desired
+/// objects, objects that differ from the approved value, or deleted objects that remain live.
+pub fn verify_firewall_plan_result(
+    inventory: &FirewallInventory,
+    plan: &FirewallMutationPlan,
+) -> Result<(), FirewallPlanError> {
+    if inventory.objects.len() > MAX_OBJECTS
+        || plan.changes.is_empty()
+        || plan.changes.len() > MAX_MUTATIONS
+    {
+        return Err(FirewallPlanError::Capacity);
+    }
+    let mut live = HashMap::with_capacity(inventory.objects.len());
+    for object in &inventory.objects {
+        validate_firewall_object(object)?;
+        let key = (object.kind().to_owned(), object.id().to_owned());
+        if live.insert(key, object).is_some() {
+            return Err(FirewallPlanError::DuplicateObject);
+        }
+    }
+    let mut touched = HashSet::with_capacity(plan.changes.len());
+    for change in &plan.changes {
+        validate_execution_change(&change.diff, change)
+            .map_err(|_| FirewallPlanError::PlanMismatch)?;
+        let object = change
+            .after
+            .as_ref()
+            .or(change.before.as_ref())
+            .ok_or(FirewallPlanError::PlanMismatch)?;
+        let key = (object.kind().to_owned(), object.id().to_owned());
+        if !touched.insert(key.clone()) {
+            return Err(FirewallPlanError::DuplicateMutation);
+        }
+        match &change.after {
+            Some(expected) if live.get(&key).copied() == Some(expected) => {}
+            None if !live.contains_key(&key) => {}
+            _ => return Err(FirewallPlanError::PlanMismatch),
+        }
+    }
+    Ok(())
+}
+
 fn validate_projected_references(
     inventory: &FirewallInventory,
     changes: &[FirewallPlannedChange],
@@ -1131,6 +1180,19 @@ mod tests {
         assert_eq!(
             FirewallExecutionPlan::decode(&encoded).expect("decode"),
             execution
+        );
+        let applied = FirewallInventory {
+            objects: vec![
+                execution.typed.changes[0]
+                    .after
+                    .clone()
+                    .expect("created object"),
+            ],
+        };
+        verify_firewall_plan_result(&applied, &execution.typed).expect("approved result");
+        assert_eq!(
+            verify_firewall_plan_result(&FirewallInventory { objects: vec![] }, &execution.typed),
+            Err(FirewallPlanError::PlanMismatch)
         );
 
         let mut tampered = execution;

@@ -40,8 +40,7 @@ independent rollback helper is armed.
 
 ## Consequences
 
-The OpenWrt backend now has a concrete path that can perform an actual atomic
-configuration write, but it is not yet exposed directly to CLI or Channels.
-The daemon execution port must first connect ChangeSet state persistence,
-approval consumption, rollback-helper spawning, and confirmation to this
-native transaction.
+The OpenWrt backend has a concrete path that can perform an actual atomic
+configuration write. ADR 0036 connects it to daemon authorization, state,
+rollback-helper spawning, and CLI apply/confirmation. Channels must use the
+same protocol path rather than call this transaction directly.
