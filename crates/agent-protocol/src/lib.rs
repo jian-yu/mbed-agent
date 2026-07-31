@@ -45,6 +45,10 @@ pub enum Command {
     ChangeApprove {
         change_set_id: String,
     },
+    FirewallPlan {
+        mutations: Vec<FirewallMutationRequest>,
+    },
+    FirewallInventory,
     ChangeApply {
         change_set_id: String,
         approval_id: String,
@@ -64,6 +68,28 @@ pub enum Command {
     },
     Complete {
         prompt: String,
+    },
+}
+
+/// Closed, typed mutation request accepted by the firewall planner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FirewallMutationRequest {
+    Create {
+        desired: FirewallObject,
+    },
+    Update {
+        expected_digest: String,
+        desired: FirewallObject,
+    },
+    Delete {
+        kind: String,
+        id: String,
+        expected_digest: String,
+    },
+    Move {
+        expected_digest: String,
+        desired: FirewallObject,
     },
 }
 
@@ -127,6 +153,7 @@ pub enum ResponseData {
     Elevation(ElevationResponse),
     ChangeSet(ChangeSetResponse),
     ChangeApproval(ChangeApprovalResponse),
+    FirewallInventory(FirewallInventoryResponse),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -191,6 +218,17 @@ pub struct ChangeApprovalResponse {
     pub plan_digest: String,
     pub token: SensitiveString,
     pub expires_monotonic_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallInventoryResponse {
+    pub objects: Vec<FirewallInventoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallInventoryEntry {
+    pub digest: String,
+    pub object: FirewallObject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1393,6 +1431,10 @@ mod tests {
             Command::ChangeApprove {
                 change_set_id: "change-1".into(),
             },
+            Command::FirewallPlan {
+                mutations: Vec::new(),
+            },
+            Command::FirewallInventory,
             Command::ChangeApply {
                 change_set_id: "change-1".into(),
                 approval_id: "0123456789abcdef0123456789abcdef".into(),
@@ -1415,6 +1457,26 @@ mod tests {
                 serde_json::from_str(&encoded).expect("deserialize request");
             assert_eq!(decoded, request);
         }
+    }
+
+    #[test]
+    fn firewall_mutation_requests_reject_unknown_fields() {
+        let request = FirewallMutationRequest::Delete {
+            kind: "filter_rule".into(),
+            id: "guest-block".into(),
+            expected_digest: "a".repeat(64),
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        assert_eq!(
+            serde_json::from_slice::<FirewallMutationRequest>(&encoded).expect("decode"),
+            request
+        );
+        assert!(
+            serde_json::from_str::<FirewallMutationRequest>(
+                r#"{"operation":"delete","kind":"filter_rule","id":"x","expected_digest":"abc","command":"iptables -F"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

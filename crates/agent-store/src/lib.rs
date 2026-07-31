@@ -365,6 +365,103 @@ impl Store {
         transaction.commit().map_err(StoreError::Sqlite)
     }
 
+    /// Atomically creates a planned firewall `ChangeSet`, binds its executable payload, and
+    /// exposes it for approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds/bindings, capacity pressure, duplicate identifiers,
+    /// an expired plan, or any `SQLite` failure. No partial record is committed.
+    pub fn create_firewall_change_set(
+        &self,
+        record: &ChangeSetRecord,
+        execution_payload: &[u8],
+        max_records: u32,
+        max_plan_bytes: usize,
+        max_execution_bytes: usize,
+        now_monotonic_ms: u64,
+    ) -> Result<ChangeSetState, StoreError> {
+        validate_change_set_record(record, max_plan_bytes)?;
+        if record.state != ChangeSetState::Planned {
+            return Err(StoreError::ChangeSetConflict);
+        }
+        if record.expires_monotonic_ms <= now_monotonic_ms {
+            return Err(StoreError::ChangeSetExpired);
+        }
+        if execution_payload.is_empty() || execution_payload.len() > max_execution_bytes {
+            return Err(StoreError::PayloadTooLarge {
+                actual: execution_payload.len(),
+                limit: max_execution_bytes,
+            });
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(StoreError::Sqlite)?;
+        let active: u32 = transaction
+            .query_row(
+                "SELECT count(*) FROM change_sets WHERE state NOT IN
+                 ('confirmed', 'rejected', 'expired', 'rolled_back', 'rollback_failed')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if active >= max_records {
+            return Err(StoreError::ChangeSetCapacity);
+        }
+        transaction
+            .execute(
+                "INSERT INTO change_sets
+                 (id, plan_digest, plan_payload, state, actor_id, boot_id, risk,
+                  expires_monotonic_ms, rollback_deadline_monotonic_ms, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'planned', ?4, ?5, ?6, ?7, NULL,
+                         unixepoch(), unixepoch())",
+                params![
+                    record.id,
+                    record.plan_digest,
+                    record.plan_payload,
+                    record.actor_id,
+                    record.boot_id,
+                    record.risk.as_str(),
+                    u64_to_sql(record.expires_monotonic_ms),
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO change_execution_plans
+                 (change_set_id, domain, plan_digest, boot_id, payload, created_at)
+                 VALUES (?1, 'firewall', ?2, ?3, ?4, unixepoch())",
+                params![
+                    record.id,
+                    record.plan_digest,
+                    record.boot_id,
+                    execution_payload
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE change_sets SET state = 'awaiting_approval', updated_at = unixepoch()
+                 WHERE id = ?1 AND state = 'planned' AND plan_digest = ?2 AND boot_id = ?3",
+                params![record.id, record.plan_digest, record.boot_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if changed != 1 {
+            return Err(StoreError::ChangeSetConflict);
+        }
+        transaction
+            .execute(
+                "DELETE FROM change_sets WHERE id IN (
+                   SELECT id FROM change_sets
+                   WHERE state IN ('confirmed', 'rejected', 'expired', 'rolled_back', 'rollback_failed')
+                   ORDER BY updated_at DESC, rowid DESC LIMIT -1 OFFSET ?1
+                 )",
+                [max_records],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ChangeSetState::AwaitingApproval)
+    }
+
     /// Returns one `ChangeSet` record by identifier.
     ///
     /// # Errors
@@ -1279,6 +1376,39 @@ mod tests {
                 .firewall_execution_plan("change-exec", PLAN_DIGEST, "wrong-boot", 32)
                 .expect("wrong binding"),
             None
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn firewall_change_creation_is_atomic_and_approval_ready() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-agent-change-create-{nonce}"));
+        let store = Store::open(&root.join("agent.db"), 1024 * 1024).expect("open store");
+        let record = change_set_record("firewall-create", 1_000);
+        assert_eq!(
+            store
+                .create_firewall_change_set(&record, b"typed", 4, 4096, 32, 100)
+                .expect("create"),
+            ChangeSetState::AwaitingApproval
+        );
+        assert_eq!(
+            store
+                .change_set("firewall-create")
+                .expect("load")
+                .expect("record")
+                .state,
+            ChangeSetState::AwaitingApproval
+        );
+        assert_eq!(
+            store
+                .firewall_execution_plan("firewall-create", PLAN_DIGEST, "boot-1", 32)
+                .expect("execution"),
+            Some(b"typed".to_vec())
         );
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");

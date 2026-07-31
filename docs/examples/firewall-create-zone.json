@@ -1,0 +1,19 @@
+[
+  {
+    "operation": "create",
+    "desired": {
+      "kind": "zone",
+      "spec": {
+        "id": "guest_agent",
+        "ownership": "agent_owned",
+        "enabled": true,
+        "networks": ["guest"],
+        "input": "drop",
+        "output": "accept",
+        "forward": "drop",
+        "masquerade": false,
+        "mtu_fix": false
+      }
+    }
+  }
+]

@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::generate_password_hash;
-use agent_protocol::{ClientRequest, Command, PROTOCOL_VERSION, SensitiveString, ServerResponse};
+use agent_protocol::{
+    ClientRequest, Command, FirewallMutationRequest, PROTOCOL_VERSION, SensitiveString,
+    ServerResponse,
+};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -181,6 +184,16 @@ enum AuthTarget {
 
 #[derive(Debug, Subcommand)]
 enum ChangeTarget {
+    /// Show a fresh typed firewall inventory with exact object digests.
+    FirewallInventory {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Read a typed firewall mutation array from stdin and create an approval-ready plan.
+    FirewallPlan {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
     /// Show one typed plan and its current volatile state.
     Get {
         change_set_id: String,
@@ -197,7 +210,7 @@ enum ChangeTarget {
     Apply {
         change_set_id: String,
         #[arg(long)]
-        approval_id: String,
+        approval_id: Option<String>,
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
@@ -320,6 +333,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
     match target {
+        ChangeTarget::FirewallInventory { socket } => {
+            run_client(&socket, Command::FirewallInventory).await
+        }
+        ChangeTarget::FirewallPlan { socket } => {
+            let input = read_bounded_stdin(60 * 1024, "firewall plan")?;
+            let mutations: Vec<FirewallMutationRequest> = serde_json::from_slice(&input)?;
+            run_client(&socket, Command::FirewallPlan { mutations }).await
+        }
         ChangeTarget::Get {
             change_set_id,
             socket,
@@ -333,7 +354,7 @@ async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
             approval_id,
             socket,
         } => {
-            let token = read_secret_stdin("approval token")?;
+            let (approval_id, token) = read_approval_stdin(&change_set_id, approval_id.as_deref())?;
             run_client(
                 &socket,
                 Command::ChangeApply {
@@ -353,6 +374,21 @@ async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
             socket,
         } => run_client(&socket, Command::ChangeReject { change_set_id }).await,
     }
+}
+
+fn read_bounded_stdin(limit: usize, label: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut input = Vec::new();
+    io::stdin()
+        .lock()
+        .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut input)?;
+    if input.len() > limit {
+        return Err(format!("{label} exceeds {limit} bytes").into());
+    }
+    if input.is_empty() {
+        return Err(format!("{label} must not be empty").into());
+    }
+    Ok(input)
 }
 
 fn read_password_stdin() -> Result<Zeroizing<Vec<u8>>, Box<dyn Error>> {
@@ -377,13 +413,46 @@ fn read_password_stdin() -> Result<Zeroizing<Vec<u8>>, Box<dyn Error>> {
     Ok(password)
 }
 
-fn read_secret_stdin(label: &str) -> Result<String, Box<dyn Error>> {
-    let mut secret = read_password_stdin()?;
-    String::from_utf8(std::mem::take(&mut secret)).map_err(|error| {
+fn read_approval_stdin(
+    change_set_id: &str,
+    supplied_approval_id: Option<&str>,
+) -> Result<(String, String), Box<dyn Error>> {
+    let mut input = Zeroizing::new(read_bounded_stdin(8 * 1024, "change approval")?);
+    parse_approval_input(change_set_id, supplied_approval_id, &mut input)
+}
+
+fn parse_approval_input(
+    change_set_id: &str,
+    supplied_approval_id: Option<&str>,
+    input: &mut Zeroizing<Vec<u8>>,
+) -> Result<(String, String), Box<dyn Error>> {
+    if input.first() == Some(&b'{') {
+        let response: ServerResponse = serde_json::from_slice(input)?;
+        let Some(agent_protocol::ResponseData::ChangeApproval(approval)) = response.result else {
+            return Err("stdin is not a successful change approval response".into());
+        };
+        if approval.change_set_id != change_set_id
+            || supplied_approval_id.is_some_and(|value| value != approval.approval_id)
+        {
+            return Err("approval response does not match the requested ChangeSet".into());
+        }
+        return Ok((approval.approval_id, approval.token.into_inner()));
+    }
+    let approval_id = supplied_approval_id
+        .ok_or("--approval-id is required when stdin contains only the raw token")?
+        .to_owned();
+    while input.last().is_some_and(u8::is_ascii_whitespace) {
+        input.pop();
+    }
+    if input.is_empty() {
+        return Err("approval token must not be empty".into());
+    }
+    let token = String::from_utf8(std::mem::take(input)).map_err(|error| {
         let mut invalid = error.into_bytes();
         invalid.zeroize();
-        format!("{label} must be valid UTF-8").into()
-    })
+        "approval token must be valid UTF-8"
+    })?;
+    Ok((approval_id, token))
 }
 
 async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error>> {
@@ -412,5 +481,34 @@ async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error
         Ok(())
     } else {
         Err("daemon returned an error".into())
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use agent_protocol::{ChangeApprovalResponse, ResponseData};
+
+    use super::*;
+
+    #[test]
+    fn complete_approval_response_can_flow_directly_to_apply() {
+        let response = ServerResponse::success(
+            "request-1",
+            ResponseData::ChangeApproval(ChangeApprovalResponse {
+                approval_id: "0123456789abcdef0123456789abcdef".into(),
+                change_set_id: "change-1".into(),
+                plan_digest: "a".repeat(64),
+                token: SensitiveString::new("one-use-token".into()),
+                expires_monotonic_ms: 1_000,
+            }),
+        );
+        let mut input = Zeroizing::new(serde_json::to_vec_pretty(&response).expect("encode"));
+        assert_eq!(
+            parse_approval_input("change-1", None, &mut input).expect("parse"),
+            (
+                "0123456789abcdef0123456789abcdef".into(),
+                "one-use-token".into()
+            )
+        );
     }
 }

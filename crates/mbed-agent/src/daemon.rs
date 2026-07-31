@@ -10,13 +10,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::{
-    AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, FirewallExecutionPlan, TmpBudget,
-    confirm_awaiting_execution, execute_approved_change, plan_digest,
+    AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, FirewallExecutionPlan,
+    FirewallMutation, FirewallRiskContext, TmpBudget, confirm_awaiting_execution,
+    execute_approved_change, firewall_object_digest, plan_digest, plan_firewall_mutations,
 };
 use agent_protocol::{
     ChangeApprovalResponse, ChangePlan, ChangeSetResponse, ChangeSetState, ClientRequest, Command,
-    CompletionResponse, DiagnosticHistoryEntry, ErrorCode, PROTOCOL_VERSION, ResponseData,
-    SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
+    CompletionResponse, DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry,
+    FirewallInventoryResponse, FirewallMutationRequest, FirewallObject, PROTOCOL_VERSION,
+    ResponseData, SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
     TaskHistoryEntry,
 };
 use agent_provider::{
@@ -27,7 +29,10 @@ use agent_store::{
     ApprovalRecord, ChangeSetRecord, DiagnosticRecord, Store, StoreError, TaskRecord,
 };
 use agent_tools::ToolRunner;
-use platform_linux::firewall_command::FirewallCommandRunner;
+use platform_linux::firewall_command::{
+    FirewallCommand, FirewallCommandExecutor, FirewallCommandRunner,
+};
+use platform_linux::firewall_inventory::inspect_openwrt_firewall_inventory;
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -375,6 +380,12 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::ChangeApprove { change_set_id } => {
             return handle_change_approve(request.id, change_set_id, state).await;
         }
+        Command::FirewallPlan { mutations } => {
+            return handle_firewall_plan(request.id, mutations, state).await;
+        }
+        Command::FirewallInventory => {
+            return handle_firewall_inventory(request.id, state).await;
+        }
         Command::ChangeApply {
             change_set_id,
             approval_id,
@@ -529,6 +540,275 @@ async fn handle_change_get(id: String, change_set_id: String, state: &AppState) 
             ServerResponse::error(id, ErrorCode::Internal, "ChangeSet storage is unavailable")
         }
     }
+}
+
+async fn handle_firewall_plan(
+    id: String,
+    requests: Vec<FirewallMutationRequest>,
+    state: &AppState,
+) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    if let Err(error) = openwrt_write_backend(state) {
+        return error.with_id(id);
+    }
+    let _configuration_guard = state.configuration_lock.lock().await;
+    let now = match boot_monotonic_ms() {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let snapshot = match inspect_firewall_for_planning(state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error.with_id(id),
+    };
+    let mutations = requests
+        .into_iter()
+        .map(firewall_mutation)
+        .collect::<Vec<_>>();
+    let context = conservative_firewall_risk_context(snapshot.inventory());
+    let mut typed = match plan_firewall_mutations(snapshot.inventory(), &mutations, &context) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::InvalidRequest,
+                format!("firewall mutation plan was rejected: {error}"),
+            );
+        }
+    };
+    typed.risk = typed.risk.max(agent_protocol::RiskLevel::R3);
+    let plan_id = match random_hex(16) {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let expires_monotonic_ms =
+        now.saturating_add(state.config.auth.capability_ttl_secs.saturating_mul(1_000));
+    let plan = ChangePlan {
+        schema_version: agent_protocol::CHANGE_PLAN_SCHEMA_VERSION,
+        plan_id: plan_id.clone(),
+        boot_id: state.auth.boot_id().to_owned(),
+        actor_id: LOCAL_CLI_ACTOR.into(),
+        created_monotonic_ms: now,
+        expires_monotonic_ms,
+        risk: typed.risk,
+        changes: typed
+            .changes
+            .iter()
+            .map(|change| change.diff.clone())
+            .collect(),
+        validation_checks: vec!["reinspect live UCI and run native fw3/fw4 validation".into()],
+        verification_checks: vec!["reconstruct and compare touched live firewall objects".into()],
+        rollback_required: true,
+    };
+    let digest = match plan_digest(&plan) {
+        Ok(value) => value,
+        Err(error) => {
+            error!(%error, "locally generated firewall plan is invalid");
+            return ServerResponse::error(id, ErrorCode::Internal, "firewall planner failed");
+        }
+    };
+    let execution = FirewallExecutionPlan {
+        schema_version: agent_core::FIREWALL_EXECUTION_PLAN_SCHEMA_VERSION,
+        preview: plan.clone(),
+        typed,
+    };
+    let execution_payload = match execution.encode() {
+        Ok(value) => value,
+        Err(error) => {
+            error!(%error, "firewall execution plan encoding failed");
+            return ServerResponse::error(id, ErrorCode::Internal, "firewall planner failed");
+        }
+    };
+    let plan_payload = match serde_json::to_vec(&plan) {
+        Ok(value) => value,
+        Err(error) => {
+            error!(%error, "firewall plan encoding failed");
+            return ServerResponse::error(id, ErrorCode::Internal, "firewall planner failed");
+        }
+    };
+    let record = ChangeSetRecord {
+        id: plan_id.clone(),
+        plan_digest: digest,
+        plan_payload,
+        state: ChangeSetState::Planned,
+        actor_id: LOCAL_CLI_ACTOR.into(),
+        boot_id: state.auth.boot_id().to_owned(),
+        risk: plan.risk,
+        expires_monotonic_ms,
+        rollback_deadline_monotonic_ms: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    persist_firewall_change(id, plan_id, record, execution_payload, now, state).await
+}
+
+async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerResponse {
+    if let Err(error) = openwrt_write_backend(state) {
+        return error.with_id(id);
+    }
+    let _configuration_guard = state.configuration_lock.lock().await;
+    let snapshot = match inspect_firewall_for_planning(state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error.with_id(id),
+    };
+    let objects = snapshot
+        .inventory()
+        .objects
+        .iter()
+        .map(|object| {
+            firewall_object_digest(object).map(|digest| FirewallInventoryEntry {
+                digest,
+                object: object.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>();
+    match objects {
+        Ok(objects) => ServerResponse::success(
+            id,
+            ResponseData::FirewallInventory(FirewallInventoryResponse { objects }),
+        ),
+        Err(error) => {
+            error!(%error, "fresh firewall inventory digest failed");
+            ServerResponse::error(id, ErrorCode::Internal, "firewall inventory is unavailable")
+        }
+    }
+}
+
+async fn inspect_firewall_for_planning(
+    state: &AppState,
+) -> Result<
+    platform_linux::firewall_inventory::OpenWrtFirewallInventorySnapshot,
+    PendingResponseError,
+> {
+    let runner = firewall_command_runner(state);
+    let output = tokio::task::spawn_blocking(move || {
+        runner.execute(&FirewallCommand::UciShowFirewall, None)
+    })
+    .await
+    .map_err(|error| {
+        error!(%error, "firewall planning inspection worker failed");
+        PendingResponseError::internal("firewall planner is unavailable")
+    })?
+    .map_err(|error| {
+        error!(%error, "fresh firewall planning inspection failed");
+        PendingResponseError::unavailable("live firewall inventory is unavailable")
+    })?
+    .stdout;
+    let uci = std::str::from_utf8(&output)
+        .map_err(|_| PendingResponseError::conflict("live firewall inventory is malformed"))?;
+    inspect_openwrt_firewall_inventory(uci).map_err(|error| {
+        warn!(%error, "live firewall inventory cannot be safely planned");
+        PendingResponseError::conflict("live firewall inventory cannot be safely modified")
+    })
+}
+
+async fn persist_firewall_change(
+    id: String,
+    plan_id: String,
+    record: ChangeSetRecord,
+    execution_payload: Vec<u8>,
+    now: u64,
+    state: &AppState,
+) -> ServerResponse {
+    let Ok(max_plan_bytes) = usize::try_from(state.config.storage.max_change_plan_bytes) else {
+        return ServerResponse::error(id, ErrorCode::Internal, "plan limit is invalid");
+    };
+    let Ok(max_execution_bytes) =
+        usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
+    else {
+        return ServerResponse::error(id, ErrorCode::Internal, "execution plan limit is invalid");
+    };
+    let store = Arc::clone(&state.store);
+    let max_records = state.config.storage.max_change_set_records;
+    let create = tokio::task::spawn_blocking(move || {
+        store.create_firewall_change_set(
+            &record,
+            &execution_payload,
+            max_records,
+            max_plan_bytes,
+            max_execution_bytes,
+            now,
+        )
+    })
+    .await;
+    match create {
+        Ok(Ok(_)) => {
+            info!(change_set_id = %plan_id, "approval-ready firewall ChangeSet created");
+            current_change_set_response(id, &plan_id, state).await
+        }
+        Ok(Err(error)) => store_error_response(id, &error),
+        Err(error) => {
+            error!(%error, "firewall plan storage worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "firewall plan storage is unavailable",
+            )
+        }
+    }
+}
+
+fn firewall_mutation(request: FirewallMutationRequest) -> FirewallMutation {
+    match request {
+        FirewallMutationRequest::Create { desired } => FirewallMutation::Create(desired),
+        FirewallMutationRequest::Update {
+            expected_digest,
+            desired,
+        } => FirewallMutation::Update {
+            expected_digest,
+            desired,
+        },
+        FirewallMutationRequest::Delete {
+            kind,
+            id,
+            expected_digest,
+        } => FirewallMutation::Delete {
+            kind,
+            id,
+            expected_digest,
+        },
+        FirewallMutationRequest::Move {
+            expected_digest,
+            desired,
+        } => FirewallMutation::Move {
+            expected_digest,
+            desired,
+        },
+    }
+}
+
+fn conservative_firewall_risk_context(
+    inventory: &agent_core::FirewallInventory,
+) -> FirewallRiskContext {
+    let mut context = FirewallRiskContext::default();
+    for object in &inventory.objects {
+        match object {
+            FirewallObject::Zone(zone) => {
+                context.management_zones.push(zone.id.clone());
+                context
+                    .management_interfaces
+                    .extend(zone.networks.iter().cloned());
+            }
+            FirewallObject::FilterRule(rule) => {
+                context.management_rule_ids.push(rule.id.clone());
+            }
+            FirewallObject::NatRule(rule) => {
+                context.management_rule_ids.push(rule.id.clone());
+            }
+            FirewallObject::Forwarding(_) | FirewallObject::AddressSet(_) => {}
+        }
+    }
+    for values in [
+        &mut context.management_rule_ids,
+        &mut context.management_zones,
+        &mut context.management_interfaces,
+    ] {
+        values.sort_unstable();
+        values.dedup();
+        values.truncate(32);
+    }
+    context
 }
 
 async fn handle_change_approve(
@@ -900,15 +1180,8 @@ fn openwrt_port_config(
     state: &AppState,
 ) -> OpenWrtExecutionPortConfig {
     let runtime_root = state.budget.root().to_path_buf();
-    let max_input = usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
-        .unwrap_or(usize::MAX);
     OpenWrtExecutionPortConfig {
-        runner: FirewallCommandRunner::system(
-            runtime_root.clone(),
-            Duration::from_secs(state.config.runtime.tool_timeout_secs),
-            max_input,
-            state.config.runtime.max_tool_output_bytes,
-        ),
+        runner: firewall_command_runner(state),
         store: Arc::clone(&state.store),
         runtime_root,
         config_path: state.config_path.clone(),
@@ -921,6 +1194,16 @@ fn openwrt_port_config(
         backend,
         execution,
     }
+}
+
+fn firewall_command_runner(state: &AppState) -> FirewallCommandRunner {
+    FirewallCommandRunner::system(
+        state.budget.root().to_path_buf(),
+        Duration::from_secs(state.config.runtime.tool_timeout_secs),
+        usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
+            .unwrap_or(usize::MAX),
+        state.config.runtime.max_tool_output_bytes,
+    )
 }
 
 async fn current_change_set_response(
@@ -1074,6 +1357,13 @@ impl PendingResponseError {
     const fn conflict(message: &'static str) -> Self {
         Self {
             code: ErrorCode::Conflict,
+            message,
+        }
+    }
+
+    const fn unavailable(message: &'static str) -> Self {
+        Self {
+            code: ErrorCode::Unavailable,
             message,
         }
     }

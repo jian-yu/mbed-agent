@@ -485,6 +485,12 @@ fn resolve_mutation(
     match mutation {
         FirewallMutation::Create(desired) => {
             validate_firewall_object(desired)?;
+            if desired.ownership() == ObjectOwnership::Unmanaged {
+                return Err(FirewallPlanError::Unmanaged);
+            }
+            if desired.ownership() != ObjectOwnership::AgentOwned {
+                return Err(FirewallPlanError::CreateOwnership);
+            }
             if current.contains_key(&object_key(desired)) {
                 return Err(FirewallPlanError::AlreadyExists);
             }
@@ -1074,6 +1080,8 @@ pub enum FirewallPlanError {
     Unmanaged,
     #[error("firewall ownership cannot change in an update")]
     OwnershipChanged,
+    #[error("new firewall objects must be Agent-owned")]
+    CreateOwnership,
     #[error("firewall mutation has no semantic change")]
     NoChange,
     #[error("only ordered firewall rules support move")]
@@ -1377,6 +1385,19 @@ mod tests {
                 &FirewallRiskContext::default(),
             ),
             Err(FirewallPlanError::Unmanaged)
+        );
+        let mut forged_native = restrictive_rule("forged-native");
+        let FirewallObject::FilterRule(rule) = &mut forged_native else {
+            unreachable!()
+        };
+        rule.ownership = ObjectOwnership::PlatformNative;
+        assert_eq!(
+            plan_firewall_mutations(
+                &inventory_with_zones(vec![]),
+                &[FirewallMutation::Create(forged_native)],
+                &FirewallRiskContext::default(),
+            ),
+            Err(FirewallPlanError::CreateOwnership)
         );
     }
 

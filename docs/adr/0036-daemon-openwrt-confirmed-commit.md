@@ -16,7 +16,9 @@ verification.
 1. Add `change apply` and `change confirm` to the existing single binary and
    local protocol. Approval tokens are read from stdin and represented as
    redacted, zeroizing values; they are never accepted as command-line
-   arguments.
+   arguments. The CLI may consume the complete approval response from stdin,
+   verifies its ChangeSet and optional approval-ID binding, and extracts the
+   one-use token without an intermediate file.
 2. Serialize apply and confirm with one daemon configuration mutex. Accept only
    exact, boot-bound, actor-owned executable payloads and supported OpenWrt
    21.02+ fw3/fw4 capabilities.

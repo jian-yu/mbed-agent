@@ -1034,6 +1034,16 @@ token 只从 stdin 读取，不进入 argv；仅 OpenWrt 21.02+ 的 fw3/fw4 capa
 UCI 并逐一核对所有受影响对象后才原子确认 watchdog；超时或执行/验证失败由 helper
 恢复。普通 Linux nftables/iptables execution port 仍按同一闭环继续接入。
 
+OpenWrt 写路径已有公开但严格 typed 的计划入口：`change firewall-plan` 从 stdin
+读取有界 JSON mutation 数组，daemon 在单写锁内重新执行 `uci show firewall`，重建
+完整 inventory 后才解析 create/update/delete/move。调用者必须提供 update/delete/
+move 的对象摘要（由 `change firewall-inventory` 的 fresh typed inventory 返回），
+不能自行提供 before-state；新对象只能是 Agent-owned，现有
+platform-native 对象则必须按 fresh identity/version 修改。daemon 会把 OpenWrt 防火墙
+计划保守提升为至少 R3，并用有界的现有 zone、network 与 rule 生成细分风险信号；再将展示 plan 与完整 executable
+payload 在同一 SQLite transaction 内写入并直接进入 `awaiting_approval`，避免半成品
+计划占位或被审批。
+
 独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
 通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突
 决定被拒绝。apply/verify 失败无需等待 deadline，可请求 helper 立即执行同一套

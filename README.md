@@ -194,22 +194,35 @@ on daemon restart. Failed authentication is rate-limited per actor with
 for verified MQTT, WeCom, and WeChat actors, but those adapters are not connected
 yet. Passwords are never accepted as command-line arguments.
 
-Daemon-created plans can be inspected, approved, or rejected through the same
-binary:
+Typed firewall mutations can be planned, inspected, approved, executed, and
+confirmed through the same binary. `firewall-plan` reads a JSON array of closed
+`create`, `update`, `delete`, or `move` requests from stdin:
 
 ```sh
+cargo run -p mbed-agent -- change firewall-inventory > firewall-inventory.json
+cargo run -p mbed-agent -- change firewall-plan < docs/examples/firewall-create-zone.json
 cargo run -p mbed-agent -- change get CHANGE_SET_ID
-cargo run -p mbed-agent -- change approve CHANGE_SET_ID
-cargo run -p mbed-agent -- change apply CHANGE_SET_ID --approval-id APPROVAL_ID < approval-token.txt
+cargo run -p mbed-agent -- change approve CHANGE_SET_ID | \
+  cargo run -p mbed-agent -- change apply CHANGE_SET_ID
 cargo run -p mbed-agent -- change confirm CHANGE_SET_ID
 cargo run -p mbed-agent -- change reject CHANGE_SET_ID
 ```
 
+The example demonstrates the exact tagged JSON shape. `firewall-inventory`
+returns every fresh typed object and its 64-character digest. Update, delete,
+and move requests copy that value into `expected_digest`; stale digests are
+rejected when planning and again immediately before execution.
+
 Approval requires a current local `device-admin` elevation. Its response contains
 the raw one-use token exactly once; only its digest is retained in `/tmp`
-SQLite. Approval does not apply the plan, and no public apply command is exposed
-until staging, native validation, independent rollback, runtime verification,
-and confirmation are connected.
+SQLite. Planning always uses a fresh live UCI inventory and persists the preview
+and full executable payload atomically. `apply` cannot accept replacement rule
+content: it consumes only the exact one-use approval token. OpenWrt fw3/fw4
+execution then performs staging, native validation, independent rollback,
+runtime verification, and risk-based confirmation.
+`apply` accepts the complete approval response from stdin and checks its
+ChangeSet/approval binding before extracting the secret. A raw token is also
+accepted from stdin when `--approval-id` is supplied.
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart
