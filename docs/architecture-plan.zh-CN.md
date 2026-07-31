@@ -1044,12 +1044,18 @@ platform-native 对象则必须按 fresh identity/version 修改。daemon 会把
 payload 在同一 SQLite transaction 内写入并直接进入 `awaiting_approval`，避免半成品
 计划占位或被审批。
 
-普通 Linux nftables 的实际写路径已开始接入 fresh observation：先运行固定且有界的
+普通 Linux nftables 的实际写路径已接通：先运行固定且有界的
 `nft list tables`，严格解析精确 `table inet mbed_agent` identity；只有确认存在后才
 运行 `nft list table inet mbed_agent`。因此“表不存在”不再由任意非零退出码猜测，
 命令故障、畸形输出、重复 identity、foreign table、orphan state 与 native drift 都会
-分别 fail closed。该 observation 已能与 `/tmp` SQLite 中 boot-bound canonical state
-重建 typed inventory，下一步由 nft native transaction 消费。
+分别 fail closed。fresh observation 与 `/tmp` SQLite 中 boot-bound canonical state
+重建 typed inventory 后，由 native transaction 生成私有 staging ruleset，执行
+`nft --check --file`、源状态二次核对、单次原子 load 和 live verify。daemon 的现有
+inventory/plan/apply/confirm 命令已按 capability 在 OpenWrt 与 generic nftables 间
+闭合分派；两者共享 R3、device-admin、一次性 approval 与 confirmed-commit 状态机。
+generic 回滚包只在 `/tmp` 保存带摘要的旧 owned-table ruleset 与旧 canonical state，
+独立 helper 在超时或 daemon 退出后同时恢复内核和 SQLite，不写持久 nftables 文件。
+iptables/ip6tables 因双地址族不是单一事务，仍保持写入口关闭，等待独立故障恢复切片。
 
 独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
 通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突
@@ -1160,8 +1166,9 @@ filter/mangle/nat chain，首次在 builtin chain 末尾添加一次带 ownershi
 的 jump，之后利用 `*-restore --noflush` 仅重建自有 chain，不回放或 flush 主机
 规则；typed set 有界展开，双栈 filter、zone/forwarding、TCPMSS、masquerade/
 SNAT/DNAT/redirect 均支持，且 IPv4/IPv6 的 `--test` 必须先全部通过。由于跨
-table/地址族不是单一原子提交，该后端强制独立 rollback。ChangeSet 执行编排、
-live apply/verify/confirm 尚是下一纵向切片，未完成前公共写接口保持关闭。
+table/地址族不是单一原子提交，该后端强制独立 rollback。ChangeSet 执行编排与
+OpenWrt、generic nftables 的 live apply/verify/confirm 已完成；iptables/ip6tables
+公共写入口仍保持关闭，直到双地址族回滚协议完成。
 
 ## 21. 参考项目与官方资料
 

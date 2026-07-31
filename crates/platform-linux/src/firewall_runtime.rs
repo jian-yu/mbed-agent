@@ -95,6 +95,64 @@ impl GenericFirewallInventorySnapshot {
     }
 }
 
+/// One owned native nftables observation collected by the closed command runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedNftablesObservation {
+    managed_listing: Option<String>,
+}
+
+impl CollectedNftablesObservation {
+    #[must_use]
+    pub fn managed_listing(&self) -> Option<&str> {
+        self.managed_listing.as_deref()
+    }
+}
+
+/// Collects the exact fixed-table presence and optional table listing.
+///
+/// # Errors
+///
+/// Returns an error for command failures, non-UTF-8 output, or malformed declarations.
+pub fn collect_nftables_observation(
+    executor: &impl FirewallCommandExecutor,
+) -> Result<CollectedNftablesObservation, GenericFirewallStateError> {
+    let tables = executor
+        .execute(&FirewallCommand::NftListTables, None)
+        .map_err(|_| GenericFirewallStateError::NativeInspection)?
+        .stdout;
+    let tables =
+        std::str::from_utf8(&tables).map_err(|_| GenericFirewallStateError::NativeInspection)?;
+    let managed_listing = if nftables_managed_table_exists(tables)? {
+        let output = executor
+            .execute(&FirewallCommand::NftListManagedTable, None)
+            .map_err(|_| GenericFirewallStateError::NativeInspection)?
+            .stdout;
+        Some(String::from_utf8(output).map_err(|_| GenericFirewallStateError::NativeInspection)?)
+    } else {
+        None
+    };
+    Ok(CollectedNftablesObservation { managed_listing })
+}
+
+/// Reconciles one already collected observation with volatile canonical state.
+///
+/// # Errors
+///
+/// Returns an error for corrupt/stale canonical state, foreign ownership, orphaned native state,
+/// or native drift.
+pub fn reconcile_nftables_observation(
+    canonical_state: Option<&[u8]>,
+    boot_id: &str,
+    observation: &CollectedNftablesObservation,
+) -> Result<GenericFirewallInventorySnapshot, GenericFirewallStateError> {
+    inspect_generic_firewall_inventory(
+        canonical_state,
+        boot_id,
+        GenericFirewallBackend::Nftables,
+        GenericFirewallObservation::Nftables(observation.managed_listing()),
+    )
+}
+
 /// Collects a fresh generic Linux nftables observation through closed commands and reconciles it
 /// with the volatile canonical state.
 ///
@@ -107,28 +165,8 @@ pub fn inspect_generic_nftables_inventory(
     canonical_state: Option<&[u8]>,
     boot_id: &str,
 ) -> Result<GenericFirewallInventorySnapshot, GenericFirewallStateError> {
-    let tables = executor
-        .execute(&FirewallCommand::NftListTables, None)
-        .map_err(|_| GenericFirewallStateError::NativeInspection)?
-        .stdout;
-    let tables =
-        std::str::from_utf8(&tables).map_err(|_| GenericFirewallStateError::NativeInspection)?;
-    let exists = nftables_managed_table_exists(tables)?;
-    let managed = if exists {
-        let output = executor
-            .execute(&FirewallCommand::NftListManagedTable, None)
-            .map_err(|_| GenericFirewallStateError::NativeInspection)?
-            .stdout;
-        Some(String::from_utf8(output).map_err(|_| GenericFirewallStateError::NativeInspection)?)
-    } else {
-        None
-    };
-    inspect_generic_firewall_inventory(
-        canonical_state,
-        boot_id,
-        GenericFirewallBackend::Nftables,
-        GenericFirewallObservation::Nftables(managed.as_deref()),
-    )
+    let observation = collect_nftables_observation(executor)?;
+    reconcile_nftables_observation(canonical_state, boot_id, &observation)
 }
 
 /// Reconciles volatile canonical state with a fresh native firewall observation.

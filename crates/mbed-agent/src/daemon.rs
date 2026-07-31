@@ -33,6 +33,9 @@ use platform_linux::firewall_command::{
     FirewallCommand, FirewallCommandExecutor, FirewallCommandRunner,
 };
 use platform_linux::firewall_inventory::inspect_openwrt_firewall_inventory;
+use platform_linux::firewall_runtime::{
+    GenericFirewallInventorySnapshot, inspect_generic_nftables_inventory,
+};
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -42,7 +45,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
-use crate::firewall_execution::{OpenWrtExecutionPort, OpenWrtExecutionPortConfig};
+use crate::firewall_execution::{
+    GenericNftablesExecutionPort, GenericNftablesExecutionPortConfig, OpenWrtExecutionPort,
+    OpenWrtExecutionPortConfig,
+};
 use crate::logging;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -550,9 +556,10 @@ async fn handle_firewall_plan(
     if let Err(message) = ensure_task_storage(state).await {
         return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
     }
-    if let Err(error) = openwrt_write_backend(state) {
-        return error.with_id(id);
-    }
+    let backend = match firewall_write_backend(state) {
+        Ok(backend) => backend,
+        Err(error) => return error.with_id(id),
+    };
     let _configuration_guard = state.configuration_lock.lock().await;
     let now = match boot_monotonic_ms() {
         Ok(value) => value,
@@ -597,7 +604,7 @@ async fn handle_firewall_plan(
             .iter()
             .map(|change| change.diff.clone())
             .collect(),
-        validation_checks: vec!["reinspect live UCI and run native fw3/fw4 validation".into()],
+        validation_checks: vec![firewall_validation_check(backend).into()],
         verification_checks: vec!["reconstruct and compare touched live firewall objects".into()],
         rollback_required: true,
     };
@@ -644,7 +651,7 @@ async fn handle_firewall_plan(
 }
 
 async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerResponse {
-    if let Err(error) = openwrt_write_backend(state) {
+    if let Err(error) = firewall_write_backend(state) {
         return error.with_id(id);
     }
     let _configuration_guard = state.configuration_lock.lock().await;
@@ -677,10 +684,36 @@ async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerRespon
 
 async fn inspect_firewall_for_planning(
     state: &AppState,
-) -> Result<
-    platform_linux::firewall_inventory::OpenWrtFirewallInventorySnapshot,
-    PendingResponseError,
-> {
+) -> Result<FirewallPlanningSnapshot, PendingResponseError> {
+    if matches!(
+        firewall_write_backend(state)?,
+        WritableFirewallBackend::GenericNftables
+    ) {
+        let max_state_bytes = usize::try_from(state.config.storage.max_firewall_state_bytes)
+            .map_err(|_| PendingResponseError::internal("firewall state limit is invalid"))?;
+        let store = Arc::clone(&state.store);
+        let runner = firewall_command_runner(state);
+        let boot_id = state.auth.boot_id().to_owned();
+        return tokio::task::spawn_blocking(move || {
+            let canonical = store
+                .firewall_runtime_state(max_state_bytes)
+                .map_err(|_| PendingResponseError::internal("firewall state is unavailable"))?;
+            inspect_generic_nftables_inventory(&runner, canonical.as_deref(), &boot_id).map_err(
+                |error| {
+                    warn!(%error, "generic Linux nftables inventory cannot be safely planned");
+                    PendingResponseError::conflict(
+                        "live nftables inventory cannot be safely modified",
+                    )
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            error!(%error, "nftables planning inspection worker failed");
+            PendingResponseError::internal("firewall planner is unavailable")
+        })?
+        .map(FirewallPlanningSnapshot::GenericNftables);
+    }
     let runner = firewall_command_runner(state);
     let output = tokio::task::spawn_blocking(move || {
         runner.execute(&FirewallCommand::UciShowFirewall, None)
@@ -697,10 +730,26 @@ async fn inspect_firewall_for_planning(
     .stdout;
     let uci = std::str::from_utf8(&output)
         .map_err(|_| PendingResponseError::conflict("live firewall inventory is malformed"))?;
-    inspect_openwrt_firewall_inventory(uci).map_err(|error| {
-        warn!(%error, "live firewall inventory cannot be safely planned");
-        PendingResponseError::conflict("live firewall inventory cannot be safely modified")
-    })
+    inspect_openwrt_firewall_inventory(uci)
+        .map(FirewallPlanningSnapshot::OpenWrt)
+        .map_err(|error| {
+            warn!(%error, "live firewall inventory cannot be safely planned");
+            PendingResponseError::conflict("live firewall inventory cannot be safely modified")
+        })
+}
+
+enum FirewallPlanningSnapshot {
+    OpenWrt(platform_linux::firewall_inventory::OpenWrtFirewallInventorySnapshot),
+    GenericNftables(GenericFirewallInventorySnapshot),
+}
+
+impl FirewallPlanningSnapshot {
+    fn inventory(&self) -> &agent_core::FirewallInventory {
+        match self {
+            Self::OpenWrt(snapshot) => snapshot.inventory(),
+            Self::GenericNftables(snapshot) => snapshot.inventory(),
+        }
+    }
 }
 
 async fn persist_firewall_change(
@@ -952,7 +1001,7 @@ async fn handle_change_apply(
         }
         Err(response) => return response.with_id(id),
     };
-    let backend = match openwrt_write_backend(state) {
+    let backend = match firewall_write_backend(state) {
         Ok(backend) => backend,
         Err(response) => return response.with_id(id),
     };
@@ -963,6 +1012,10 @@ async fn handle_change_apply(
             "daemon configuration must exist before arming the rollback helper",
         );
     }
+    let generic_canonical_state = match canonical_for_backend(backend, state).await {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
     let token_digest = sha256_hex(approval_token.expose().as_bytes());
     if let Err(error) =
         consume_change_approval(approval_id, token_digest, record.clone(), now, state).await
@@ -971,20 +1024,18 @@ async fn handle_change_apply(
     }
     drop(approval_token);
 
-    let deadline = now.saturating_add(
-        state
-            .config
-            .runtime
-            .rollback_confirm_timeout_secs
-            .saturating_mul(1_000),
-    );
-    let port_config = openwrt_port_config(record.clone(), execution, backend, now, state);
+    let deadline = rollback_deadline(now, state);
     let confirmation_required = record.risk >= agent_protocol::RiskLevel::R3;
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut port = OpenWrtExecutionPort::apply(port_config)?;
-        execute_approved_change(&mut port, now, deadline, confirmation_required)
-            .map_err(|_| agent_core::ExecutionPortError)
-    })
+    let outcome = execute_firewall_change(
+        backend,
+        record.clone(),
+        execution,
+        generic_canonical_state,
+        now,
+        deadline,
+        confirmation_required,
+        state,
+    )
     .await;
     match outcome {
         Ok(Ok(result)) => {
@@ -1105,15 +1156,22 @@ async fn handle_change_confirm(
         Ok(execution) => execution,
         Err(response) => return response.with_id(id),
     };
-    let backend = match openwrt_write_backend(state) {
+    let backend = match firewall_write_backend(state) {
         Ok(backend) => backend,
         Err(response) => return response.with_id(id),
     };
-    let port_config = openwrt_port_config(record.clone(), execution, backend, now, state);
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut port = OpenWrtExecutionPort::confirmation(port_config);
-        confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
-    })
+    let generic_canonical_state = match canonical_for_backend(backend, state).await {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let outcome = confirm_firewall_change(
+        backend,
+        record.clone(),
+        execution,
+        generic_canonical_state,
+        now,
+        state,
+    )
     .await;
     match outcome {
         Ok(Ok(result)) => {
@@ -1158,16 +1216,111 @@ async fn load_firewall_execution_plan(
         .map_err(|_| PendingResponseError::internal("stored execution plan is invalid"))
 }
 
-fn openwrt_write_backend(state: &AppState) -> Result<FirewallBackend, PendingResponseError> {
-    if state.platform.kind != PlatformKind::OpenWrt || !state.platform.release_supported {
-        return Err(PendingResponseError::conflict(
-            "this execution path requires supported OpenWrt 21.02 or newer",
-        ));
+#[derive(Clone, Copy)]
+enum WritableFirewallBackend {
+    OpenWrt(FirewallBackend),
+    GenericNftables,
+}
+
+const fn firewall_validation_check(backend: WritableFirewallBackend) -> &'static str {
+    match backend {
+        WritableFirewallBackend::OpenWrt(_) => {
+            "reinspect live UCI and run native fw3/fw4 validation"
+        }
+        WritableFirewallBackend::GenericNftables => {
+            "reconcile live owned nftables state and run nft --check"
+        }
     }
-    match state.platform.firewall.backend {
-        backend @ (FirewallBackend::Fw3 | FirewallBackend::Fw4) => Ok(backend),
-        _ => Err(PendingResponseError::conflict(
-            "no supported writable OpenWrt firewall backend is available",
+}
+
+type ExecutionWorkerResult = Result<
+    Result<agent_core::ExecutionOutcome, agent_core::ExecutionPortError>,
+    tokio::task::JoinError,
+>;
+
+#[allow(clippy::too_many_arguments)] // Closed backend dispatcher keeps the request handler small.
+async fn execute_firewall_change(
+    backend: WritableFirewallBackend,
+    record: ChangeSetRecord,
+    execution: FirewallExecutionPlan,
+    canonical_state: Option<Vec<u8>>,
+    now: u64,
+    deadline: u64,
+    confirmation_required: bool,
+    state: &AppState,
+) -> ExecutionWorkerResult {
+    match backend {
+        WritableFirewallBackend::OpenWrt(backend) => {
+            let port_config = openwrt_port_config(record, execution, backend, now, state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = OpenWrtExecutionPort::apply(port_config)?;
+                execute_approved_change(&mut port, now, deadline, confirmation_required)
+                    .map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+        WritableFirewallBackend::GenericNftables => {
+            let port_config =
+                generic_nftables_port_config(record, execution, now, state, canonical_state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = GenericNftablesExecutionPort::apply(port_config)?;
+                execute_approved_change(&mut port, now, deadline, confirmation_required)
+                    .map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+    }
+}
+
+async fn confirm_firewall_change(
+    backend: WritableFirewallBackend,
+    record: ChangeSetRecord,
+    execution: FirewallExecutionPlan,
+    canonical_state: Option<Vec<u8>>,
+    now: u64,
+    state: &AppState,
+) -> ExecutionWorkerResult {
+    match backend {
+        WritableFirewallBackend::OpenWrt(backend) => {
+            let port_config = openwrt_port_config(record, execution, backend, now, state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = OpenWrtExecutionPort::confirmation(port_config);
+                confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+        WritableFirewallBackend::GenericNftables => {
+            let port_config =
+                generic_nftables_port_config(record, execution, now, state, canonical_state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = GenericNftablesExecutionPort::confirmation(port_config);
+                confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+    }
+}
+
+fn firewall_write_backend(
+    state: &AppState,
+) -> Result<WritableFirewallBackend, PendingResponseError> {
+    match (state.platform.kind, state.platform.firewall.backend) {
+        (PlatformKind::OpenWrt, backend @ (FirewallBackend::Fw3 | FirewallBackend::Fw4))
+            if state.platform.release_supported =>
+        {
+            Ok(WritableFirewallBackend::OpenWrt(backend))
+        }
+        (PlatformKind::GenericLinux, FirewallBackend::Nftables) => {
+            Ok(WritableFirewallBackend::GenericNftables)
+        }
+        (PlatformKind::OpenWrt, _) => Err(PendingResponseError::conflict(
+            "no supported writable OpenWrt 21.02+ firewall backend is available",
+        )),
+        (PlatformKind::GenericLinux, _) => Err(PendingResponseError::conflict(
+            "generic Linux writes currently require native nftables",
+        )),
+        (PlatformKind::Unknown, _) => Err(PendingResponseError::conflict(
+            "no supported writable firewall backend is available",
         )),
     }
 }
@@ -1194,6 +1347,66 @@ fn openwrt_port_config(
         backend,
         execution,
     }
+}
+
+fn generic_nftables_port_config(
+    record: ChangeSetRecord,
+    execution: FirewallExecutionPlan,
+    now_monotonic_ms: u64,
+    state: &AppState,
+    canonical_state: Option<Vec<u8>>,
+) -> GenericNftablesExecutionPortConfig {
+    let max_firewall_state_bytes =
+        usize::try_from(state.config.storage.max_firewall_state_bytes).unwrap_or(usize::MAX);
+    GenericNftablesExecutionPortConfig {
+        runner: firewall_command_runner(state),
+        store: Arc::clone(&state.store),
+        runtime_root: state.budget.root().to_path_buf(),
+        config_path: state.config_path.clone(),
+        change_set_id: record.id,
+        plan_digest: record.plan_digest,
+        boot_id: record.boot_id,
+        now_monotonic_ms,
+        rollback_timeout_secs: state.config.runtime.rollback_confirm_timeout_secs,
+        max_rollback_bytes: state.config.storage.max_rollback_bytes,
+        max_firewall_state_bytes,
+        canonical_state,
+        execution,
+    }
+}
+
+async fn load_generic_firewall_state(
+    state: &AppState,
+) -> Result<Option<Vec<u8>>, PendingResponseError> {
+    let max_firewall_state_bytes =
+        usize::try_from(state.config.storage.max_firewall_state_bytes)
+            .map_err(|_| PendingResponseError::internal("firewall state limit is invalid"))?;
+    let store = Arc::clone(&state.store);
+    tokio::task::spawn_blocking(move || store.firewall_runtime_state(max_firewall_state_bytes))
+        .await
+        .map_err(|_| PendingResponseError::internal("firewall state is unavailable"))?
+        .map_err(|_| PendingResponseError::internal("firewall state is unavailable"))
+}
+
+async fn canonical_for_backend(
+    backend: WritableFirewallBackend,
+    state: &AppState,
+) -> Result<Option<Vec<u8>>, PendingResponseError> {
+    if matches!(backend, WritableFirewallBackend::GenericNftables) {
+        load_generic_firewall_state(state).await
+    } else {
+        Ok(None)
+    }
+}
+
+fn rollback_deadline(now_monotonic_ms: u64, state: &AppState) -> u64 {
+    now_monotonic_ms.saturating_add(
+        state
+            .config
+            .runtime
+            .rollback_confirm_timeout_secs
+            .saturating_mul(1_000),
+    )
 }
 
 fn firewall_command_runner(state: &AppState) -> FirewallCommandRunner {

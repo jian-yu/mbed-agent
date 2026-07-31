@@ -314,21 +314,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::RollbackHelper {
             transaction_id,
             config,
-        } => {
-            let config = agent_core::AgentConfig::load(&config)?;
-            let runtime_root = config
-                .storage
-                .path
-                .parent()
-                .ok_or("storage path has no runtime root")?;
-            agent_core::run_rollback_helper(
-                &runtime_root.join("rollback"),
-                &transaction_id,
-                config.storage.max_rollback_bytes,
-            )?;
-            Ok(())
-        }
+        } => run_rollback_helper_command(&config, &transaction_id),
     }
+}
+
+fn run_rollback_helper_command(
+    config_path: &Path,
+    transaction_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let config = agent_core::AgentConfig::load(config_path)?;
+    let runtime_root = config
+        .storage
+        .path
+        .parent()
+        .ok_or("storage path has no runtime root")?;
+    let rollback_root = runtime_root.join("rollback");
+    let canonical = agent_core::nftables_runtime_rollback_canonical_state(
+        &rollback_root,
+        transaction_id,
+        config.storage.max_rollback_bytes,
+    )?;
+    agent_core::run_rollback_helper(
+        &rollback_root,
+        transaction_id,
+        config.storage.max_rollback_bytes,
+    )?;
+    if matches!(
+        agent_core::rollback_outcome(&rollback_root, transaction_id),
+        Ok(agent_core::RollbackOutcome::RolledBack)
+    ) {
+        restore_runtime_canonical(&config, canonical)?;
+    }
+    Ok(())
+}
+
+fn restore_runtime_canonical(
+    config: &agent_core::AgentConfig,
+    canonical: agent_core::RuntimeCanonicalSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    let max_state_bytes = usize::try_from(config.storage.max_firewall_state_bytes)?;
+    let store = agent_store::Store::open(&config.storage.path, config.storage.max_database_bytes)?;
+    match canonical {
+        agent_core::RuntimeCanonicalSnapshot::Present(payload) => {
+            store.replace_firewall_runtime_state(&payload, max_state_bytes)?;
+        }
+        agent_core::RuntimeCanonicalSnapshot::Absent => store.clear_firewall_runtime_state()?,
+        agent_core::RuntimeCanonicalSnapshot::NotRuntime => {}
+    }
+    Ok(())
 }
 
 async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {

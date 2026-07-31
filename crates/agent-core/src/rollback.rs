@@ -19,13 +19,16 @@ const MAX_ENTRIES: usize = 8;
 pub enum RollbackTarget {
     OpenWrtFirewall,
     LinuxNftablesManaged,
+    LinuxNftablesRuntime,
+    LinuxFirewallCanonical,
 }
 
 impl RollbackTarget {
-    fn path(self) -> &'static Path {
+    fn path(self) -> Option<&'static Path> {
         match self {
-            Self::OpenWrtFirewall => Path::new("/etc/config/firewall"),
-            Self::LinuxNftablesManaged => Path::new("/etc/mbed-agent/managed/firewall.nft"),
+            Self::OpenWrtFirewall => Some(Path::new("/etc/config/firewall")),
+            Self::LinuxNftablesManaged => Some(Path::new("/etc/mbed-agent/managed/firewall.nft")),
+            Self::LinuxNftablesRuntime | Self::LinuxFirewallCanonical => None,
         }
     }
 }
@@ -35,6 +38,7 @@ impl RollbackTarget {
 pub enum RollbackReload {
     OpenWrtFirewall,
     LinuxNftables,
+    LinuxNftablesRuntime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +63,14 @@ pub struct RollbackBundle {
     pub directory: PathBuf,
 }
 
+/// Prior volatile canonical state carried by a generic nftables rollback bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeCanonicalSnapshot {
+    NotRuntime,
+    Absent,
+    Present(Vec<u8>),
+}
+
 /// Creates a bounded rollback bundle before any managed configuration write.
 ///
 /// # Errors
@@ -74,9 +86,10 @@ pub fn create_rollback_bundle(
     max_bytes: u64,
 ) -> Result<RollbackBundle, RollbackError> {
     for target in targets {
-        match fs::symlink_metadata(target.path()) {
+        let path = target.path().ok_or(RollbackError::InvalidManifest)?;
+        match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.uid() == 0 && metadata.gid() == 0 => {}
-            Ok(_) => return Err(RollbackError::UnsafeTarget(target.path().to_path_buf())),
+            Ok(_) => return Err(RollbackError::UnsafeTarget(path.to_path_buf())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(RollbackError::Io(error)),
         }
@@ -88,8 +101,132 @@ pub fn create_rollback_bundle(
         reload,
         timeout_secs,
         max_bytes,
-        |target| target.path().to_path_buf(),
+        |target| target.path().unwrap_or(Path::new("/")).to_path_buf(),
     )
+}
+
+/// Creates a runtime-only nftables rollback bundle from a pre-rendered owned-table snapshot.
+///
+/// The ruleset is stored only below the private rollback root and is consumed by the independent
+/// helper. It never creates or updates persistent Linux configuration.
+///
+/// # Errors
+///
+/// Returns an error for invalid identifiers or limits, an unsafe rollback root, an empty or
+/// oversized ruleset, or a failure to durably create the bundle.
+pub fn create_nftables_runtime_rollback_bundle(
+    rollback_root: &Path,
+    transaction_id: &str,
+    ruleset: &[u8],
+    prior_table_existed: bool,
+    canonical_state: Option<&[u8]>,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<RollbackBundle, RollbackError> {
+    validate_transaction_id(transaction_id)?;
+    let canonical_bytes: u64 = canonical_state
+        .map_or(0, <[u8]>::len)
+        .try_into()
+        .map_err(|_| RollbackError::CapacityExceeded)?;
+    if !(5..=600).contains(&timeout_secs)
+        || ruleset.is_empty()
+        || ruleset.len() as u64 > max_bytes
+        || canonical_bytes > max_bytes.saturating_sub(ruleset.len() as u64)
+    {
+        return Err(RollbackError::InvalidManifest);
+    }
+    fs::create_dir_all(rollback_root).map_err(RollbackError::Io)?;
+    fs::set_permissions(rollback_root, fs::Permissions::from_mode(0o700))
+        .map_err(RollbackError::Io)?;
+    let directory = rollback_root.join(transaction_id);
+    fs::create_dir(&directory).map_err(RollbackError::Io)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(RollbackError::Io)?;
+    let result = (|| {
+        let snapshot_name = "snapshot-0.bin".to_owned();
+        write_new_file(&directory.join(&snapshot_name), ruleset, 0o600)?;
+        let canonical_name = "snapshot-1.bin".to_owned();
+        let canonical_entry = if let Some(canonical) = canonical_state {
+            write_new_file(&directory.join(&canonical_name), canonical, 0o600)?;
+            SnapshotEntry {
+                target: RollbackTarget::LinuxFirewallCanonical,
+                existed: true,
+                snapshot_name: canonical_name,
+                digest: Some(lower_hex(digest(&SHA256, canonical).as_ref())),
+                mode: None,
+            }
+        } else {
+            SnapshotEntry {
+                target: RollbackTarget::LinuxFirewallCanonical,
+                existed: false,
+                snapshot_name: canonical_name,
+                digest: None,
+                mode: None,
+            }
+        };
+        let manifest = RollbackManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            transaction_id: transaction_id.to_owned(),
+            timeout_secs,
+            entries: vec![
+                SnapshotEntry {
+                    target: RollbackTarget::LinuxNftablesRuntime,
+                    existed: prior_table_existed,
+                    snapshot_name,
+                    digest: Some(lower_hex(digest(&SHA256, ruleset).as_ref())),
+                    mode: None,
+                },
+                canonical_entry,
+            ],
+            reload: RollbackReload::LinuxNftablesRuntime,
+        };
+        let encoded = serde_json::to_vec(&manifest).map_err(RollbackError::Encode)?;
+        if encoded.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(RollbackError::InvalidManifest);
+        }
+        write_new_file(&directory.join("manifest.json"), &encoded, 0o600)?;
+        sync_directory(&directory)?;
+        sync_directory(rollback_root)?;
+        Ok(RollbackBundle {
+            directory: directory.clone(),
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result
+}
+
+/// Loads the digest-verified prior canonical state from a rollback bundle.
+///
+/// # Errors
+///
+/// Returns an error for an invalid bundle or an oversized/tampered canonical snapshot.
+pub fn nftables_runtime_rollback_canonical_state(
+    rollback_root: &Path,
+    transaction_id: &str,
+    max_bytes: u64,
+) -> Result<RuntimeCanonicalSnapshot, RollbackError> {
+    validate_transaction_id(transaction_id)?;
+    let directory = rollback_root.join(transaction_id);
+    let manifest = load_manifest(&directory, transaction_id)?;
+    if manifest.reload != RollbackReload::LinuxNftablesRuntime {
+        return Ok(RuntimeCanonicalSnapshot::NotRuntime);
+    }
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.target == RollbackTarget::LinuxFirewallCanonical)
+        .ok_or(RollbackError::InvalidManifest)?;
+    if !entry.existed {
+        return Ok(RuntimeCanonicalSnapshot::Absent);
+    }
+    let snapshot = read_bounded_file(&directory.join(&entry.snapshot_name), max_bytes)?;
+    let actual = lower_hex(digest(&SHA256, &snapshot).as_ref());
+    if entry.digest.as_deref() != Some(&actual) {
+        return Err(RollbackError::SnapshotDigestMismatch);
+    }
+    Ok(RuntimeCanonicalSnapshot::Present(snapshot))
 }
 
 fn create_bundle_with<F>(
@@ -197,7 +334,7 @@ pub fn run_rollback_helper(
         rollback_root,
         transaction_id,
         max_bytes,
-        |target| target.path().to_path_buf(),
+        |target| target.path().unwrap_or(Path::new("/")).to_path_buf(),
         execute_reload,
     )
 }
@@ -211,7 +348,7 @@ fn run_helper_with<F, R>(
 ) -> Result<(), RollbackError>
 where
     F: Fn(RollbackTarget) -> PathBuf,
-    R: Fn(RollbackReload) -> Result<(), RollbackError>,
+    R: Fn(RollbackReload, &Path, bool) -> Result<(), RollbackError>,
 {
     validate_transaction_id(transaction_id)?;
     let directory = rollback_root.join(transaction_id);
@@ -245,10 +382,15 @@ fn recover_bundle<F, R>(
 ) -> Result<(), RollbackError>
 where
     F: Fn(RollbackTarget) -> PathBuf,
-    R: Fn(RollbackReload) -> Result<(), RollbackError>,
+    R: Fn(RollbackReload, &Path, bool) -> Result<(), RollbackError>,
 {
-    let recovery =
-        restore(directory, manifest, max_bytes, resolve).and_then(|()| reload(manifest.reload));
+    let prior_runtime_table_existed = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.target == RollbackTarget::LinuxNftablesRuntime)
+        .is_some_and(|entry| entry.existed);
+    let recovery = restore(directory, manifest, max_bytes, resolve)
+        .and_then(|()| reload(manifest.reload, directory, prior_runtime_table_existed));
     match recovery {
         Ok(()) => {
             write_new_file(&directory.join("rolled-back"), b"ok", 0o600)?;
@@ -397,6 +539,26 @@ where
 {
     let mut restored_bytes = 0_u64;
     for entry in &manifest.entries {
+        if matches!(
+            entry.target,
+            RollbackTarget::LinuxNftablesRuntime | RollbackTarget::LinuxFirewallCanonical
+        ) {
+            if entry.target == RollbackTarget::LinuxFirewallCanonical && !entry.existed {
+                continue;
+            }
+            let snapshot = read_bounded_file(&directory.join(&entry.snapshot_name), max_bytes)?;
+            restored_bytes = restored_bytes.saturating_add(
+                u64::try_from(snapshot.len()).map_err(|_| RollbackError::CapacityExceeded)?,
+            );
+            if restored_bytes > max_bytes {
+                return Err(RollbackError::CapacityExceeded);
+            }
+            let actual = lower_hex(digest(&SHA256, &snapshot).as_ref());
+            if entry.digest.as_deref() != Some(&actual) {
+                return Err(RollbackError::SnapshotDigestMismatch);
+            }
+            continue;
+        }
         let target = resolve(entry.target);
         if entry.existed {
             let snapshot = read_bounded_file(&directory.join(&entry.snapshot_name), max_bytes)?;
@@ -452,7 +614,15 @@ fn load_manifest(
     }
     let mut targets = HashSet::with_capacity(manifest.entries.len());
     for (index, entry) in manifest.entries.iter().enumerate() {
-        let metadata_shape_valid = if entry.existed {
+        let metadata_shape_valid = if entry.target == RollbackTarget::LinuxNftablesRuntime {
+            entry.digest.as_deref().is_some_and(valid_digest) && entry.mode.is_none()
+        } else if entry.target == RollbackTarget::LinuxFirewallCanonical {
+            if entry.existed {
+                entry.digest.as_deref().is_some_and(valid_digest) && entry.mode.is_none()
+            } else {
+                entry.digest.is_none() && entry.mode.is_none()
+            }
+        } else if entry.existed {
             entry.digest.as_deref().is_some_and(valid_digest)
                 && entry.mode.is_some_and(|mode| mode <= 0o777)
         } else {
@@ -532,16 +702,40 @@ fn sync_directory(path: &Path) -> Result<(), RollbackError> {
         .map_err(RollbackError::Io)
 }
 
-fn execute_reload(reload: RollbackReload) -> Result<(), RollbackError> {
-    let (program, arguments): (&str, &[&str]) = match reload {
-        RollbackReload::OpenWrtFirewall => ("/etc/init.d/firewall", &["reload"]),
-        RollbackReload::LinuxNftables => (
-            "/usr/sbin/nft",
-            &["-f", "/etc/mbed-agent/managed/firewall.nft"],
+fn execute_reload(
+    reload: RollbackReload,
+    directory: &Path,
+    prior_runtime_table_existed: bool,
+) -> Result<(), RollbackError> {
+    let (program, arguments): (PathBuf, Vec<PathBuf>) = match reload {
+        RollbackReload::OpenWrtFirewall => (
+            PathBuf::from("/etc/init.d/firewall"),
+            vec![PathBuf::from("reload")],
         ),
+        RollbackReload::LinuxNftables => (
+            resolve_fixed_program("nft")?,
+            vec![
+                PathBuf::from("--file"),
+                PathBuf::from("/etc/mbed-agent/managed/firewall.nft"),
+            ],
+        ),
+        RollbackReload::LinuxNftablesRuntime => {
+            let nft = resolve_fixed_program("nft")?;
+            if !managed_nftables_table_exists(&nft)? {
+                return if prior_runtime_table_existed {
+                    Err(RollbackError::ReloadFailed)
+                } else {
+                    Ok(())
+                };
+            }
+            (
+                nft,
+                vec![PathBuf::from("--file"), directory.join("snapshot-0.bin")],
+            )
+        }
     };
     let status = Command::new(program)
-        .args(arguments)
+        .args(&arguments)
         .env_clear()
         .status()
         .map_err(RollbackError::Io)?;
@@ -550,6 +744,45 @@ fn execute_reload(reload: RollbackReload) -> Result<(), RollbackError> {
     } else {
         Err(RollbackError::ReloadFailed)
     }
+}
+
+fn managed_nftables_table_exists(nft: &Path) -> Result<bool, RollbackError> {
+    let output = Command::new(nft)
+        .args(["list", "tables"])
+        .env_clear()
+        .output()
+        .map_err(RollbackError::Io)?;
+    if !output.status.success()
+        || u64::try_from(output.stdout.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES
+    {
+        return Err(RollbackError::ReloadFailed);
+    }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| RollbackError::ReloadFailed)?;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != "table" {
+            return Err(RollbackError::ReloadFailed);
+        }
+        if fields[1] == "inet" && fields[2] == "mbed_agent" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_fixed_program(name: &str) -> Result<PathBuf, RollbackError> {
+    for directory in ["/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+        let candidate = Path::new(directory).join(name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+                return Ok(candidate);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RollbackError::Io(error)),
+        }
+    }
+    Err(RollbackError::ReloadFailed)
 }
 
 fn validate_transaction_id(value: &str) -> Result<(), RollbackError> {
@@ -578,6 +811,13 @@ fn targets_match_reload(targets: &HashSet<RollbackTarget>, reload: RollbackReloa
         }
         RollbackReload::LinuxNftables => {
             targets == &HashSet::from([RollbackTarget::LinuxNftablesManaged])
+        }
+        RollbackReload::LinuxNftablesRuntime => {
+            targets
+                == &HashSet::from([
+                    RollbackTarget::LinuxNftablesRuntime,
+                    RollbackTarget::LinuxFirewallCanonical,
+                ])
         }
     }
 }
@@ -622,7 +862,60 @@ pub enum RollbackError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn runtime_nftables_bundle_is_volatile_digest_bound_and_first_use_aware() {
+        let root = test_root("nft-runtime");
+        let rollback = root.join("rollback");
+        let ruleset = b"delete table inet mbed_agent\n";
+        let bundle = create_nftables_runtime_rollback_bundle(
+            &rollback,
+            "txn-nft-runtime",
+            ruleset,
+            false,
+            Some(b"canonical-before"),
+            5,
+            1024,
+        )
+        .expect("runtime bundle");
+        assert_eq!(
+            fs::read(bundle.directory.join("snapshot-0.bin")).expect("snapshot"),
+            ruleset
+        );
+        assert_eq!(
+            nftables_runtime_rollback_canonical_state(&rollback, "txn-nft-runtime", 1024)
+                .expect("canonical snapshot"),
+            RuntimeCanonicalSnapshot::Present(b"canonical-before".to_vec())
+        );
+        request_rollback(&rollback, "txn-nft-runtime").expect("request");
+        let called = Cell::new(false);
+        run_helper_with(
+            &rollback,
+            "txn-nft-runtime",
+            1024,
+            |_| panic!("runtime rollback must not resolve a persistent target"),
+            |reload, directory, prior_existed| {
+                assert_eq!(reload, RollbackReload::LinuxNftablesRuntime);
+                assert!(!prior_existed);
+                assert_eq!(
+                    fs::read(directory.join("snapshot-0.bin")).expect("snapshot"),
+                    ruleset
+                );
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect("helper");
+        assert!(called.get());
+        assert_eq!(
+            rollback_outcome(&rollback, "txn-nft-runtime").expect("outcome"),
+            RollbackOutcome::RolledBack
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn confirmed_watchdog_removes_bundle_without_restoring() {
@@ -646,7 +939,7 @@ mod tests {
             "txn-confirm",
             1024,
             |_| target.clone(),
-            |_| panic!("confirmed transaction must not reload"),
+            |_, _, _| panic!("confirmed transaction must not reload"),
         )
         .expect("watchdog");
         assert_eq!(fs::read(&target).expect("target"), b"after");
@@ -703,7 +996,7 @@ mod tests {
                 &manifest,
                 1024,
                 |_| target.clone(),
-                |_| Err(RollbackError::ReloadFailed),
+                |_, _, _| Err(RollbackError::ReloadFailed),
             ),
             Err(RollbackError::ReloadFailed)
         ));
@@ -779,7 +1072,7 @@ mod tests {
                 "txn-immediate",
                 1024,
                 |_| helper_target.clone(),
-                |_| Ok(()),
+                |_, _, _| Ok(()),
             )
         });
         request_rollback(&rollback, "txn-immediate").expect("request");

@@ -836,6 +836,22 @@ impl Store {
         Ok(payload)
     }
 
+    /// Removes the volatile generic firewall canonical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot update the application state.
+    pub fn clear_firewall_runtime_state(&self) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM app_state WHERE key = ?1",
+                [FIREWALL_RUNTIME_STATE_KEY],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
     pub fn database_bytes(&self) -> u64 {
         file_len(&self.path)
             .saturating_add(file_len(&PathBuf::from(format!(
@@ -1210,6 +1226,10 @@ mod tests {
             store.firewall_runtime_state(4),
             Err(StoreError::PayloadTooLarge { .. })
         ));
+        store
+            .clear_firewall_runtime_state()
+            .expect("clear volatile state");
+        assert_eq!(store.firewall_runtime_state(16).expect("cleared"), None);
         drop(store);
         fs::remove_dir_all(root).expect("remove store test directory");
     }

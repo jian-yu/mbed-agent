@@ -27,6 +27,5 @@ hide a broken nftables control plane.
 ## Consequences
 
 Generic Linux nftables transactions now have an unambiguous fresh-inspection
-primitive for both first use and existing managed state. Native staging,
-activation, persistent managed-file rollback, and daemon admission remain the
-next layer and cannot bypass this probe.
+primitive for both first use and existing managed state. ADR 0039 builds the
+native transaction, runtime-only rollback, and daemon admission on this probe.
