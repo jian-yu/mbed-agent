@@ -219,12 +219,15 @@ where
     let started = Instant::now();
     let timeout = Duration::from_secs(manifest.timeout_secs);
     while started.elapsed() < timeout {
-        let confirmation = directory.join("confirmed");
-        if confirmation.is_file() {
-            let value = read_bounded_file(&confirmation, 64)?;
-            if value == transaction_id.as_bytes() {
+        let decision = directory.join("decision");
+        if decision.is_file() {
+            let value = read_bounded_file(&decision, 80)?;
+            if value == decision_value("confirm", transaction_id).as_bytes() {
                 fs::remove_dir_all(&directory).map_err(RollbackError::Io)?;
                 return Ok(());
+            }
+            if value == decision_value("rollback", transaction_id).as_bytes() {
+                return recover_bundle(&directory, &manifest, max_bytes, resolve, reload);
             }
             return Err(RollbackError::InvalidManifest);
         }
@@ -273,12 +276,114 @@ pub fn confirm_rollback(rollback_root: &Path, transaction_id: &str) -> Result<()
     validate_transaction_id(transaction_id)?;
     let directory = rollback_root.join(transaction_id);
     load_manifest(&directory, transaction_id)?;
-    write_new_file(
-        &directory.join("confirmed"),
-        transaction_id.as_bytes(),
-        0o600,
-    )?;
-    sync_directory(&directory)
+    write_decision(&directory, "confirm", transaction_id)
+}
+
+/// Requests immediate recovery from the already running independent helper.
+///
+/// The marker contains only the exact validated transaction ID and is durable before return.
+/// Repeating the same request is idempotent.
+///
+/// # Errors
+///
+/// Returns an error for an invalid bundle, conflicting marker, or filesystem failure.
+pub fn request_rollback(rollback_root: &Path, transaction_id: &str) -> Result<(), RollbackError> {
+    validate_transaction_id(transaction_id)?;
+    let directory = rollback_root.join(transaction_id);
+    load_manifest(&directory, transaction_id)?;
+    write_decision(&directory, "rollback", transaction_id)
+}
+
+fn write_decision(
+    directory: &Path,
+    action: &str,
+    transaction_id: &str,
+) -> Result<(), RollbackError> {
+    let marker = directory.join("decision");
+    let expected = decision_value(action, transaction_id);
+    if marker.exists() {
+        return validate_existing_decision(&marker, &expected);
+    }
+    let temporary = directory.join(format!(".decision-{action}"));
+    match write_new_file(&temporary, expected.as_bytes(), 0o600) {
+        Ok(()) => {}
+        Err(RollbackError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            for _ in 0..100 {
+                if marker.exists() {
+                    return validate_existing_decision(&marker, &expected);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return Err(RollbackError::DecisionConflict);
+        }
+        Err(error) => return Err(error),
+    }
+    match fs::hard_link(&temporary, &marker) {
+        Ok(()) => {
+            fs::remove_file(&temporary).map_err(RollbackError::Io)?;
+            sync_directory(directory)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            validate_existing_decision(&marker, &expected)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(RollbackError::Io(error))
+        }
+    }
+}
+
+fn validate_existing_decision(marker: &Path, expected: &str) -> Result<(), RollbackError> {
+    let value = read_bounded_file(marker, 80)?;
+    if value == expected.as_bytes() {
+        Ok(())
+    } else {
+        Err(RollbackError::DecisionConflict)
+    }
+}
+
+fn decision_value(action: &str, transaction_id: &str) -> String {
+    format!("{action}:{transaction_id}")
+}
+
+/// Reads the durable recovery result without waiting or trusting process state.
+///
+/// # Errors
+///
+/// Returns an error for an invalid bundle, malformed outcome marker, or filesystem failure.
+pub fn rollback_outcome(
+    rollback_root: &Path,
+    transaction_id: &str,
+) -> Result<RollbackOutcome, RollbackError> {
+    validate_transaction_id(transaction_id)?;
+    let directory = rollback_root.join(transaction_id);
+    load_manifest(&directory, transaction_id)?;
+    let rolled_back = directory.join("rolled-back");
+    if rolled_back.is_file() {
+        return if read_bounded_file(&rolled_back, 16)? == b"ok" {
+            Ok(RollbackOutcome::RolledBack)
+        } else {
+            Err(RollbackError::InvalidManifest)
+        };
+    }
+    let failed = directory.join("rollback-failed");
+    if failed.is_file() {
+        return match read_bounded_file(&failed, 16)?.as_slice() {
+            b"restore" => Ok(RollbackOutcome::RestoreFailed),
+            b"reload" => Ok(RollbackOutcome::ReloadFailed),
+            _ => Err(RollbackError::InvalidManifest),
+        };
+    }
+    Ok(RollbackOutcome::Pending)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackOutcome {
+    Pending,
+    RolledBack,
+    RestoreFailed,
+    ReloadFailed,
 }
 
 fn restore<F>(
@@ -505,6 +610,8 @@ pub enum RollbackError {
     SnapshotDigestMismatch,
     #[error("rollback reload failed")]
     ReloadFailed,
+    #[error("rollback decision conflicts with an existing terminal decision")]
+    DecisionConflict,
     #[error("rollback manifest encoding failed: {0}")]
     Encode(serde_json::Error),
     #[error("rollback manifest decoding failed: {0}")]
@@ -644,6 +751,69 @@ mod tests {
         let manifest = load_manifest(&bundle.directory, "txn-absent").expect("manifest");
         restore(&bundle.directory, &manifest, 1024, |_| absent.clone()).expect("restore");
         assert!(!absent.exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn immediate_request_is_idempotent_and_reports_durable_outcome() {
+        let root = test_root("immediate");
+        let rollback = root.join("rollback");
+        let target = root.join("managed.nft");
+        fs::write(&target, b"before").expect("target");
+        create_bundle_with(
+            &rollback,
+            "txn-immediate",
+            &[RollbackTarget::LinuxNftablesManaged],
+            RollbackReload::LinuxNftables,
+            5,
+            1024,
+            |_| target.clone(),
+        )
+        .expect("bundle");
+        fs::write(&target, b"after").expect("change");
+        let helper_rollback = rollback.clone();
+        let helper_target = target.clone();
+        let helper = std::thread::spawn(move || {
+            run_helper_with(
+                &helper_rollback,
+                "txn-immediate",
+                1024,
+                |_| helper_target.clone(),
+                |_| Ok(()),
+            )
+        });
+        request_rollback(&rollback, "txn-immediate").expect("request");
+        request_rollback(&rollback, "txn-immediate").expect("repeat request");
+        helper.join().expect("join").expect("helper");
+        assert_eq!(fs::read(&target).expect("restored"), b"before");
+        assert_eq!(
+            rollback_outcome(&rollback, "txn-immediate").expect("outcome"),
+            RollbackOutcome::RolledBack
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn first_terminal_decision_wins() {
+        let root = test_root("decision-conflict");
+        let rollback = root.join("rollback");
+        let target = root.join("managed.nft");
+        fs::write(&target, b"before").expect("target");
+        create_bundle_with(
+            &rollback,
+            "txn-decision",
+            &[RollbackTarget::LinuxNftablesManaged],
+            RollbackReload::LinuxNftables,
+            5,
+            1024,
+            |_| target.clone(),
+        )
+        .expect("bundle");
+        request_rollback(&rollback, "txn-decision").expect("rollback wins");
+        assert!(matches!(
+            confirm_rollback(&rollback, "txn-decision"),
+            Err(RollbackError::DecisionConflict)
+        ));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

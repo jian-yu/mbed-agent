@@ -1030,6 +1030,12 @@ inventory，并执行 fw3 双栈 print 或 fw4 check。安装入口只在 valida
 清理。daemon 仍需把 rollback helper 的成功 arm 证明、SQLite 状态转换和 approval
 token 消费接到该入口后，才会对 CLI/Channel 开放。
 
+独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
+通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突
+决定被拒绝。apply/verify 失败无需等待 deadline，可请求 helper 立即执行同一套
+有界摘要恢复，并通过 durable outcome 区分 pending、恢复成功、restore 失败和
+reload 失败。
+
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
 1. **防火墙完整策略**：OpenWrt UCI fw3/fw4 与普通 Linux nftables/iptables

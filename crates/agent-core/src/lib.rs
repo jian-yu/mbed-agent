@@ -25,6 +25,7 @@ pub use firewall::{
 };
 pub use resources::{ResourceError, TmpBudget};
 pub use rollback::{
-    RollbackBundle, RollbackError, RollbackReload, RollbackTarget, confirm_rollback,
-    create_rollback_bundle, run_rollback_helper,
+    RollbackBundle, RollbackError, RollbackOutcome, RollbackReload, RollbackTarget,
+    confirm_rollback, create_rollback_bundle, request_rollback, rollback_outcome,
+    run_rollback_helper,
 };
