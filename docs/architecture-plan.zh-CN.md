@@ -1022,6 +1022,14 @@ ID、plan digest 和 boot ID 一次性写入。encode/decode 都重新核对 pre
 语义风险、ownership、operation shape、对象 schema 与内容摘要，Channel 不能在
 apply 时补交或替换 desired object。
 
+OpenWrt 原生 transaction 已接通实际 UCI staging 与安装原语：读取 root-owned
+`/etc/config/firewall`，在 `/tmp` 私有目录应用 batch，重新解析 staged typed
+inventory，并执行 fw3 双栈 print 或 fw4 check。安装入口只在 validated 状态可用，
+且会在 Flash 原子 rename 前再次比较 live `uci show` 和源文件 SHA-256，发现并发
+漂移即拒绝。安装后 reload 并重建 typed inventory 验证；staging 在失败和 drop 时
+清理。daemon 仍需把 rollback helper 的成功 arm 证明、SQLite 状态转换和 approval
+token 消费接到该入口后，才会对 CLI/Channel 开放。
+
 ### Phase 3：专业配置能力扩展（8–12 周，按纵向切片持续交付）
 
 1. **防火墙完整策略**：OpenWrt UCI fw3/fw4 与普通 Linux nftables/iptables

@@ -17,6 +17,7 @@ const COMMAND_DIRS: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirewallCommand {
     UciShowFirewall,
+    UciShowFirewallAt { staging_dir: PathBuf },
     UciBatch { staging_dir: PathBuf },
     Fw3PrintIpv4 { staging_dir: PathBuf },
     Fw3PrintIpv6 { staging_dir: PathBuf },
@@ -37,6 +38,20 @@ pub struct FirewallCommandOutput {
     pub stderr: Vec<u8>,
     pub truncated: bool,
     pub duration_ms: u64,
+}
+
+/// Minimal command capability consumed by typed native transactions.
+pub trait FirewallCommandExecutor {
+    /// Executes one closed firewall operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed command error.
+    fn execute(
+        &self,
+        operation: &FirewallCommand,
+        stdin: Option<&[u8]>,
+    ) -> Result<FirewallCommandOutput, FirewallCommandError>;
 }
 
 /// Executes only [`FirewallCommand`] values with a clean environment and no shell.
@@ -166,6 +181,20 @@ impl FirewallCommandRunner {
     ) -> Result<CommandSpecification, FirewallCommandError> {
         let spec = match operation {
             FirewallCommand::UciShowFirewall => spec("uci", &["-q", "show", "firewall"]),
+            FirewallCommand::UciShowFirewallAt { staging_dir } => {
+                let dir = self.validate_staging_dir(staging_dir)?;
+                CommandSpecification {
+                    program: "uci",
+                    arguments: vec![
+                        "-c".into(),
+                        dir.as_os_str().into(),
+                        "-q".into(),
+                        "show".into(),
+                        "firewall".into(),
+                    ],
+                    uci_config_dir: None,
+                }
+            }
             FirewallCommand::UciBatch { staging_dir } => {
                 let dir = self.validate_staging_dir(staging_dir)?;
                 CommandSpecification {
@@ -284,6 +313,16 @@ impl FirewallCommandRunner {
     }
 }
 
+impl FirewallCommandExecutor for FirewallCommandRunner {
+    fn execute(
+        &self,
+        operation: &FirewallCommand,
+        stdin: Option<&[u8]>,
+    ) -> Result<FirewallCommandOutput, FirewallCommandError> {
+        self.run(operation, stdin)
+    }
+}
+
 struct CommandSpecification {
     program: &'static str,
     arguments: Vec<OsString>,
@@ -395,7 +434,7 @@ mod tests {
     fn timeout_kills_a_stuck_fixed_command() {
         let root = fixture_root();
         write_program(&root.join("bin/nft"), "#!/bin/sh\nwhile :; do :; done\n");
-        let runner = test_runner(&root, Duration::from_millis(30), 32, 32);
+        let runner = test_runner(&root, Duration::from_millis(100), 32, 32);
         assert!(matches!(
             runner.run(&FirewallCommand::NftListManagedTable, None),
             Err(FirewallCommandError::TimedOut)

@@ -48,8 +48,10 @@ pub fn execute_approved_change(
     }
     port.reinspect()
         .map_err(|_| ChangeExecutionError::Failed(ExecutionStage::Reinspect))?;
-    port.stage()
-        .map_err(|_| ChangeExecutionError::Failed(ExecutionStage::Stage))?;
+    if port.stage().is_err() {
+        port.discard_stage();
+        return Err(ChangeExecutionError::Failed(ExecutionStage::Stage));
+    }
     transition_or_discard(port, ChangeSetState::Approved, ChangeSetState::Staged)?;
     if port.validate_stage().is_err() {
         port.discard_stage();
@@ -332,5 +334,16 @@ mod tests {
         );
         assert!(!port.calls.contains(&"arm"));
         assert!(!port.calls.contains(&"activate"));
+    }
+
+    #[test]
+    fn partial_staging_is_discarded() {
+        let mut port = port(Some("stage"));
+        assert_eq!(
+            execute_approved_change(&mut port, 1, 10, false),
+            Err(ChangeExecutionError::Failed(ExecutionStage::Stage))
+        );
+        assert_eq!(port.calls, ["reinspect", "stage", "discard"]);
+        assert_eq!(port.state, ChangeSetState::Approved);
     }
 }

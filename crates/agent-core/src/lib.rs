@@ -21,7 +21,7 @@ pub use firewall::{
     FIREWALL_EXECUTION_PLAN_SCHEMA_VERSION, FirewallExecutionPlan, FirewallExecutionPlanError,
     FirewallInventory, FirewallMutation, FirewallMutationPlan, FirewallPlanError,
     FirewallPlannedChange, FirewallRiskContext, firewall_object_digest, plan_firewall_mutations,
-    validate_firewall_object,
+    project_firewall_inventory, validate_firewall_object,
 };
 pub use resources::{ResourceError, TmpBudget};
 pub use rollback::{

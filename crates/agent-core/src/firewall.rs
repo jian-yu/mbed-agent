@@ -271,6 +271,80 @@ pub fn plan_firewall_mutations(
     Ok(FirewallMutationPlan { risk, changes })
 }
 
+/// Projects a validated typed mutation plan onto one freshly inspected inventory.
+///
+/// # Errors
+///
+/// Returns an error when inventory identity, ownership, before-state, operation shape, object
+/// digests, or projected references do not exactly match.
+pub fn project_firewall_inventory(
+    inventory: &FirewallInventory,
+    plan: &FirewallMutationPlan,
+) -> Result<FirewallInventory, FirewallPlanError> {
+    if inventory.objects.len() > MAX_OBJECTS
+        || plan.changes.is_empty()
+        || plan.changes.len() > MAX_MUTATIONS
+    {
+        return Err(FirewallPlanError::Capacity);
+    }
+    let mut projected = HashMap::with_capacity(inventory.objects.len());
+    for object in &inventory.objects {
+        validate_firewall_object(object)?;
+        let key = (object.kind().to_owned(), object.id().to_owned());
+        if projected.insert(key, object.clone()).is_some() {
+            return Err(FirewallPlanError::DuplicateObject);
+        }
+    }
+    let mut touched = HashSet::with_capacity(plan.changes.len());
+    for change in &plan.changes {
+        validate_execution_change(&change.diff, change)
+            .map_err(|_| FirewallPlanError::PlanMismatch)?;
+        let object = change
+            .after
+            .as_ref()
+            .or(change.before.as_ref())
+            .ok_or(FirewallPlanError::PlanMismatch)?;
+        let key = (object.kind().to_owned(), object.id().to_owned());
+        if !touched.insert(key.clone()) {
+            return Err(FirewallPlanError::DuplicateMutation);
+        }
+        match change.diff.operation {
+            ChangeOperation::Create if !projected.contains_key(&key) => {
+                projected.insert(
+                    key,
+                    change
+                        .after
+                        .clone()
+                        .ok_or(FirewallPlanError::PlanMismatch)?,
+                );
+            }
+            ChangeOperation::Update | ChangeOperation::Move
+                if change.before.as_ref() == projected.get(&key) =>
+            {
+                projected.insert(
+                    key,
+                    change
+                        .after
+                        .clone()
+                        .ok_or(FirewallPlanError::PlanMismatch)?,
+                );
+            }
+            ChangeOperation::Delete if change.before.as_ref() == projected.get(&key) => {
+                projected.remove(&key);
+            }
+            _ => return Err(FirewallPlanError::PlanMismatch),
+        }
+    }
+    validate_projected_references(inventory, &plan.changes)?;
+    let mut objects: Vec<_> = projected.into_values().collect();
+    objects.sort_by(|left, right| {
+        left.kind()
+            .cmp(right.kind())
+            .then_with(|| left.id().cmp(right.id()))
+    });
+    Ok(FirewallInventory { objects })
+}
+
 fn validate_projected_references(
     inventory: &FirewallInventory,
     changes: &[FirewallPlannedChange],
@@ -961,6 +1035,8 @@ pub enum FirewallPlanError {
     Encode,
     #[error("firewall mutation does not contain an object")]
     InvalidMutation,
+    #[error("firewall mutation plan does not match fresh inventory")]
+    PlanMismatch,
     #[error("firewall plan contains a dangling zone or set reference")]
     DanglingReference,
 }
