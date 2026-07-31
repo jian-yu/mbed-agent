@@ -23,6 +23,7 @@ pub enum FirewallCommand {
     Fw3PrintIpv6 { staging_dir: PathBuf },
     Fw4Check { staging_dir: PathBuf },
     OpenWrtFirewallReload,
+    NftListTables,
     NftListManagedTable,
     NftCheck { ruleset: PathBuf },
     NftLoad { ruleset: PathBuf },
@@ -219,6 +220,7 @@ impl FirewallCommandRunner {
                 self.validate_staging_dir(staging_dir)?,
             ),
             FirewallCommand::OpenWrtFirewallReload => spec("/etc/init.d/firewall", &["reload"]),
+            FirewallCommand::NftListTables => spec("nft", &["list", "tables"]),
             FirewallCommand::NftListManagedTable => {
                 spec("nft", &["list", "table", "inet", "mbed_agent"])
             }

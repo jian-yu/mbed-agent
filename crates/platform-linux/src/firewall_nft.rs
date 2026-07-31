@@ -26,6 +26,40 @@ const MAX_RULESET_BYTES: usize = 256 * 1024;
 const MAX_EXPANDED_RULES: usize = 1_024;
 const MAX_INSPECTION_BYTES: usize = 64 * 1024;
 
+/// Determines whether the exact fixed Agent table exists from `nft list tables` output.
+///
+/// # Errors
+///
+/// Returns an error for oversized output, control bytes, malformed table declarations, or a
+/// duplicate exact declaration.
+pub fn nftables_managed_table_exists(listing: &str) -> Result<bool, NftablesRenderError> {
+    if listing.len() > MAX_INSPECTION_BYTES
+        || listing
+            .bytes()
+            .any(|byte| byte == 0 || (byte.is_ascii_control() && !matches!(byte, b'\n' | b'\t')))
+    {
+        return Err(NftablesRenderError::MalformedInspection);
+    }
+    let mut found = false;
+    for line in listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != "table" {
+            return Err(NftablesRenderError::MalformedInspection);
+        }
+        if fields[1] == "inet" && fields[2] == TABLE_NAME {
+            if found {
+                return Err(NftablesRenderError::MalformedInspection);
+            }
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
 /// Current ownership state of the fixed nftables table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NftablesTableState {
@@ -944,6 +978,24 @@ mod tests {
 
     #[test]
     fn inspection_requires_the_exact_owned_table_marker() {
+        assert_eq!(
+            nftables_managed_table_exists("table ip filter\ntable inet firewalld\n"),
+            Ok(false)
+        );
+        assert_eq!(
+            nftables_managed_table_exists(
+                "table ip filter\ntable inet mbed_agent\ntable ip6 filter\n"
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            nftables_managed_table_exists("table inet mbed_agent\ntable inet mbed_agent\n"),
+            Err(NftablesRenderError::MalformedInspection)
+        );
+        assert_eq!(
+            nftables_managed_table_exists("unexpected output\n"),
+            Err(NftablesRenderError::MalformedInspection)
+        );
         assert_eq!(
             inspect_nftables_table_state(None),
             Ok(NftablesTableState::Absent)

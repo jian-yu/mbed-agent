@@ -11,13 +11,14 @@ use agent_protocol::ObjectOwnership;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::firewall_command::{FirewallCommand, FirewallCommandExecutor};
 use crate::firewall_iptables::{
     IptablesFamilyState, IptablesFirewallStage, IptablesRenderError, inspect_iptables_family_state,
     iptables_owned_state_digest, render_iptables_firewall_stage,
 };
 use crate::firewall_nft::{
     NftablesFirewallStage, NftablesRenderError, NftablesTableState, inspect_nftables_table_state,
-    nftables_owned_state_digest, render_nftables_firewall_stage,
+    nftables_managed_table_exists, nftables_owned_state_digest, render_nftables_firewall_stage,
 };
 use crate::firewall_project::{FirewallProjectionError, project_agent_objects};
 
@@ -92,6 +93,42 @@ impl GenericFirewallInventorySnapshot {
     pub fn boot_id(&self) -> &str {
         &self.boot_id
     }
+}
+
+/// Collects a fresh generic Linux nftables observation through closed commands and reconciles it
+/// with the volatile canonical state.
+///
+/// # Errors
+///
+/// Returns an error for command failures, non-UTF-8/malformed output, foreign ownership,
+/// canonical-state corruption, or native drift.
+pub fn inspect_generic_nftables_inventory(
+    executor: &impl FirewallCommandExecutor,
+    canonical_state: Option<&[u8]>,
+    boot_id: &str,
+) -> Result<GenericFirewallInventorySnapshot, GenericFirewallStateError> {
+    let tables = executor
+        .execute(&FirewallCommand::NftListTables, None)
+        .map_err(|_| GenericFirewallStateError::NativeInspection)?
+        .stdout;
+    let tables =
+        std::str::from_utf8(&tables).map_err(|_| GenericFirewallStateError::NativeInspection)?;
+    let exists = nftables_managed_table_exists(tables)?;
+    let managed = if exists {
+        let output = executor
+            .execute(&FirewallCommand::NftListManagedTable, None)
+            .map_err(|_| GenericFirewallStateError::NativeInspection)?
+            .stdout;
+        Some(String::from_utf8(output).map_err(|_| GenericFirewallStateError::NativeInspection)?)
+    } else {
+        None
+    };
+    inspect_generic_firewall_inventory(
+        canonical_state,
+        boot_id,
+        GenericFirewallBackend::Nftables,
+        GenericFirewallObservation::Nftables(managed.as_deref()),
+    )
 }
 
 /// Reconciles volatile canonical state with a fresh native firewall observation.
@@ -301,6 +338,8 @@ fn map_projection_error(error: FirewallProjectionError) -> GenericFirewallStateE
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum GenericFirewallStateError {
+    #[error("generic firewall native inspection failed")]
+    NativeInspection,
     #[error("generic firewall backend and native observation do not match")]
     BackendMismatch,
     #[error("generic firewall canonical state is malformed")]
@@ -335,11 +374,49 @@ mod tests {
     use agent_protocol::{FirewallObject, FirewallVerdict, FirewallZone, ObjectOwnership};
 
     use super::*;
+    use crate::firewall_command::{FirewallCommandError, FirewallCommandOutput};
 
     const BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
 
+    struct NftObservation {
+        tables: &'static str,
+        managed: Option<&'static str>,
+    }
+
+    impl FirewallCommandExecutor for NftObservation {
+        fn execute(
+            &self,
+            operation: &FirewallCommand,
+            _stdin: Option<&[u8]>,
+        ) -> Result<FirewallCommandOutput, FirewallCommandError> {
+            let value = match operation {
+                FirewallCommand::NftListTables => self.tables,
+                FirewallCommand::NftListManagedTable => {
+                    self.managed.ok_or(FirewallCommandError::Unsuccessful)?
+                }
+                _ => return Err(FirewallCommandError::UnexpectedInput),
+            };
+            Ok(FirewallCommandOutput {
+                stdout: value.as_bytes().to_vec(),
+                stderr: Vec::new(),
+                truncated: false,
+                duration_ms: 1,
+            })
+        }
+    }
+
     #[test]
     fn first_use_requires_native_state_to_be_absent() {
+        let collected = inspect_generic_nftables_inventory(
+            &NftObservation {
+                tables: "table ip filter\n",
+                managed: None,
+            },
+            None,
+            BOOT_ID,
+        )
+        .expect("collected first use");
+        assert!(collected.inventory().objects.is_empty());
         let snapshot = inspect_generic_firewall_inventory(
             None,
             BOOT_ID,

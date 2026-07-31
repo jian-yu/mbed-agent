@@ -1044,6 +1044,13 @@ platform-native 对象则必须按 fresh identity/version 修改。daemon 会把
 payload 在同一 SQLite transaction 内写入并直接进入 `awaiting_approval`，避免半成品
 计划占位或被审批。
 
+普通 Linux nftables 的实际写路径已开始接入 fresh observation：先运行固定且有界的
+`nft list tables`，严格解析精确 `table inet mbed_agent` identity；只有确认存在后才
+运行 `nft list table inet mbed_agent`。因此“表不存在”不再由任意非零退出码猜测，
+命令故障、畸形输出、重复 identity、foreign table、orphan state 与 native drift 都会
+分别 fail closed。该 observation 已能与 `/tmp` SQLite 中 boot-bound canonical state
+重建 typed inventory，下一步由 nft native transaction 消费。
+
 独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
 通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突
 决定被拒绝。apply/verify 失败无需等待 deadline，可请求 helper 立即执行同一套
