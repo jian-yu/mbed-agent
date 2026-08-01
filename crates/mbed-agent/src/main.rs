@@ -195,7 +195,7 @@ enum ChangeTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
-    /// Show a fresh typed `OpenWrt` L2/L3 inventory with exact object digests.
+    /// Show a fresh typed L2/L3 inventory with exact object digests.
     NetworkInventory {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,

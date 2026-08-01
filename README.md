@@ -146,6 +146,10 @@ and non-installing staging are recorded in
 The OpenWrt network install/reload/verify transaction and independent rollback
 target are recorded in
 [ADR 0043](docs/adr/0043-openwrt-network-transaction-rollback.md).
+OpenWrt network daemon admission and confirmed commit are recorded in
+[ADR 0044](docs/adr/0044-daemon-openwrt-network-confirmed-commit.md).
+Bounded generic Linux runtime network inventory is recorded in
+[ADR 0045](docs/adr/0045-generic-linux-network-runtime-inventory.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -243,7 +247,8 @@ runtime verification, and risk-based confirmation.
 ChangeSet/approval binding before extracting the secret. A raw token is also
 accepted from stdin when `--approval-id` is supplied.
 
-OpenWrt 21.02+ L2/L3 changes use the same lifecycle and the same binary:
+Fresh L2/L3 inventory is available on OpenWrt 21.02+ and generic Linux with
+iproute2. OpenWrt changes use the same lifecycle and the same binary:
 
 ```sh
 cargo run -p mbed-agent -- change network-inventory > network-inventory.json

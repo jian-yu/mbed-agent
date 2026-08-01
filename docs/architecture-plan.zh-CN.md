@@ -1226,6 +1226,13 @@ approval、全局串行写、独立 `/etc/config/network` rollback helper、live
 普通 Linux 的 L2/L3 公共写入口仍保持关闭，需在 netlink 或已识别 network manager
 上实现等价的 fresh inventory、原生 transaction 与独立回滚后再开放。
 
+截至 ADR 0045，普通 Linux 已开放只读的 typed runtime inventory：当 iproute2 可用时，
+执行固定且有界的 `ip -j link/address/route`，将可安全表达的接口和路由重建为
+platform-native 对象并返回精确摘要。动态租约地址不会伪装成静态期望配置，当前 MAC
+也不会被误标为 override；multipath、未知 route type、重复 identity、畸形或超限输出
+均 fail closed。由于内核状态不能证明 NetworkManager、systemd-networkd、发行版脚本
+或厂商 supervisor 的持久 ownership，普通 Linux 的 plan/apply 仍关闭。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。

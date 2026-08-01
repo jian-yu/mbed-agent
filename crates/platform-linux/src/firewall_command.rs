@@ -27,6 +27,9 @@ pub enum FirewallCommand {
     Fw4Check { staging_dir: PathBuf },
     OpenWrtFirewallReload,
     OpenWrtNetworkReload,
+    IpJsonLink,
+    IpJsonAddress,
+    IpJsonRoute,
     NftListTables,
     NftListManagedTable,
     NftCheck { ruleset: PathBuf },
@@ -180,6 +183,7 @@ impl FirewallCommandRunner {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Closed operation mapping is intentionally centralized.
     fn specification(
         &self,
         operation: &FirewallCommand,
@@ -233,6 +237,9 @@ impl FirewallCommandRunner {
                 self.validate_staging_dir(staging_dir)?,
             ),
             FirewallCommand::OpenWrtFirewallReload => spec("/etc/init.d/firewall", &["reload"]),
+            FirewallCommand::IpJsonLink => spec("ip", &["-j", "link", "show"]),
+            FirewallCommand::IpJsonAddress => spec("ip", &["-j", "address", "show"]),
+            FirewallCommand::IpJsonRoute => spec("ip", &["-j", "route", "show", "table", "all"]),
             FirewallCommand::NftListTables => spec("nft", &["list", "tables"]),
             FirewallCommand::NftListManagedTable => {
                 spec("nft", &["list", "table", "inet", "mbed_agent"])
@@ -554,6 +561,31 @@ mod tests {
         assert_eq!(staged.arguments[2], "-q");
         assert_eq!(staged.arguments[3], "export");
         assert_eq!(staged.arguments[4], "network");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn runtime_network_inventory_operations_are_fixed_and_read_only() {
+        let root = fixture_root();
+        let runner = test_runner(&root, Duration::from_secs(5), 1024, 1024);
+        for (operation, expected) in [
+            (FirewallCommand::IpJsonLink, vec!["-j", "link", "show"]),
+            (
+                FirewallCommand::IpJsonAddress,
+                vec!["-j", "address", "show"],
+            ),
+            (
+                FirewallCommand::IpJsonRoute,
+                vec!["-j", "route", "show", "table", "all"],
+            ),
+        ] {
+            let specification = runner.specification(&operation).expect("specification");
+            assert_eq!(specification.program, "ip");
+            assert_eq!(
+                specification.arguments,
+                expected.into_iter().map(OsString::from).collect::<Vec<_>>()
+            );
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use agent_core::{
     AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, FirewallExecutionPlan,
-    FirewallMutation, FirewallRiskContext, NetworkExecutionPlan, NetworkMutation,
+    FirewallMutation, FirewallRiskContext, NetworkExecutionPlan, NetworkInventory, NetworkMutation,
     NetworkRiskContext, TmpBudget, confirm_awaiting_execution, execute_approved_change,
     firewall_object_digest, network_object_digest, plan_digest, plan_firewall_mutations,
     plan_network_mutations,
@@ -43,6 +43,7 @@ use platform_linux::firewall_runtime::{
 use platform_linux::network_openwrt::{
     OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory,
 };
+use platform_linux::network_runtime::inspect_runtime_network_inventory;
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -807,16 +808,12 @@ async fn handle_network_plan(
 }
 
 async fn handle_network_inventory(id: String, state: &AppState) -> ServerResponse {
-    if let Err(error) = openwrt_network_write_supported(state) {
-        return error.with_id(id);
-    }
     let _configuration_guard = state.configuration_lock.lock().await;
-    let snapshot = match inspect_network_for_planning(state).await {
-        Ok(snapshot) => snapshot,
+    let inventory = match inspect_network_inventory(state).await {
+        Ok(inventory) => inventory,
         Err(error) => return error.with_id(id),
     };
-    let objects = snapshot
-        .inventory()
+    let objects = inventory
         .objects
         .iter()
         .map(|object| {
@@ -835,6 +832,67 @@ async fn handle_network_inventory(id: String, state: &AppState) -> ServerRespons
             error!(%error, "fresh network inventory digest failed");
             ServerResponse::error(id, ErrorCode::Internal, "network inventory is unavailable")
         }
+    }
+}
+
+async fn inspect_network_inventory(
+    state: &AppState,
+) -> Result<NetworkInventory, PendingResponseError> {
+    match state.platform.kind {
+        PlatformKind::OpenWrt => inspect_network_for_planning(state)
+            .await
+            .map(|snapshot| snapshot.inventory().clone()),
+        PlatformKind::GenericLinux
+            if state
+                .platform
+                .available_commands
+                .iter()
+                .any(|command| command == "ip") =>
+        {
+            let runner = firewall_command_runner(state);
+            tokio::task::spawn_blocking(move || {
+                let links = runner
+                    .execute(&FirewallCommand::IpJsonLink, None)
+                    .map_err(|_| {
+                        PendingResponseError::unavailable("live network inventory is unavailable")
+                    })?
+                    .stdout;
+                let addresses = runner
+                    .execute(&FirewallCommand::IpJsonAddress, None)
+                    .map_err(|_| {
+                        PendingResponseError::unavailable("live network inventory is unavailable")
+                    })?
+                    .stdout;
+                let routes = runner
+                    .execute(&FirewallCommand::IpJsonRoute, None)
+                    .map_err(|_| {
+                        PendingResponseError::unavailable("live network inventory is unavailable")
+                    })?
+                    .stdout;
+                inspect_runtime_network_inventory(
+                    std::str::from_utf8(&links).map_err(|_| {
+                        PendingResponseError::conflict("live network inventory is malformed")
+                    })?,
+                    std::str::from_utf8(&addresses).map_err(|_| {
+                        PendingResponseError::conflict("live network inventory is malformed")
+                    })?,
+                    std::str::from_utf8(&routes).map_err(|_| {
+                        PendingResponseError::conflict("live network inventory is malformed")
+                    })?,
+                )
+                .map_err(|error| {
+                    warn!(%error, "generic Linux network inventory is not safely representable");
+                    PendingResponseError::conflict(
+                        "live network inventory cannot be safely represented",
+                    )
+                })
+            })
+            .await
+            .map_err(|_| PendingResponseError::internal("network inventory worker failed"))?
+        }
+        _ => Err(PendingResponseError::conflict(
+            "no supported network inventory backend is available",
+        )),
     }
 }
 
