@@ -24,6 +24,8 @@ pub enum RollbackTarget {
     LinuxNftablesManaged,
     LinuxNftablesRuntime,
     LinuxFirewallCanonical,
+    LinuxNetworkRouteBatch,
+    LinuxNetworkCanonical,
     LinuxIptablesIpv4FromOwned,
     LinuxIptablesIpv4FromAbsent,
     LinuxIptablesIpv6FromOwned,
@@ -38,6 +40,8 @@ impl RollbackTarget {
             Self::LinuxNftablesManaged => Some(Path::new("/etc/mbed-agent/managed/firewall.nft")),
             Self::LinuxNftablesRuntime
             | Self::LinuxFirewallCanonical
+            | Self::LinuxNetworkRouteBatch
+            | Self::LinuxNetworkCanonical
             | Self::LinuxIptablesIpv4FromOwned
             | Self::LinuxIptablesIpv4FromAbsent
             | Self::LinuxIptablesIpv6FromOwned
@@ -54,6 +58,7 @@ pub enum RollbackReload {
     LinuxNftables,
     LinuxNftablesRuntime,
     LinuxIptablesRuntime,
+    LinuxNetworkRoutesRuntime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +89,8 @@ pub enum RuntimeCanonicalSnapshot {
     NotRuntime,
     Absent,
     Present(Vec<u8>),
+    NetworkAbsent,
+    NetworkPresent(Vec<u8>),
 }
 
 /// Conditional rollback inputs for one iptables address family.
@@ -201,6 +208,92 @@ pub fn create_nftables_runtime_rollback_bundle(
                 canonical_entry,
             ],
             reload: RollbackReload::LinuxNftablesRuntime,
+        };
+        let encoded = serde_json::to_vec(&manifest).map_err(RollbackError::Encode)?;
+        if encoded.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(RollbackError::InvalidManifest);
+        }
+        write_new_file(&directory.join("manifest.json"), &encoded, 0o600)?;
+        sync_directory(&directory)?;
+        sync_directory(rollback_root)?;
+        Ok(RollbackBundle {
+            directory: directory.clone(),
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result
+}
+
+/// Creates a runtime-only generic Linux route rollback bundle.
+///
+/// The reverse `ip` batch and optional prior network canonical state remain below the private
+/// rollback root. The helper executes only a fixed `ip -force -batch <snapshot>` command.
+///
+/// # Errors
+///
+/// Returns an error for invalid identifiers/limits, empty or oversized artifacts, or failure to
+/// durably create the bundle.
+pub fn create_network_routes_runtime_rollback_bundle(
+    rollback_root: &Path,
+    transaction_id: &str,
+    rollback_batch: &[u8],
+    canonical_state: Option<&[u8]>,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<RollbackBundle, RollbackError> {
+    validate_transaction_id(transaction_id)?;
+    let canonical_len = canonical_state.map_or(0, <[u8]>::len);
+    let total = rollback_batch.len().saturating_add(canonical_len);
+    if !(5..=600).contains(&timeout_secs)
+        || rollback_batch.is_empty()
+        || u64::try_from(total).unwrap_or(u64::MAX) > max_bytes
+    {
+        return Err(RollbackError::InvalidManifest);
+    }
+    fs::create_dir_all(rollback_root).map_err(RollbackError::Io)?;
+    fs::set_permissions(rollback_root, fs::Permissions::from_mode(0o700))
+        .map_err(RollbackError::Io)?;
+    let directory = rollback_root.join(transaction_id);
+    fs::create_dir(&directory).map_err(RollbackError::Io)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(RollbackError::Io)?;
+    let result = (|| {
+        write_new_file(&directory.join("snapshot-0.bin"), rollback_batch, 0o600)?;
+        let canonical_entry = if let Some(canonical) = canonical_state {
+            write_new_file(&directory.join("snapshot-1.bin"), canonical, 0o600)?;
+            SnapshotEntry {
+                target: RollbackTarget::LinuxNetworkCanonical,
+                existed: true,
+                snapshot_name: "snapshot-1.bin".into(),
+                digest: Some(lower_hex(digest(&SHA256, canonical).as_ref())),
+                mode: None,
+            }
+        } else {
+            SnapshotEntry {
+                target: RollbackTarget::LinuxNetworkCanonical,
+                existed: false,
+                snapshot_name: "snapshot-1.bin".into(),
+                digest: None,
+                mode: None,
+            }
+        };
+        let manifest = RollbackManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            transaction_id: transaction_id.into(),
+            timeout_secs,
+            entries: vec![
+                SnapshotEntry {
+                    target: RollbackTarget::LinuxNetworkRouteBatch,
+                    existed: true,
+                    snapshot_name: "snapshot-0.bin".into(),
+                    digest: Some(lower_hex(digest(&SHA256, rollback_batch).as_ref())),
+                    mode: None,
+                },
+                canonical_entry,
+            ],
+            reload: RollbackReload::LinuxNetworkRoutesRuntime,
         };
         let encoded = serde_json::to_vec(&manifest).map_err(RollbackError::Encode)?;
         if encoded.len() as u64 > MAX_MANIFEST_BYTES {
@@ -358,26 +451,36 @@ pub fn runtime_rollback_canonical_state(
     validate_transaction_id(transaction_id)?;
     let directory = rollback_root.join(transaction_id);
     let manifest = load_manifest(&directory, transaction_id)?;
-    if !matches!(
-        manifest.reload,
-        RollbackReload::LinuxNftablesRuntime | RollbackReload::LinuxIptablesRuntime
-    ) {
-        return Ok(RuntimeCanonicalSnapshot::NotRuntime);
-    }
+    let canonical_target = match manifest.reload {
+        RollbackReload::LinuxNftablesRuntime | RollbackReload::LinuxIptablesRuntime => {
+            RollbackTarget::LinuxFirewallCanonical
+        }
+        RollbackReload::LinuxNetworkRoutesRuntime => RollbackTarget::LinuxNetworkCanonical,
+        _ => return Ok(RuntimeCanonicalSnapshot::NotRuntime),
+    };
+    let network = canonical_target == RollbackTarget::LinuxNetworkCanonical;
     let entry = manifest
         .entries
         .iter()
-        .find(|entry| entry.target == RollbackTarget::LinuxFirewallCanonical)
+        .find(|entry| entry.target == canonical_target)
         .ok_or(RollbackError::InvalidManifest)?;
     if !entry.existed {
-        return Ok(RuntimeCanonicalSnapshot::Absent);
+        return Ok(if network {
+            RuntimeCanonicalSnapshot::NetworkAbsent
+        } else {
+            RuntimeCanonicalSnapshot::Absent
+        });
     }
     let snapshot = read_bounded_file(&directory.join(&entry.snapshot_name), max_bytes)?;
     let actual = lower_hex(digest(&SHA256, &snapshot).as_ref());
     if entry.digest.as_deref() != Some(&actual) {
         return Err(RollbackError::SnapshotDigestMismatch);
     }
-    Ok(RuntimeCanonicalSnapshot::Present(snapshot))
+    Ok(if network {
+        RuntimeCanonicalSnapshot::NetworkPresent(snapshot)
+    } else {
+        RuntimeCanonicalSnapshot::Present(snapshot)
+    })
 }
 
 fn create_bundle_with<F>(
@@ -686,7 +789,11 @@ where
     let mut restored_bytes = 0_u64;
     for entry in &manifest.entries {
         if is_runtime_target(entry.target) {
-            if entry.target != RollbackTarget::LinuxNftablesRuntime && !entry.existed {
+            if !matches!(
+                entry.target,
+                RollbackTarget::LinuxNftablesRuntime | RollbackTarget::LinuxNetworkRouteBatch
+            ) && !entry.existed
+            {
                 continue;
             }
             let snapshot = read_bounded_file(&directory.join(&entry.snapshot_name), max_bytes)?;
@@ -759,8 +866,12 @@ fn load_manifest(
     for (index, entry) in manifest.entries.iter().enumerate() {
         let metadata_shape_valid = if entry.target == RollbackTarget::LinuxNftablesRuntime {
             entry.digest.as_deref().is_some_and(valid_digest) && entry.mode.is_none()
-        } else if entry.target == RollbackTarget::LinuxFirewallCanonical
-            || is_iptables_artifact(entry.target)
+        } else if matches!(
+            entry.target,
+            RollbackTarget::LinuxFirewallCanonical
+                | RollbackTarget::LinuxNetworkCanonical
+                | RollbackTarget::LinuxNetworkRouteBatch
+        ) || is_iptables_artifact(entry.target)
         {
             if entry.existed {
                 entry.digest.as_deref().is_some_and(valid_digest) && entry.mode.is_none()
@@ -799,7 +910,10 @@ const fn is_iptables_artifact(target: RollbackTarget) -> bool {
 const fn is_runtime_target(target: RollbackTarget) -> bool {
     matches!(
         target,
-        RollbackTarget::LinuxNftablesRuntime | RollbackTarget::LinuxFirewallCanonical
+        RollbackTarget::LinuxNftablesRuntime
+            | RollbackTarget::LinuxFirewallCanonical
+            | RollbackTarget::LinuxNetworkRouteBatch
+            | RollbackTarget::LinuxNetworkCanonical
     ) || is_iptables_artifact(target)
 }
 
@@ -906,6 +1020,19 @@ fn execute_reload(
         }
         RollbackReload::LinuxIptablesRuntime => {
             return restore_iptables_families(directory, manifest);
+        }
+        RollbackReload::LinuxNetworkRoutesRuntime => {
+            let ip = resolve_fixed_program("ip")?;
+            let entry = manifest
+                .entries
+                .iter()
+                .find(|entry| entry.target == RollbackTarget::LinuxNetworkRouteBatch)
+                .ok_or(RollbackError::InvalidManifest)?;
+            return run_fixed_status(
+                &ip,
+                &["-force", "-batch"],
+                Some(&directory.join(&entry.snapshot_name)),
+            );
         }
     };
     let status = Command::new(program)
@@ -1023,6 +1150,25 @@ fn run_fixed_stdin(program: &Path, arguments: &[&str], input: &[u8]) -> Result<(
         .take()
         .ok_or(RollbackError::ReloadFailed)?
         .write_all(input)
+        .map_err(RollbackError::Io)?;
+    wait_bounded(&mut child)
+}
+
+fn run_fixed_status(
+    program: &Path,
+    arguments: &[&str],
+    final_path: Option<&Path>,
+) -> Result<(), RollbackError> {
+    let mut command = Command::new(program);
+    command.args(arguments).env_clear();
+    if let Some(path) = final_path {
+        command.arg(path);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(RollbackError::Io)?;
     wait_bounded(&mut child)
 }
@@ -1231,6 +1377,13 @@ fn targets_match_reload(targets: &HashSet<RollbackTarget>, reload: RollbackReloa
                     RollbackTarget::LinuxFirewallCanonical,
                 ])
         }
+        RollbackReload::LinuxNetworkRoutesRuntime => {
+            targets
+                == &HashSet::from([
+                    RollbackTarget::LinuxNetworkRouteBatch,
+                    RollbackTarget::LinuxNetworkCanonical,
+                ])
+        }
     }
 }
 
@@ -1394,6 +1547,85 @@ mod tests {
             rollback_outcome(&rollback, "txn-nft-runtime").expect("outcome"),
             RollbackOutcome::RolledBack
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn runtime_route_bundle_binds_reverse_batch_and_network_canonical() {
+        let root = test_root("network-routes-runtime");
+        let rollback = root.join("rollback");
+        let batch = b"-4 route del default via 192.0.2.1 table 100 proto 186\n";
+        let bundle = create_network_routes_runtime_rollback_bundle(
+            &rollback,
+            "txn-network-routes",
+            batch,
+            Some(b"network-canonical-before"),
+            5,
+            1024,
+        )
+        .expect("bundle");
+        assert_eq!(
+            runtime_rollback_canonical_state(&rollback, "txn-network-routes", 1024)
+                .expect("canonical"),
+            RuntimeCanonicalSnapshot::NetworkPresent(b"network-canonical-before".to_vec())
+        );
+        request_rollback(&rollback, "txn-network-routes").expect("request");
+        let called = Cell::new(false);
+        run_helper_with(
+            &rollback,
+            "txn-network-routes",
+            1024,
+            |_| panic!("runtime route rollback must not resolve persistent targets"),
+            |reload, directory, manifest| {
+                assert_eq!(reload, RollbackReload::LinuxNetworkRoutesRuntime);
+                let entry = manifest
+                    .entries
+                    .iter()
+                    .find(|entry| entry.target == RollbackTarget::LinuxNetworkRouteBatch)
+                    .expect("batch entry");
+                assert_eq!(
+                    fs::read(directory.join(&entry.snapshot_name)).expect("batch"),
+                    batch
+                );
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect("helper");
+        assert!(called.get());
+        assert_eq!(
+            rollback_outcome(&rollback, "txn-network-routes").expect("outcome"),
+            RollbackOutcome::RolledBack
+        );
+        assert!(bundle.directory.join("rolled-back").is_file());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn runtime_route_bundle_rejects_tampered_reverse_batch() {
+        let root = test_root("network-routes-tamper");
+        let rollback = root.join("rollback");
+        let bundle = create_network_routes_runtime_rollback_bundle(
+            &rollback,
+            "txn-network-tamper",
+            b"-4 route del blackhole 192.0.2.0/24 table 100 proto 186\n",
+            None,
+            5,
+            1024,
+        )
+        .expect("bundle");
+        fs::write(bundle.directory.join("snapshot-0.bin"), b"tampered\n").expect("tamper");
+        request_rollback(&rollback, "txn-network-tamper").expect("request");
+        assert!(matches!(
+            run_helper_with(
+                &rollback,
+                "txn-network-tamper",
+                1024,
+                |_| PathBuf::new(),
+                |_, _, _| panic!("reload must not run after digest failure")
+            ),
+            Err(RollbackError::SnapshotDigestMismatch)
+        ));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

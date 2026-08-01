@@ -34,7 +34,8 @@ pub use resources::{ResourceError, TmpBudget};
 pub use rollback::{
     IptablesRuntimeRollback, RollbackBundle, RollbackError, RollbackOutcome, RollbackReload,
     RollbackTarget, RuntimeCanonicalSnapshot, confirm_rollback,
-    create_iptables_runtime_rollback_bundle, create_nftables_runtime_rollback_bundle,
-    create_rollback_bundle, nftables_runtime_rollback_canonical_state, request_rollback,
-    rollback_outcome, run_rollback_helper, runtime_rollback_canonical_state,
+    create_iptables_runtime_rollback_bundle, create_network_routes_runtime_rollback_bundle,
+    create_nftables_runtime_rollback_bundle, create_rollback_bundle,
+    nftables_runtime_rollback_canonical_state, request_rollback, rollback_outcome,
+    run_rollback_helper, runtime_rollback_canonical_state,
 };

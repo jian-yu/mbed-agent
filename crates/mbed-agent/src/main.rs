@@ -370,6 +370,12 @@ fn restore_runtime_canonical(
             store.replace_firewall_runtime_state(&payload, max_state_bytes)?;
         }
         agent_core::RuntimeCanonicalSnapshot::Absent => store.clear_firewall_runtime_state()?,
+        agent_core::RuntimeCanonicalSnapshot::NetworkPresent(payload) => {
+            store.replace_network_runtime_state(&payload, max_state_bytes)?;
+        }
+        agent_core::RuntimeCanonicalSnapshot::NetworkAbsent => {
+            store.clear_network_runtime_state()?;
+        }
         agent_core::RuntimeCanonicalSnapshot::NotRuntime => {}
     }
     Ok(())

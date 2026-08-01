@@ -405,7 +405,9 @@ impl GenericNftablesExecutionPort {
                 .store
                 .clear_firewall_runtime_state()
                 .map_err(|_| ExecutionPortError),
-            agent_core::RuntimeCanonicalSnapshot::NotRuntime => Err(ExecutionPortError),
+            agent_core::RuntimeCanonicalSnapshot::NotRuntime
+            | agent_core::RuntimeCanonicalSnapshot::NetworkAbsent
+            | agent_core::RuntimeCanonicalSnapshot::NetworkPresent(_) => Err(ExecutionPortError),
         }
     }
 }
@@ -639,7 +641,9 @@ impl GenericIptablesExecutionPort {
                 .store
                 .clear_firewall_runtime_state()
                 .map_err(|_| ExecutionPortError),
-            agent_core::RuntimeCanonicalSnapshot::NotRuntime => Err(ExecutionPortError),
+            agent_core::RuntimeCanonicalSnapshot::NotRuntime
+            | agent_core::RuntimeCanonicalSnapshot::NetworkAbsent
+            | agent_core::RuntimeCanonicalSnapshot::NetworkPresent(_) => Err(ExecutionPortError),
         }
     }
 }

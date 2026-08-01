@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 const FIREWALL_RUNTIME_STATE_KEY: &str = "firewall_runtime_state_v1";
+const NETWORK_RUNTIME_STATE_KEY: &str = "network_runtime_state_v1";
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -942,6 +943,96 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically replaces bounded boot-bound generic network canonical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload exceeds its cap or `SQLite` cannot write it.
+    pub fn replace_network_runtime_state(
+        &self,
+        payload: &[u8],
+        max_payload_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.replace_app_state(NETWORK_RUNTIME_STATE_KEY, payload, max_payload_bytes)
+    }
+
+    /// Loads bounded boot-bound generic network canonical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized state or an unavailable `SQLite` query.
+    pub fn network_runtime_state(
+        &self,
+        max_payload_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.app_state(NETWORK_RUNTIME_STATE_KEY, max_payload_bytes)
+    }
+
+    /// Clears volatile generic network canonical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot update the application state.
+    pub fn clear_network_runtime_state(&self) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "DELETE FROM app_state WHERE key = ?1",
+                [NETWORK_RUNTIME_STATE_KEY],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn replace_app_state(
+        &self,
+        key: &str,
+        payload: &[u8],
+        max_payload_bytes: usize,
+    ) -> Result<(), StoreError> {
+        if payload.is_empty() || payload.len() > max_payload_bytes {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload.len(),
+                limit: max_payload_bytes,
+            });
+        }
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                     updated_at = excluded.updated_at",
+                params![key, payload],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    fn app_state(
+        &self,
+        key: &str,
+        max_payload_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let connection = self.connection()?;
+        let payload: Option<Vec<u8>> = connection
+            .query_row("SELECT value FROM app_state WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if payload
+            .as_ref()
+            .is_some_and(|value| value.len() > max_payload_bytes)
+        {
+            return Err(StoreError::PayloadTooLarge {
+                actual: payload.as_ref().map_or(0, Vec::len),
+                limit: max_payload_bytes,
+            });
+        }
+        Ok(payload)
+    }
+
     pub fn database_bytes(&self) -> u64 {
         file_len(&self.path)
             .saturating_add(file_len(&PathBuf::from(format!(
@@ -1342,6 +1433,17 @@ mod tests {
             store.firewall_runtime_state(16).expect("load"),
             Some(b"second".to_vec())
         );
+        store
+            .replace_network_runtime_state(b"network", 16)
+            .expect("network state");
+        assert_eq!(
+            store.network_runtime_state(16).expect("network load"),
+            Some(b"network".to_vec())
+        );
+        assert_eq!(
+            store.firewall_runtime_state(16).expect("firewall isolated"),
+            Some(b"second".to_vec())
+        );
         assert!(matches!(
             store.replace_firewall_runtime_state(b"too-large", 4),
             Err(StoreError::PayloadTooLarge { .. })
@@ -1354,6 +1456,10 @@ mod tests {
             .clear_firewall_runtime_state()
             .expect("clear volatile state");
         assert_eq!(store.firewall_runtime_state(16).expect("cleared"), None);
+        store
+            .clear_network_runtime_state()
+            .expect("clear network state");
+        assert_eq!(store.network_runtime_state(16).expect("cleared"), None);
         drop(store);
         fs::remove_dir_all(root).expect("remove store test directory");
     }

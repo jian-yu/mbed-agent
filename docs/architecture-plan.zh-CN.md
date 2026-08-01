@@ -1250,6 +1250,14 @@ rollback-armed activate → verify 的强制顺序。正向与逆向 batch 以 0
 仍缺独立 helper 对逆向 batch 与旧 network canonical 的恢复，因此 daemon 公共写入口
 继续关闭。
 
+截至 ADR 0048，独立 helper 已支持 generic runtime route：rollback bundle 在 `/tmp`
+分别保存摘要绑定的逆向 batch 与旧 network canonical，恢复只执行固定
+`ip -force -batch <snapshot>`，使部分 forward apply 中缺失的对象不会阻断后续恢复，
+但最终非零状态仍记为 rollback failure。canonical result 显式区分 firewall/network，
+native rollback 成功后才恢复或清理独立 `network_runtime_state_v1` SQLite key。现有
+first-decision-wins、超时、即时 rollback、durable outcome 与子进程超时保持不变。
+下一切片只需接 daemon execution port 与公共 ChangeSet admission。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。

@@ -154,6 +154,8 @@ Agent-owned generic Linux volatile route ownership and staging are recorded in
 [ADR 0046](docs/adr/0046-generic-linux-runtime-route-staging.md).
 The generic Linux runtime route native transaction is recorded in
 [ADR 0047](docs/adr/0047-generic-linux-runtime-route-transaction.md).
+Independent generic Linux runtime route recovery is recorded in
+[ADR 0048](docs/adr/0048-generic-linux-runtime-route-rollback.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
