@@ -34,20 +34,21 @@ replaying unrelated rules.
    - prior owned/current absent: recreate chains plus exact hooks;
    - prior absent/current owned: delete exact hooks, flush, and delete chains;
    - prior absent/current absent: no operation.
-7. Keep daemon admission closed until the independent helper selects and
-   executes those artifacts for both families and restores canonical SQLite
-   state.
+7. Store all four conditional artifacts and prior canonical state in the
+   bounded volatile rollback manifest. The helper freshly classifies both
+   families, attempts both recoveries even if one fails, and restores canonical
+   SQLite state after native recovery.
+8. Admit iptables through the same R3 approval, one-use token, confirmed-commit,
+   and daemon serialization path used by OpenWrt and nftables.
 
 ## Consequences
 
-The platform crate now has a tested dual-stack transaction and bounded recovery
-renderer, including an explicit IPv4-success/IPv6-failure test. No public
-iptables write capability is exposed yet. The next slice extends the volatile
-rollback manifest/helper and then reuses the existing R3 approval and confirmed
-commit daemon path.
+Generic Linux iptables now has a tested dual-stack transaction, bounded
+conditional recovery, independent watchdog, canonical-state rollback, and
+daemon admission. The public typed firewall commands select it only when
+capability discovery reports the complete iptables/ip6tables backend.
 
 ## References
 
 - [Netfilter iptables-restore source](https://git.netfilter.org/iptables/tree/iptables-restore.c)
 - [Netfilter packet filtering HOWTO](https://www.netfilter.org/documentation/HOWTO/packet-filtering-HOWTO-7.html)
-

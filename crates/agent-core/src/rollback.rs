@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ring::digest::{SHA256, digest};
@@ -13,6 +13,8 @@ use thiserror::Error;
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ENTRIES: usize = 8;
+const ROLLBACK_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_IPTABLES_SAVE_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +23,10 @@ pub enum RollbackTarget {
     LinuxNftablesManaged,
     LinuxNftablesRuntime,
     LinuxFirewallCanonical,
+    LinuxIptablesIpv4FromOwned,
+    LinuxIptablesIpv4FromAbsent,
+    LinuxIptablesIpv6FromOwned,
+    LinuxIptablesIpv6FromAbsent,
 }
 
 impl RollbackTarget {
@@ -28,7 +34,12 @@ impl RollbackTarget {
         match self {
             Self::OpenWrtFirewall => Some(Path::new("/etc/config/firewall")),
             Self::LinuxNftablesManaged => Some(Path::new("/etc/mbed-agent/managed/firewall.nft")),
-            Self::LinuxNftablesRuntime | Self::LinuxFirewallCanonical => None,
+            Self::LinuxNftablesRuntime
+            | Self::LinuxFirewallCanonical
+            | Self::LinuxIptablesIpv4FromOwned
+            | Self::LinuxIptablesIpv4FromAbsent
+            | Self::LinuxIptablesIpv6FromOwned
+            | Self::LinuxIptablesIpv6FromAbsent => None,
         }
     }
 }
@@ -39,6 +50,7 @@ pub enum RollbackReload {
     OpenWrtFirewall,
     LinuxNftables,
     LinuxNftablesRuntime,
+    LinuxIptablesRuntime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +81,13 @@ pub enum RuntimeCanonicalSnapshot {
     NotRuntime,
     Absent,
     Present(Vec<u8>),
+}
+
+/// Conditional rollback inputs for one iptables address family.
+#[derive(Debug, Clone, Copy)]
+pub struct IptablesRuntimeRollback<'a> {
+    pub restore_from_owned: Option<&'a [u8]>,
+    pub restore_from_absent: Option<&'a [u8]>,
 }
 
 /// Creates a bounded rollback bundle before any managed configuration write.
@@ -197,6 +216,119 @@ pub fn create_nftables_runtime_rollback_bundle(
     result
 }
 
+/// Creates a bounded runtime-only dual-stack iptables rollback bundle.
+///
+/// Each family supplies an artifact selected when current state is owned and an optional artifact
+/// selected when current state is absent. Missing artifacts mean that recovery for that observed
+/// state is intentionally a no-op.
+///
+/// # Errors
+///
+/// Returns an error for invalid identifiers/limits, missing owned-state recovery, empty or
+/// oversized artifacts, or a failure to durably create the bundle below the rollback root.
+pub fn create_iptables_runtime_rollback_bundle(
+    rollback_root: &Path,
+    transaction_id: &str,
+    ipv4: IptablesRuntimeRollback<'_>,
+    ipv6: IptablesRuntimeRollback<'_>,
+    canonical_state: Option<&[u8]>,
+    timeout_secs: u64,
+    max_bytes: u64,
+) -> Result<RollbackBundle, RollbackError> {
+    validate_transaction_id(transaction_id)?;
+    if !(5..=600).contains(&timeout_secs)
+        || ipv4.restore_from_owned.is_none()
+        || ipv6.restore_from_owned.is_none()
+    {
+        return Err(RollbackError::InvalidManifest);
+    }
+    let runtime_entries = [
+        (
+            RollbackTarget::LinuxIptablesIpv4FromOwned,
+            ipv4.restore_from_owned,
+        ),
+        (
+            RollbackTarget::LinuxIptablesIpv4FromAbsent,
+            ipv4.restore_from_absent,
+        ),
+        (
+            RollbackTarget::LinuxIptablesIpv6FromOwned,
+            ipv6.restore_from_owned,
+        ),
+        (
+            RollbackTarget::LinuxIptablesIpv6FromAbsent,
+            ipv6.restore_from_absent,
+        ),
+        (RollbackTarget::LinuxFirewallCanonical, canonical_state),
+    ];
+    let mut total_bytes = 0_u64;
+    for (_, bytes) in runtime_entries {
+        if let Some(bytes) = bytes {
+            if bytes.is_empty() {
+                return Err(RollbackError::InvalidManifest);
+            }
+            total_bytes = total_bytes.saturating_add(
+                u64::try_from(bytes.len()).map_err(|_| RollbackError::CapacityExceeded)?,
+            );
+            if total_bytes > max_bytes {
+                return Err(RollbackError::CapacityExceeded);
+            }
+        }
+    }
+    fs::create_dir_all(rollback_root).map_err(RollbackError::Io)?;
+    fs::set_permissions(rollback_root, fs::Permissions::from_mode(0o700))
+        .map_err(RollbackError::Io)?;
+    let directory = rollback_root.join(transaction_id);
+    fs::create_dir(&directory).map_err(RollbackError::Io)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .map_err(RollbackError::Io)?;
+    let result = (|| {
+        let mut entries = Vec::with_capacity(runtime_entries.len());
+        for (index, (target, bytes)) in runtime_entries.into_iter().enumerate() {
+            let snapshot_name = format!("snapshot-{index}.bin");
+            if let Some(bytes) = bytes {
+                write_new_file(&directory.join(&snapshot_name), bytes, 0o600)?;
+                entries.push(SnapshotEntry {
+                    target,
+                    existed: true,
+                    snapshot_name,
+                    digest: Some(lower_hex(digest(&SHA256, bytes).as_ref())),
+                    mode: None,
+                });
+            } else {
+                entries.push(SnapshotEntry {
+                    target,
+                    existed: false,
+                    snapshot_name,
+                    digest: None,
+                    mode: None,
+                });
+            }
+        }
+        let manifest = RollbackManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            transaction_id: transaction_id.to_owned(),
+            timeout_secs,
+            entries,
+            reload: RollbackReload::LinuxIptablesRuntime,
+        };
+        let encoded = serde_json::to_vec(&manifest).map_err(RollbackError::Encode)?;
+        if encoded.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(RollbackError::InvalidManifest);
+        }
+        write_new_file(&directory.join("manifest.json"), &encoded, 0o600)?;
+        sync_directory(&directory)?;
+        sync_directory(rollback_root)?;
+        Ok(RollbackBundle {
+            directory: directory.clone(),
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&directory);
+    }
+    result
+}
+
 /// Loads the digest-verified prior canonical state from a rollback bundle.
 ///
 /// # Errors
@@ -207,10 +339,26 @@ pub fn nftables_runtime_rollback_canonical_state(
     transaction_id: &str,
     max_bytes: u64,
 ) -> Result<RuntimeCanonicalSnapshot, RollbackError> {
+    runtime_rollback_canonical_state(rollback_root, transaction_id, max_bytes)
+}
+
+/// Loads prior canonical state from either supported runtime firewall rollback bundle.
+///
+/// # Errors
+///
+/// Returns an error for an invalid bundle or an oversized/tampered canonical snapshot.
+pub fn runtime_rollback_canonical_state(
+    rollback_root: &Path,
+    transaction_id: &str,
+    max_bytes: u64,
+) -> Result<RuntimeCanonicalSnapshot, RollbackError> {
     validate_transaction_id(transaction_id)?;
     let directory = rollback_root.join(transaction_id);
     let manifest = load_manifest(&directory, transaction_id)?;
-    if manifest.reload != RollbackReload::LinuxNftablesRuntime {
+    if !matches!(
+        manifest.reload,
+        RollbackReload::LinuxNftablesRuntime | RollbackReload::LinuxIptablesRuntime
+    ) {
         return Ok(RuntimeCanonicalSnapshot::NotRuntime);
     }
     let entry = manifest
@@ -348,7 +496,7 @@ fn run_helper_with<F, R>(
 ) -> Result<(), RollbackError>
 where
     F: Fn(RollbackTarget) -> PathBuf,
-    R: Fn(RollbackReload, &Path, bool) -> Result<(), RollbackError>,
+    R: Fn(RollbackReload, &Path, &RollbackManifest) -> Result<(), RollbackError>,
 {
     validate_transaction_id(transaction_id)?;
     let directory = rollback_root.join(transaction_id);
@@ -382,15 +530,10 @@ fn recover_bundle<F, R>(
 ) -> Result<(), RollbackError>
 where
     F: Fn(RollbackTarget) -> PathBuf,
-    R: Fn(RollbackReload, &Path, bool) -> Result<(), RollbackError>,
+    R: Fn(RollbackReload, &Path, &RollbackManifest) -> Result<(), RollbackError>,
 {
-    let prior_runtime_table_existed = manifest
-        .entries
-        .iter()
-        .find(|entry| entry.target == RollbackTarget::LinuxNftablesRuntime)
-        .is_some_and(|entry| entry.existed);
     let recovery = restore(directory, manifest, max_bytes, resolve)
-        .and_then(|()| reload(manifest.reload, directory, prior_runtime_table_existed));
+        .and_then(|()| reload(manifest.reload, directory, manifest));
     match recovery {
         Ok(()) => {
             write_new_file(&directory.join("rolled-back"), b"ok", 0o600)?;
@@ -539,11 +682,8 @@ where
 {
     let mut restored_bytes = 0_u64;
     for entry in &manifest.entries {
-        if matches!(
-            entry.target,
-            RollbackTarget::LinuxNftablesRuntime | RollbackTarget::LinuxFirewallCanonical
-        ) {
-            if entry.target == RollbackTarget::LinuxFirewallCanonical && !entry.existed {
+        if is_runtime_target(entry.target) {
+            if entry.target != RollbackTarget::LinuxNftablesRuntime && !entry.existed {
                 continue;
             }
             let snapshot = read_bounded_file(&directory.join(&entry.snapshot_name), max_bytes)?;
@@ -616,7 +756,9 @@ fn load_manifest(
     for (index, entry) in manifest.entries.iter().enumerate() {
         let metadata_shape_valid = if entry.target == RollbackTarget::LinuxNftablesRuntime {
             entry.digest.as_deref().is_some_and(valid_digest) && entry.mode.is_none()
-        } else if entry.target == RollbackTarget::LinuxFirewallCanonical {
+        } else if entry.target == RollbackTarget::LinuxFirewallCanonical
+            || is_iptables_artifact(entry.target)
+        {
             if entry.existed {
                 entry.digest.as_deref().is_some_and(valid_digest) && entry.mode.is_none()
             } else {
@@ -639,6 +781,23 @@ fn load_manifest(
         return Err(RollbackError::InvalidManifest);
     }
     Ok(manifest)
+}
+
+const fn is_iptables_artifact(target: RollbackTarget) -> bool {
+    matches!(
+        target,
+        RollbackTarget::LinuxIptablesIpv4FromOwned
+            | RollbackTarget::LinuxIptablesIpv4FromAbsent
+            | RollbackTarget::LinuxIptablesIpv6FromOwned
+            | RollbackTarget::LinuxIptablesIpv6FromAbsent
+    )
+}
+
+const fn is_runtime_target(target: RollbackTarget) -> bool {
+    matches!(
+        target,
+        RollbackTarget::LinuxNftablesRuntime | RollbackTarget::LinuxFirewallCanonical
+    ) || is_iptables_artifact(target)
 }
 
 fn atomic_replace(
@@ -705,7 +864,7 @@ fn sync_directory(path: &Path) -> Result<(), RollbackError> {
 fn execute_reload(
     reload: RollbackReload,
     directory: &Path,
-    prior_runtime_table_existed: bool,
+    manifest: &RollbackManifest,
 ) -> Result<(), RollbackError> {
     let (program, arguments): (PathBuf, Vec<PathBuf>) = match reload {
         RollbackReload::OpenWrtFirewall => (
@@ -721,6 +880,11 @@ fn execute_reload(
         ),
         RollbackReload::LinuxNftablesRuntime => {
             let nft = resolve_fixed_program("nft")?;
+            let prior_runtime_table_existed = manifest
+                .entries
+                .iter()
+                .find(|entry| entry.target == RollbackTarget::LinuxNftablesRuntime)
+                .is_some_and(|entry| entry.existed);
             if !managed_nftables_table_exists(&nft)? {
                 return if prior_runtime_table_existed {
                     Err(RollbackError::ReloadFailed)
@@ -733,6 +897,9 @@ fn execute_reload(
                 vec![PathBuf::from("--file"), directory.join("snapshot-0.bin")],
             )
         }
+        RollbackReload::LinuxIptablesRuntime => {
+            return restore_iptables_families(directory, manifest);
+        }
     };
     let status = Command::new(program)
         .args(&arguments)
@@ -741,6 +908,231 @@ fn execute_reload(
         .map_err(RollbackError::Io)?;
     if status.success() {
         Ok(())
+    } else {
+        Err(RollbackError::ReloadFailed)
+    }
+}
+
+fn restore_iptables_families(
+    directory: &Path,
+    manifest: &RollbackManifest,
+) -> Result<(), RollbackError> {
+    let ipv4 = restore_iptables_family(directory, manifest, false);
+    let ipv6 = restore_iptables_family(directory, manifest, true);
+    if ipv4.is_ok() && ipv6.is_ok() {
+        Ok(())
+    } else {
+        Err(RollbackError::ReloadFailed)
+    }
+}
+
+fn restore_iptables_family(
+    directory: &Path,
+    manifest: &RollbackManifest,
+    ipv6: bool,
+) -> Result<(), RollbackError> {
+    let save_program = resolve_fixed_program(if ipv6 {
+        "ip6tables-save"
+    } else {
+        "iptables-save"
+    })?;
+    let output = run_fixed_capture(&save_program, &[], MAX_IPTABLES_SAVE_BYTES)?;
+    let save = std::str::from_utf8(&output).map_err(|_| RollbackError::ReloadFailed)?;
+    let current = inspect_runtime_iptables_state(save)?;
+    let target = match (ipv6, current) {
+        (false, RuntimeIptablesState::Owned) => RollbackTarget::LinuxIptablesIpv4FromOwned,
+        (false, RuntimeIptablesState::Absent) => RollbackTarget::LinuxIptablesIpv4FromAbsent,
+        (true, RuntimeIptablesState::Owned) => RollbackTarget::LinuxIptablesIpv6FromOwned,
+        (true, RuntimeIptablesState::Absent) => RollbackTarget::LinuxIptablesIpv6FromAbsent,
+    };
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.target == target)
+        .ok_or(RollbackError::InvalidManifest)?;
+    if !entry.existed {
+        return Ok(());
+    }
+    let artifact = read_bounded_file(
+        &directory.join(&entry.snapshot_name),
+        MAX_IPTABLES_SAVE_BYTES,
+    )?;
+    let actual = lower_hex(digest(&SHA256, &artifact).as_ref());
+    if entry.digest.as_deref() != Some(&actual) {
+        return Err(RollbackError::SnapshotDigestMismatch);
+    }
+    let restore_program = resolve_fixed_program(if ipv6 {
+        "ip6tables-restore"
+    } else {
+        "iptables-restore"
+    })?;
+    run_fixed_stdin(&restore_program, &["--noflush"], &artifact)
+}
+
+fn run_fixed_capture(
+    program: &Path,
+    arguments: &[&str],
+    max_bytes: u64,
+) -> Result<Vec<u8>, RollbackError> {
+    let mut child = Command::new(program)
+        .args(arguments)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(RollbackError::Io)?;
+    let stdout = child.stdout.take().ok_or(RollbackError::ReloadFailed)?;
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut output)
+            .map(|_| output)
+    });
+    wait_bounded(&mut child)?;
+    let output = reader
+        .join()
+        .map_err(|_| RollbackError::ReloadFailed)?
+        .map_err(RollbackError::Io)?;
+    if u64::try_from(output.len()).unwrap_or(u64::MAX) > max_bytes {
+        Err(RollbackError::CapacityExceeded)
+    } else {
+        Ok(output)
+    }
+}
+
+fn run_fixed_stdin(program: &Path, arguments: &[&str], input: &[u8]) -> Result<(), RollbackError> {
+    let mut child = Command::new(program)
+        .args(arguments)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(RollbackError::Io)?;
+    child
+        .stdin
+        .take()
+        .ok_or(RollbackError::ReloadFailed)?
+        .write_all(input)
+        .map_err(RollbackError::Io)?;
+    wait_bounded(&mut child)
+}
+
+fn wait_bounded(child: &mut std::process::Child) -> Result<(), RollbackError> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(RollbackError::Io)? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(RollbackError::ReloadFailed)
+            };
+        }
+        if started.elapsed() >= ROLLBACK_COMMAND_TIMEOUT {
+            child.kill().map_err(RollbackError::Io)?;
+            let _ = child.wait();
+            return Err(RollbackError::ReloadFailed);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeIptablesState {
+    Absent,
+    Owned,
+}
+
+fn inspect_runtime_iptables_state(save: &str) -> Result<RuntimeIptablesState, RollbackError> {
+    const BINDINGS: &[(&str, &str, &str, &str)] = &[
+        ("filter", "INPUT", "MBED_INPUT", "mbed-agent-owned:v1:input"),
+        (
+            "filter",
+            "OUTPUT",
+            "MBED_OUTPUT",
+            "mbed-agent-owned:v1:output",
+        ),
+        (
+            "filter",
+            "FORWARD",
+            "MBED_FORWARD",
+            "mbed-agent-owned:v1:forward",
+        ),
+        (
+            "nat",
+            "PREROUTING",
+            "MBED_PREROUTING",
+            "mbed-agent-owned:v1:prerouting",
+        ),
+        (
+            "nat",
+            "POSTROUTING",
+            "MBED_POSTROUTING",
+            "mbed-agent-owned:v1:postrouting",
+        ),
+        (
+            "mangle",
+            "FORWARD",
+            "MBED_MANGLE_FORWARD",
+            "mbed-agent-owned:v1:mangle-forward",
+        ),
+    ];
+    if u64::try_from(save.len()).unwrap_or(u64::MAX) > MAX_IPTABLES_SAVE_BYTES
+        || save
+            .bytes()
+            .any(|byte| byte == 0 || (byte.is_ascii_control() && !matches!(byte, b'\n' | b'\t')))
+    {
+        return Err(RollbackError::ReloadFailed);
+    }
+    let mut table = "";
+    let mut declarations = HashSet::new();
+    let mut jumps = HashSet::new();
+    for line in save.lines() {
+        if let Some(value) = line.strip_prefix('*') {
+            table = value;
+            continue;
+        }
+        if line == "COMMIT" {
+            table = "";
+            continue;
+        }
+        for &(expected_table, builtin, managed, marker) in BINDINGS {
+            let key = (expected_table, managed);
+            if table == expected_table
+                && line
+                    .strip_prefix(':')
+                    .and_then(|value| value.split_whitespace().next())
+                    == Some(managed)
+                && !declarations.insert(key)
+            {
+                return Err(RollbackError::ReloadFailed);
+            }
+            let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+            let targets_managed = tokens
+                .windows(2)
+                .any(|pair| pair[0] == "-j" && pair[1] == managed);
+            if table == expected_table && targets_managed {
+                let exact = tokens.len() == 8
+                    && tokens[0] == "-A"
+                    && tokens[1] == builtin
+                    && tokens[2] == "-m"
+                    && tokens[3] == "comment"
+                    && tokens[4] == "--comment"
+                    && tokens[5].trim_matches('"') == marker
+                    && tokens[6] == "-j"
+                    && tokens[7] == managed;
+                if !exact || !jumps.insert(key) {
+                    return Err(RollbackError::ReloadFailed);
+                }
+            }
+        }
+    }
+    if declarations.is_empty() && jumps.is_empty() {
+        Ok(RuntimeIptablesState::Absent)
+    } else if declarations.len() == BINDINGS.len() && jumps.len() == BINDINGS.len() {
+        Ok(RuntimeIptablesState::Owned)
     } else {
         Err(RollbackError::ReloadFailed)
     }
@@ -819,6 +1211,16 @@ fn targets_match_reload(targets: &HashSet<RollbackTarget>, reload: RollbackReloa
                     RollbackTarget::LinuxFirewallCanonical,
                 ])
         }
+        RollbackReload::LinuxIptablesRuntime => {
+            targets
+                == &HashSet::from([
+                    RollbackTarget::LinuxIptablesIpv4FromOwned,
+                    RollbackTarget::LinuxIptablesIpv4FromAbsent,
+                    RollbackTarget::LinuxIptablesIpv6FromOwned,
+                    RollbackTarget::LinuxIptablesIpv6FromAbsent,
+                    RollbackTarget::LinuxFirewallCanonical,
+                ])
+        }
     }
 }
 
@@ -866,6 +1268,67 @@ mod tests {
 
     use super::*;
 
+    const OWNED_IPTABLES_SAVE: &str = "*filter\n:MBED_INPUT - [0:0]\n-A INPUT -m comment --comment mbed-agent-owned:v1:input -j MBED_INPUT\n:MBED_OUTPUT - [0:0]\n-A OUTPUT -m comment --comment mbed-agent-owned:v1:output -j MBED_OUTPUT\n:MBED_FORWARD - [0:0]\n-A FORWARD -m comment --comment mbed-agent-owned:v1:forward -j MBED_FORWARD\nCOMMIT\n*mangle\n:MBED_MANGLE_FORWARD - [0:0]\n-A FORWARD -m comment --comment mbed-agent-owned:v1:mangle-forward -j MBED_MANGLE_FORWARD\nCOMMIT\n*nat\n:MBED_PREROUTING - [0:0]\n-A PREROUTING -m comment --comment mbed-agent-owned:v1:prerouting -j MBED_PREROUTING\n:MBED_POSTROUTING - [0:0]\n-A POSTROUTING -m comment --comment mbed-agent-owned:v1:postrouting -j MBED_POSTROUTING\nCOMMIT\n";
+
+    #[test]
+    fn iptables_runtime_bundle_carries_conditional_families_and_canonical_state() {
+        let root = test_root("iptables-runtime");
+        let rollback = root.join("rollback");
+        let cleanup = b"*filter\n-D INPUT -j MBED_INPUT\nCOMMIT\n";
+        let restore = b"*filter\n:MBED_INPUT - [0:0]\nCOMMIT\n";
+        let bundle = create_iptables_runtime_rollback_bundle(
+            &rollback,
+            "txn-iptables-runtime",
+            IptablesRuntimeRollback {
+                restore_from_owned: Some(cleanup),
+                restore_from_absent: None,
+            },
+            IptablesRuntimeRollback {
+                restore_from_owned: Some(restore),
+                restore_from_absent: Some(restore),
+            },
+            Some(b"canonical-before"),
+            5,
+            1024,
+        )
+        .expect("bundle");
+        let manifest = load_manifest(&bundle.directory, "txn-iptables-runtime").expect("manifest");
+        assert_eq!(manifest.reload, RollbackReload::LinuxIptablesRuntime);
+        assert_eq!(manifest.entries.len(), 5);
+        assert!(
+            !manifest
+                .entries
+                .iter()
+                .find(|entry| entry.target == RollbackTarget::LinuxIptablesIpv4FromAbsent)
+                .expect("ipv4 absent selector")
+                .existed
+        );
+        assert_eq!(
+            runtime_rollback_canonical_state(&rollback, "txn-iptables-runtime", 1024)
+                .expect("canonical"),
+            RuntimeCanonicalSnapshot::Present(b"canonical-before".to_vec())
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn rollback_helper_strictly_classifies_iptables_ownership() {
+        assert!(matches!(
+            inspect_runtime_iptables_state(""),
+            Ok(RuntimeIptablesState::Absent)
+        ));
+        assert!(matches!(
+            inspect_runtime_iptables_state(OWNED_IPTABLES_SAVE),
+            Ok(RuntimeIptablesState::Owned)
+        ));
+        let conditional =
+            OWNED_IPTABLES_SAVE.replace("-A INPUT -m comment", "-A INPUT -p tcp -m comment");
+        assert!(matches!(
+            inspect_runtime_iptables_state(&conditional),
+            Err(RollbackError::ReloadFailed)
+        ));
+    }
+
     #[test]
     fn runtime_nftables_bundle_is_volatile_digest_bound_and_first_use_aware() {
         let root = test_root("nft-runtime");
@@ -897,9 +1360,16 @@ mod tests {
             "txn-nft-runtime",
             1024,
             |_| panic!("runtime rollback must not resolve a persistent target"),
-            |reload, directory, prior_existed| {
+            |reload, directory, manifest| {
                 assert_eq!(reload, RollbackReload::LinuxNftablesRuntime);
-                assert!(!prior_existed);
+                assert!(
+                    !manifest
+                        .entries
+                        .iter()
+                        .find(|entry| entry.target == RollbackTarget::LinuxNftablesRuntime)
+                        .expect("nft entry")
+                        .existed
+                );
                 assert_eq!(
                     fs::read(directory.join("snapshot-0.bin")).expect("snapshot"),
                     ruleset

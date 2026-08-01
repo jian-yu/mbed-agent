@@ -329,7 +329,7 @@ fn run_rollback_helper_command(
         .parent()
         .ok_or("storage path has no runtime root")?;
     let rollback_root = runtime_root.join("rollback");
-    let canonical = agent_core::nftables_runtime_rollback_canonical_state(
+    let canonical = agent_core::runtime_rollback_canonical_state(
         &rollback_root,
         transaction_id,
         config.storage.max_rollback_bytes,

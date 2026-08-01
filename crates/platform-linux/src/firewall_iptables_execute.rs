@@ -6,7 +6,9 @@ use thiserror::Error;
 use crate::firewall_command::{
     FirewallCommand, FirewallCommandError, FirewallCommandExecutor, FirewallCommandRunner,
 };
-use crate::firewall_iptables::IptablesFirewallStage;
+use crate::firewall_iptables::{
+    IptablesFamilyRollback, IptablesFirewallStage, render_iptables_family_rollback,
+};
 use crate::firewall_runtime::{
     CollectedIptablesObservation, GenericFirewallInventorySnapshot, GenericFirewallObservation,
     GenericFirewallStateError, collect_iptables_observation, encode_applied_generic_firewall_state,
@@ -229,6 +231,25 @@ impl<R: FirewallCommandExecutor> GenericIptablesTransaction<R> {
         self.source_observation
             .as_ref()
             .ok_or(GenericIptablesExecutionError::InvalidState)
+    }
+
+    /// Renders conditional rollback artifacts for both freshly inspected source families.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before reinspection or if either source save is no longer safely
+    /// representable as owned-only recovery input.
+    pub fn rollback_artifacts(
+        &self,
+    ) -> Result<(IptablesFamilyRollback, IptablesFamilyRollback), GenericIptablesExecutionError>
+    {
+        let source = self.source_observation()?;
+        Ok((
+            render_iptables_family_rollback(source.ipv4_save())
+                .map_err(GenericFirewallStateError::from)?,
+            render_iptables_family_rollback(source.ipv6_save())
+                .map_err(GenericFirewallStateError::from)?,
+        ))
     }
 
     pub fn discard_stage(&mut self) {

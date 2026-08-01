@@ -34,7 +34,8 @@ use platform_linux::firewall_command::{
 };
 use platform_linux::firewall_inventory::inspect_openwrt_firewall_inventory;
 use platform_linux::firewall_runtime::{
-    GenericFirewallInventorySnapshot, inspect_generic_nftables_inventory,
+    GenericFirewallInventorySnapshot, inspect_generic_iptables_inventory,
+    inspect_generic_nftables_inventory,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -46,8 +47,8 @@ use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
 use crate::firewall_execution::{
-    GenericNftablesExecutionPort, GenericNftablesExecutionPortConfig, OpenWrtExecutionPort,
-    OpenWrtExecutionPortConfig,
+    GenericIptablesExecutionPort, GenericIptablesExecutionPortConfig, GenericNftablesExecutionPort,
+    GenericNftablesExecutionPortConfig, OpenWrtExecutionPort, OpenWrtExecutionPortConfig,
 };
 use crate::logging;
 
@@ -685,9 +686,10 @@ async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerRespon
 async fn inspect_firewall_for_planning(
     state: &AppState,
 ) -> Result<FirewallPlanningSnapshot, PendingResponseError> {
+    let backend = firewall_write_backend(state)?;
     if matches!(
-        firewall_write_backend(state)?,
-        WritableFirewallBackend::GenericNftables
+        backend,
+        WritableFirewallBackend::GenericNftables | WritableFirewallBackend::GenericIptables
     ) {
         let max_state_bytes = usize::try_from(state.config.storage.max_firewall_state_bytes)
             .map_err(|_| PendingResponseError::internal("firewall state limit is invalid"))?;
@@ -698,21 +700,37 @@ async fn inspect_firewall_for_planning(
             let canonical = store
                 .firewall_runtime_state(max_state_bytes)
                 .map_err(|_| PendingResponseError::internal("firewall state is unavailable"))?;
-            inspect_generic_nftables_inventory(&runner, canonical.as_deref(), &boot_id).map_err(
-                |error| {
-                    warn!(%error, "generic Linux nftables inventory cannot be safely planned");
-                    PendingResponseError::conflict(
-                        "live nftables inventory cannot be safely modified",
-                    )
-                },
-            )
+            let snapshot = match backend {
+                WritableFirewallBackend::GenericNftables => {
+                    inspect_generic_nftables_inventory(&runner, canonical.as_deref(), &boot_id)
+                }
+                WritableFirewallBackend::GenericIptables => {
+                    inspect_generic_iptables_inventory(&runner, canonical.as_deref(), &boot_id)
+                }
+                WritableFirewallBackend::OpenWrt(_) => unreachable!(),
+            }
+            .map_err(|error| {
+                warn!(%error, "generic Linux firewall inventory cannot be safely planned");
+                PendingResponseError::conflict(
+                    "live generic Linux firewall inventory cannot be safely modified",
+                )
+            })?;
+            Ok((backend, snapshot))
         })
         .await
         .map_err(|error| {
             error!(%error, "nftables planning inspection worker failed");
             PendingResponseError::internal("firewall planner is unavailable")
         })?
-        .map(FirewallPlanningSnapshot::GenericNftables);
+        .map(|(backend, snapshot)| match backend {
+            WritableFirewallBackend::GenericNftables => {
+                FirewallPlanningSnapshot::GenericNftables(snapshot)
+            }
+            WritableFirewallBackend::GenericIptables => {
+                FirewallPlanningSnapshot::GenericIptables(snapshot)
+            }
+            WritableFirewallBackend::OpenWrt(_) => unreachable!(),
+        });
     }
     let runner = firewall_command_runner(state);
     let output = tokio::task::spawn_blocking(move || {
@@ -741,13 +759,16 @@ async fn inspect_firewall_for_planning(
 enum FirewallPlanningSnapshot {
     OpenWrt(platform_linux::firewall_inventory::OpenWrtFirewallInventorySnapshot),
     GenericNftables(GenericFirewallInventorySnapshot),
+    GenericIptables(GenericFirewallInventorySnapshot),
 }
 
 impl FirewallPlanningSnapshot {
     fn inventory(&self) -> &agent_core::FirewallInventory {
         match self {
             Self::OpenWrt(snapshot) => snapshot.inventory(),
-            Self::GenericNftables(snapshot) => snapshot.inventory(),
+            Self::GenericNftables(snapshot) | Self::GenericIptables(snapshot) => {
+                snapshot.inventory()
+            }
         }
     }
 }
@@ -1220,6 +1241,7 @@ async fn load_firewall_execution_plan(
 enum WritableFirewallBackend {
     OpenWrt(FirewallBackend),
     GenericNftables,
+    GenericIptables,
 }
 
 const fn firewall_validation_check(backend: WritableFirewallBackend) -> &'static str {
@@ -1229,6 +1251,9 @@ const fn firewall_validation_check(backend: WritableFirewallBackend) -> &'static
         }
         WritableFirewallBackend::GenericNftables => {
             "reconcile live owned nftables state and run nft --check"
+        }
+        WritableFirewallBackend::GenericIptables => {
+            "reconcile both owned iptables families and run dual restore tests"
         }
     }
 }
@@ -1254,6 +1279,16 @@ async fn execute_firewall_change(
             let port_config = openwrt_port_config(record, execution, backend, now, state);
             tokio::task::spawn_blocking(move || {
                 let mut port = OpenWrtExecutionPort::apply(port_config)?;
+                execute_approved_change(&mut port, now, deadline, confirmation_required)
+                    .map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+        WritableFirewallBackend::GenericIptables => {
+            let port_config =
+                generic_iptables_port_config(record, execution, now, state, canonical_state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = GenericIptablesExecutionPort::apply(port_config)?;
                 execute_approved_change(&mut port, now, deadline, confirmation_required)
                     .map_err(|_| agent_core::ExecutionPortError)
             })
@@ -1298,6 +1333,15 @@ async fn confirm_firewall_change(
             })
             .await
         }
+        WritableFirewallBackend::GenericIptables => {
+            let port_config =
+                generic_iptables_port_config(record, execution, now, state, canonical_state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = GenericIptablesExecutionPort::confirmation(port_config);
+                confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
     }
 }
 
@@ -1313,11 +1357,14 @@ fn firewall_write_backend(
         (PlatformKind::GenericLinux, FirewallBackend::Nftables) => {
             Ok(WritableFirewallBackend::GenericNftables)
         }
+        (PlatformKind::GenericLinux, FirewallBackend::Iptables) => {
+            Ok(WritableFirewallBackend::GenericIptables)
+        }
         (PlatformKind::OpenWrt, _) => Err(PendingResponseError::conflict(
             "no supported writable OpenWrt 21.02+ firewall backend is available",
         )),
         (PlatformKind::GenericLinux, _) => Err(PendingResponseError::conflict(
-            "generic Linux writes currently require native nftables",
+            "no supported writable generic Linux firewall backend is available",
         )),
         (PlatformKind::Unknown, _) => Err(PendingResponseError::conflict(
             "no supported writable firewall backend is available",
@@ -1375,6 +1422,32 @@ fn generic_nftables_port_config(
     }
 }
 
+fn generic_iptables_port_config(
+    record: ChangeSetRecord,
+    execution: FirewallExecutionPlan,
+    now_monotonic_ms: u64,
+    state: &AppState,
+    canonical_state: Option<Vec<u8>>,
+) -> GenericIptablesExecutionPortConfig {
+    let max_firewall_state_bytes =
+        usize::try_from(state.config.storage.max_firewall_state_bytes).unwrap_or(usize::MAX);
+    GenericIptablesExecutionPortConfig {
+        runner: firewall_command_runner(state),
+        store: Arc::clone(&state.store),
+        runtime_root: state.budget.root().to_path_buf(),
+        config_path: state.config_path.clone(),
+        change_set_id: record.id,
+        plan_digest: record.plan_digest,
+        boot_id: record.boot_id,
+        now_monotonic_ms,
+        rollback_timeout_secs: state.config.runtime.rollback_confirm_timeout_secs,
+        max_rollback_bytes: state.config.storage.max_rollback_bytes,
+        max_firewall_state_bytes,
+        canonical_state,
+        execution,
+    }
+}
+
 async fn load_generic_firewall_state(
     state: &AppState,
 ) -> Result<Option<Vec<u8>>, PendingResponseError> {
@@ -1392,7 +1465,10 @@ async fn canonical_for_backend(
     backend: WritableFirewallBackend,
     state: &AppState,
 ) -> Result<Option<Vec<u8>>, PendingResponseError> {
-    if matches!(backend, WritableFirewallBackend::GenericNftables) {
+    if matches!(
+        backend,
+        WritableFirewallBackend::GenericNftables | WritableFirewallBackend::GenericIptables
+    ) {
         load_generic_firewall_state(state).await
     } else {
         Ok(None)

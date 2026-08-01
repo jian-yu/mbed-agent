@@ -1051,11 +1051,11 @@ payload 在同一 SQLite transaction 内写入并直接进入 `awaiting_approval
 分别 fail closed。fresh observation 与 `/tmp` SQLite 中 boot-bound canonical state
 重建 typed inventory 后，由 native transaction 生成私有 staging ruleset，执行
 `nft --check --file`、源状态二次核对、单次原子 load 和 live verify。daemon 的现有
-inventory/plan/apply/confirm 命令已按 capability 在 OpenWrt 与 generic nftables 间
-闭合分派；两者共享 R3、device-admin、一次性 approval 与 confirmed-commit 状态机。
+inventory/plan/apply/confirm 命令已按 capability 在 OpenWrt、generic nftables 与
+generic iptables 间闭合分派；三者共享 R3、device-admin、一次性 approval 与
+confirmed-commit 状态机。
 generic 回滚包只在 `/tmp` 保存带摘要的旧 owned-table ruleset 与旧 canonical state，
 独立 helper 在超时或 daemon 退出后同时恢复内核和 SQLite，不写持久 nftables 文件。
-iptables/ip6tables 因双地址族不是单一事务，仍保持写入口关闭，等待独立故障恢复切片。
 
 iptables/ip6tables 双栈 transaction 内核已经落地：两族 save 作为一个 observation
 与 boot-bound canonical state 对账，两份 restore 输入必须全部通过原生
@@ -1064,8 +1064,12 @@ fingerprint。代码显式覆盖“IPv4 成功、IPv6 失败”的 partial activ
 为未写入。基于 fresh save 的回滚 renderer 也已生成四种条件恢复：owned→owned 只
 清空并恢复六个自有链，absent→owned 精确删除 hook/链，owned→absent 重建 hook/链，
 absent→absent 不操作；带额外匹配条件的 ownership hook 现在被视为 foreign。
-独立 helper 尚未接入这些条件 artifact，因此 daemon 的 iptables 写 capability 继续
-保持关闭，避免在双族半成功时缺少进程外恢复。
+独立 helper 已接入这些条件 artifact：rollback manifest 在 `/tmp` 中分别保存
+IPv4/IPv6 的 from-owned/from-absent 输入与旧 canonical 摘要；helper 重新执行两族
+save 并用与 transaction 相同的严格 ownership 形状选择输入。一族恢复失败不会阻止
+另一族继续恢复，最终 outcome 仍整体标记失败。所有 save/restore helper 子进程都有
+固定超时和输入/输出上限。daemon 已开放 iptables capability 的计划、执行、验证、
+确认和自动回滚，但不会修改六个固定链与精确 hook 之外的主机规则。
 
 独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
 通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突
