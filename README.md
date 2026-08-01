@@ -92,11 +92,16 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   validated on-device, and the model can never request active probes or shell
   commands.
 
-Provider routing, additional typed network tools, MQTT, WeCom, WeChat ClawBot,
-Channel-facing elevation, and configuration execution are not implemented yet.
-The local CLI now exposes actor/boot/plan-bound ChangeSet inspection, rejection,
-and device-admin approval with a one-use token; apply remains closed until the
-full executor is connected. The configuration roadmap is intentionally broader than a
+Provider routing, additional model-facing network tools, MQTT, WeCom, WeChat
+ClawBot, and Channel-facing elevation are not implemented yet. Firewall
+configuration execution is available through the bounded ChangeSet path on
+supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
+L2/L3 typed object, validation, risk, projection, and execution-payload boundary
+is implemented; host network writes remain closed until each platform adapter
+has native validation and independent rollback. The local CLI exposes
+actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
+apply, and confirmed commit for supported firewall backends. The configuration
+roadmap is intentionally broader than a
 few fixed operations: it targets capability-gated typed CRUD for firewall,
 interfaces/addresses, bridges/VLANs, routes, DNS/DHCP, wireless, controlled
 services, QoS, and WireGuard. OpenWrt will use UCI and its native fw3/fw4/netifd
@@ -128,11 +133,15 @@ The same-binary ChangeSet inspection and approval control surface is recorded in
 Bounded fresh OpenWrt UCI inventory reconstruction and snapshot-bound rendering
 are recorded in
 [ADR 0029](docs/adr/0029-openwrt-firewall-fresh-inventory.md).
+The platform-neutral L2/L3 schema, semantic risk, projection, and executable
+payload boundary are recorded in
+[ADR 0041](docs/adr/0041-typed-l2-l3-network-planner.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
-the daemon foundation is usable now, while network-changing tools and remote
-channels remain disabled until their permission and rollback boundaries exist.
+the daemon foundation is usable now, while L2/L3 host-changing tools and remote
+channels remain disabled until their platform transaction and rollback
+boundaries exist.
 
 ## Build and test
 

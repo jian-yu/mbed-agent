@@ -1182,7 +1182,17 @@ filter/mangle/nat chain，首次在 builtin chain 末尾添加一次带 ownershi
 SNAT/DNAT/redirect 均支持，且 IPv4/IPv6 的 `--test` 必须先全部通过。由于跨
 table/地址族不是单一原子提交，该后端强制独立 rollback。ChangeSet 执行编排与
 OpenWrt、generic nftables 的 live apply/verify/confirm 已完成；iptables/ip6tables
-公共写入口仍保持关闭，直到双地址族回滚协议完成。
+双地址族条件回滚、独立 helper 与公共写入口也已经完成。
+
+截至 ADR 0041，L2/L3 的平台中立 typed schema 与 planner 已完成：interface 的
+静态/动态地址模式、MTU、MAC override，以及 Bridge、VLAN、bond、VRF、默认/静态
+route 和 policy rule 都具有摘要绑定的 create/update/delete；policy rule 另支持
+只改变 priority 的 move。地址族、前缀、VLAN/MTU、聚合端口、VRF table、next-hop、
+fwmark 和 rule priority 在本地有界校验，投影与 apply 后验证共享同一 typed 状态。
+管理接口/地址、默认路由和管理 route table 的变更固定提升为 R3，启用中对象的修改
+或删除按潜在业务中断处理。当前仅完成领域边界，主机写入口保持关闭，下一步分别交付
+OpenWrt UCI/netifd 与普通 Linux netlink/受支持 network manager 的 fresh inventory、
+capability 裁剪、原生 validation、易失 rollback artifact 和 confirmed-commit。
 
 ## 21. 参考项目与官方资料
 

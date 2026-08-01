@@ -93,6 +93,28 @@ pub enum FirewallMutationRequest {
     },
 }
 
+/// Closed, typed mutation request accepted by the L2/L3 network planner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkMutationRequest {
+    Create {
+        desired: NetworkObject,
+    },
+    Update {
+        expected_digest: String,
+        desired: NetworkObject,
+    },
+    Delete {
+        kind: String,
+        id: String,
+        expected_digest: String,
+    },
+    Move {
+        expected_digest: String,
+        desired: NetworkObject,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerResponse {
     pub protocol_version: u16,
@@ -591,6 +613,202 @@ pub struct FirewallRateLimit {
 pub struct FirewallLog {
     pub prefix: String,
     pub level: FirewallLogLevel,
+}
+
+/// Platform-neutral L2/L3 configuration object. Platform adapters explicitly
+/// advertise which variants and fields they can safely persist or apply at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "spec", rename_all = "snake_case")]
+pub enum NetworkObject {
+    Interface(NetworkInterfaceConfig),
+    Bridge(NetworkBridge),
+    Vlan(NetworkVlan),
+    Bond(NetworkBond),
+    Vrf(NetworkVrf),
+    Route(NetworkRoute),
+    PolicyRule(NetworkPolicyRule),
+}
+
+impl NetworkObject {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Interface(value) => &value.id,
+            Self::Bridge(value) => &value.id,
+            Self::Vlan(value) => &value.id,
+            Self::Bond(value) => &value.id,
+            Self::Vrf(value) => &value.id,
+            Self::Route(value) => &value.id,
+            Self::PolicyRule(value) => &value.id,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Interface(_) => "interface",
+            Self::Bridge(_) => "bridge",
+            Self::Vlan(_) => "vlan",
+            Self::Bond(_) => "bond",
+            Self::Vrf(_) => "vrf",
+            Self::Route(_) => "route",
+            Self::PolicyRule(_) => "policy_rule",
+        }
+    }
+
+    #[must_use]
+    pub const fn ownership(&self) -> ObjectOwnership {
+        match self {
+            Self::Interface(value) => value.ownership,
+            Self::Bridge(value) => value.ownership,
+            Self::Vlan(value) => value.ownership,
+            Self::Bond(value) => value.ownership,
+            Self::Vrf(value) => value.ownership,
+            Self::Route(value) => value.ownership,
+            Self::PolicyRule(value) => value.ownership,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkInterfaceConfig {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub device: String,
+    pub ipv4_mode: NetworkAddressMode,
+    pub ipv6_mode: NetworkAddressMode,
+    pub addresses: Vec<IpNetwork>,
+    pub mtu: Option<u32>,
+    pub mac_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAddressMode {
+    Disabled,
+    Static,
+    Dhcp,
+    Automatic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkBridge {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub ports: Vec<String>,
+    pub stp: bool,
+    pub vlan_filtering: bool,
+    pub mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkVlan {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub parent: String,
+    pub vlan_id: u16,
+    pub protocol: NetworkVlanProtocol,
+    pub mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkVlanProtocol {
+    Ieee8021Q,
+    Ieee8021Ad,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkBond {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub ports: Vec<String>,
+    pub mode: NetworkBondMode,
+    pub primary: Option<String>,
+    pub monitor_interval_ms: u32,
+    pub mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkBondMode {
+    ActiveBackup,
+    BalanceRr,
+    BalanceXor,
+    Broadcast,
+    Ieee8023Ad,
+    BalanceTlb,
+    BalanceAlb,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkVrf {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub table: u32,
+    pub ports: Vec<String>,
+    pub mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkRoute {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub destination: IpNetwork,
+    pub gateway: Option<IpAddr>,
+    pub output_interface: Option<String>,
+    pub preferred_source: Option<IpAddr>,
+    pub table: u32,
+    pub metric: Option<u32>,
+    pub route_type: NetworkRouteType,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRouteType {
+    Unicast,
+    Blackhole,
+    Unreachable,
+    Prohibit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkPolicyRule {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub family: NetworkFamily,
+    pub priority: u32,
+    pub source: Option<IpNetwork>,
+    pub destination: Option<IpNetwork>,
+    pub input_interface: Option<String>,
+    pub output_interface: Option<String>,
+    pub fwmark: Option<u32>,
+    pub fwmark_mask: Option<u32>,
+    pub table: u32,
+    pub action: NetworkPolicyAction,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPolicyAction {
+    Lookup,
+    Blackhole,
+    Unreachable,
+    Prohibit,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1474,6 +1692,35 @@ mod tests {
         assert!(
             serde_json::from_str::<FirewallMutationRequest>(
                 r#"{"operation":"delete","kind":"filter_rule","id":"x","expected_digest":"abc","command":"iptables -F"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn network_mutation_and_object_round_trip_are_closed_and_typed() {
+        let object = NetworkObject::Vlan(NetworkVlan {
+            id: "eth0.100".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            parent: "eth0".into(),
+            vlan_id: 100,
+            protocol: NetworkVlanProtocol::Ieee8021Q,
+            mtu: Some(1500),
+        });
+        let request = NetworkMutationRequest::Create {
+            desired: object.clone(),
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        assert_eq!(
+            serde_json::from_slice::<NetworkMutationRequest>(&encoded).expect("decode"),
+            request
+        );
+        assert_eq!(object.kind(), "vlan");
+        assert_eq!(object.id(), "eth0.100");
+        assert!(
+            serde_json::from_str::<NetworkMutationRequest>(
+                r#"{"operation":"delete","kind":"route","id":"x","expected_digest":"abc","argv":["ip","route","flush"]}"#
             )
             .is_err()
         );

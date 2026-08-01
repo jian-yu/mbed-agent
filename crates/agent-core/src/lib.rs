@@ -3,6 +3,7 @@ pub mod changes;
 pub mod config;
 pub mod execution;
 pub mod firewall;
+pub mod network;
 pub mod resources;
 pub mod rollback;
 
@@ -22,6 +23,12 @@ pub use firewall::{
     FirewallInventory, FirewallMutation, FirewallMutationPlan, FirewallPlanError,
     FirewallPlannedChange, FirewallRiskContext, firewall_object_digest, plan_firewall_mutations,
     project_firewall_inventory, validate_firewall_object, verify_firewall_plan_result,
+};
+pub use network::{
+    NETWORK_EXECUTION_PLAN_SCHEMA_VERSION, NetworkExecutionPlan, NetworkExecutionPlanError,
+    NetworkInventory, NetworkMutation, NetworkMutationPlan, NetworkPlanError, NetworkPlannedChange,
+    NetworkRiskContext, network_object_digest, plan_network_mutations, project_network_inventory,
+    validate_network_object, verify_network_plan_result,
 };
 pub use resources::{ResourceError, TmpBudget};
 pub use rollback::{
