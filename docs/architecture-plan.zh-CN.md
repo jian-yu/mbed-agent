@@ -1216,6 +1216,16 @@ fsync、atomic rename 安装并固定 reload network；reload 后重新构建 ty
 协议。daemon/CLI 写入口仍关闭；下一步把 transaction port 接入 R3 device-admin、
 one-use approval、失败即时回滚、超时与 confirmed-commit 状态机。
 
+截至 ADR 0044，上述 OpenWrt 21.02+ 公共写入口已经开放：同一个 `mbed-agent`
+二进制提供 `change network-inventory` 与 `change network-plan`，只接受 closed typed
+mutation，不接受 shell、argv、路径或原始 UCI。fresh inventory、展示 plan 与完整
+execution payload 分别由 domain、plan digest 和 boot ID 绑定并原子写入 `/tmp`
+SQLite。所有 OpenWrt network apply 均保守提升为 R3，必须经过 device-admin、一次性
+approval、全局串行写、独立 `/etc/config/network` rollback helper、live typed verify
+和显式 confirm；执行失败、daemon/Channel 失联或确认超时都会进入相同恢复协议。
+普通 Linux 的 L2/L3 公共写入口仍保持关闭，需在 netlink 或已识别 network manager
+上实现等价的 fresh inventory、原生 transaction 与独立回滚后再开放。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。

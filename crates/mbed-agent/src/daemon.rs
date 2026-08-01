@@ -11,14 +11,17 @@ use std::time::{Duration, Instant};
 
 use agent_core::{
     AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, FirewallExecutionPlan,
-    FirewallMutation, FirewallRiskContext, TmpBudget, confirm_awaiting_execution,
-    execute_approved_change, firewall_object_digest, plan_digest, plan_firewall_mutations,
+    FirewallMutation, FirewallRiskContext, NetworkExecutionPlan, NetworkMutation,
+    NetworkRiskContext, TmpBudget, confirm_awaiting_execution, execute_approved_change,
+    firewall_object_digest, network_object_digest, plan_digest, plan_firewall_mutations,
+    plan_network_mutations,
 };
 use agent_protocol::{
     ChangeApprovalResponse, ChangePlan, ChangeSetResponse, ChangeSetState, ClientRequest, Command,
-    CompletionResponse, DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry,
-    FirewallInventoryResponse, FirewallMutationRequest, FirewallObject, PROTOCOL_VERSION,
-    ResponseData, SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
+    CompletionResponse, ConfigDomain, DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry,
+    FirewallInventoryResponse, FirewallMutationRequest, FirewallObject, NetworkInventoryEntry,
+    NetworkInventoryResponse, NetworkMutationRequest, PROTOCOL_VERSION, ResponseData,
+    SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
     TaskHistoryEntry,
 };
 use agent_provider::{
@@ -37,6 +40,9 @@ use platform_linux::firewall_runtime::{
     GenericFirewallInventorySnapshot, inspect_generic_iptables_inventory,
     inspect_generic_nftables_inventory,
 };
+use platform_linux::network_openwrt::{
+    OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory,
+};
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -51,6 +57,7 @@ use crate::firewall_execution::{
     GenericNftablesExecutionPortConfig, OpenWrtExecutionPort, OpenWrtExecutionPortConfig,
 };
 use crate::logging;
+use crate::network_execution::{OpenWrtNetworkExecutionPort, OpenWrtNetworkExecutionPortConfig};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOCAL_CLI_ACTOR: &str = "cli/local";
@@ -393,6 +400,12 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::FirewallInventory => {
             return handle_firewall_inventory(request.id, state).await;
         }
+        Command::NetworkPlan { mutations } => {
+            return handle_network_plan(request.id, mutations, state).await;
+        }
+        Command::NetworkInventory => {
+            return handle_network_inventory(request.id, state).await;
+        }
         Command::ChangeApply {
             change_set_id,
             approval_id,
@@ -679,6 +692,254 @@ async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerRespon
         Err(error) => {
             error!(%error, "fresh firewall inventory digest failed");
             ServerResponse::error(id, ErrorCode::Internal, "firewall inventory is unavailable")
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Plan construction keeps visible and executable forms together.
+async fn handle_network_plan(
+    id: String,
+    requests: Vec<NetworkMutationRequest>,
+    state: &AppState,
+) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    if let Err(error) = openwrt_network_write_supported(state) {
+        return error.with_id(id);
+    }
+    let _configuration_guard = state.configuration_lock.lock().await;
+    let snapshot = match inspect_network_for_planning(state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error.with_id(id),
+    };
+    let mutations = requests
+        .into_iter()
+        .map(network_mutation)
+        .collect::<Vec<_>>();
+    let mut typed = match plan_network_mutations(
+        snapshot.inventory(),
+        &mutations,
+        &NetworkRiskContext::default(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::InvalidRequest,
+                format!("network mutation plan was rejected: {error}"),
+            );
+        }
+    };
+    // A native network reload can sever the approval channel even for an otherwise local object.
+    typed.risk = typed.risk.max(agent_protocol::RiskLevel::R3);
+    let now = match boot_monotonic_ms() {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let plan_id = match random_hex(16) {
+        Ok(value) => value,
+        Err(error) => return error.with_id(id),
+    };
+    let expires_monotonic_ms =
+        now.saturating_add(state.config.auth.capability_ttl_secs.saturating_mul(1_000));
+    let plan = ChangePlan {
+        schema_version: agent_protocol::CHANGE_PLAN_SCHEMA_VERSION,
+        plan_id: plan_id.clone(),
+        boot_id: state.auth.boot_id().to_owned(),
+        actor_id: LOCAL_CLI_ACTOR.into(),
+        created_monotonic_ms: now,
+        expires_monotonic_ms,
+        risk: typed.risk,
+        changes: typed
+            .changes
+            .iter()
+            .map(|change| change.diff.clone())
+            .collect(),
+        validation_checks: vec![
+            "reinspect live network UCI and validate a private staged package".into(),
+        ],
+        verification_checks: vec![
+            "reconstruct and compare touched live L2/L3 network objects".into(),
+        ],
+        rollback_required: true,
+    };
+    let digest = match plan_digest(&plan) {
+        Ok(value) => value,
+        Err(error) => {
+            error!(%error, "locally generated network plan is invalid");
+            return ServerResponse::error(id, ErrorCode::Internal, "network planner failed");
+        }
+    };
+    let execution = NetworkExecutionPlan {
+        schema_version: agent_core::NETWORK_EXECUTION_PLAN_SCHEMA_VERSION,
+        preview: plan.clone(),
+        typed,
+    };
+    let execution_payload = match execution.encode() {
+        Ok(value) => value,
+        Err(error) => {
+            error!(%error, "network execution plan encoding failed");
+            return ServerResponse::error(id, ErrorCode::Internal, "network planner failed");
+        }
+    };
+    let plan_payload = match serde_json::to_vec(&plan) {
+        Ok(value) => value,
+        Err(error) => {
+            error!(%error, "network plan encoding failed");
+            return ServerResponse::error(id, ErrorCode::Internal, "network planner failed");
+        }
+    };
+    let record = ChangeSetRecord {
+        id: plan_id.clone(),
+        plan_digest: digest,
+        plan_payload,
+        state: ChangeSetState::Planned,
+        actor_id: LOCAL_CLI_ACTOR.into(),
+        boot_id: state.auth.boot_id().to_owned(),
+        risk: plan.risk,
+        expires_monotonic_ms,
+        rollback_deadline_monotonic_ms: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    persist_network_change(id, plan_id, record, execution_payload, now, state).await
+}
+
+async fn handle_network_inventory(id: String, state: &AppState) -> ServerResponse {
+    if let Err(error) = openwrt_network_write_supported(state) {
+        return error.with_id(id);
+    }
+    let _configuration_guard = state.configuration_lock.lock().await;
+    let snapshot = match inspect_network_for_planning(state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return error.with_id(id),
+    };
+    let objects = snapshot
+        .inventory()
+        .objects
+        .iter()
+        .map(|object| {
+            network_object_digest(object).map(|digest| NetworkInventoryEntry {
+                digest,
+                object: object.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>();
+    match objects {
+        Ok(objects) => ServerResponse::success(
+            id,
+            ResponseData::NetworkInventory(NetworkInventoryResponse { objects }),
+        ),
+        Err(error) => {
+            error!(%error, "fresh network inventory digest failed");
+            ServerResponse::error(id, ErrorCode::Internal, "network inventory is unavailable")
+        }
+    }
+}
+
+fn openwrt_network_write_supported(state: &AppState) -> Result<(), PendingResponseError> {
+    if state.platform.kind == PlatformKind::OpenWrt && state.platform.release_supported {
+        Ok(())
+    } else {
+        Err(PendingResponseError::conflict(
+            "writable L2/L3 network configuration requires supported OpenWrt 21.02+",
+        ))
+    }
+}
+
+async fn inspect_network_for_planning(
+    state: &AppState,
+) -> Result<OpenWrtNetworkInventorySnapshot, PendingResponseError> {
+    openwrt_network_write_supported(state)?;
+    let runner = firewall_command_runner(state);
+    let output =
+        tokio::task::spawn_blocking(move || runner.execute(&FirewallCommand::UciShowNetwork, None))
+            .await
+            .map_err(|_| PendingResponseError::internal("network planner is unavailable"))?
+            .map_err(|_| {
+                PendingResponseError::unavailable("live network inventory is unavailable")
+            })?
+            .stdout;
+    let uci = std::str::from_utf8(&output)
+        .map_err(|_| PendingResponseError::conflict("live network inventory is malformed"))?;
+    inspect_openwrt_network_inventory(uci).map_err(|error| {
+        warn!(%error, "live network inventory cannot be safely planned");
+        PendingResponseError::conflict("live network inventory cannot be safely modified")
+    })
+}
+
+fn network_mutation(request: NetworkMutationRequest) -> NetworkMutation {
+    match request {
+        NetworkMutationRequest::Create { desired } => NetworkMutation::Create(desired),
+        NetworkMutationRequest::Update {
+            expected_digest,
+            desired,
+        } => NetworkMutation::Update {
+            expected_digest,
+            desired,
+        },
+        NetworkMutationRequest::Delete {
+            kind,
+            id,
+            expected_digest,
+        } => NetworkMutation::Delete {
+            kind,
+            id,
+            expected_digest,
+        },
+        NetworkMutationRequest::Move {
+            expected_digest,
+            desired,
+        } => NetworkMutation::Move {
+            expected_digest,
+            desired,
+        },
+    }
+}
+
+async fn persist_network_change(
+    id: String,
+    plan_id: String,
+    record: ChangeSetRecord,
+    execution_payload: Vec<u8>,
+    now: u64,
+    state: &AppState,
+) -> ServerResponse {
+    let Ok(max_plan_bytes) = usize::try_from(state.config.storage.max_change_plan_bytes) else {
+        return ServerResponse::error(id, ErrorCode::Internal, "plan limit is invalid");
+    };
+    let Ok(max_execution_bytes) =
+        usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
+    else {
+        return ServerResponse::error(id, ErrorCode::Internal, "execution plan limit is invalid");
+    };
+    let store = Arc::clone(&state.store);
+    let max_records = state.config.storage.max_change_set_records;
+    let create = tokio::task::spawn_blocking(move || {
+        store.create_network_change_set(
+            &record,
+            &execution_payload,
+            max_records,
+            max_plan_bytes,
+            max_execution_bytes,
+            now,
+        )
+    })
+    .await;
+    match create {
+        Ok(Ok(_)) => {
+            info!(change_set_id = %plan_id, "approval-ready network ChangeSet created");
+            current_change_set_response(id, &plan_id, state).await
+        }
+        Ok(Err(error)) => store_error_response(id, &error),
+        Err(error) => {
+            error!(%error, "network plan storage worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "network plan storage is unavailable",
+            )
         }
     }
 }
@@ -979,6 +1240,7 @@ async fn handle_change_approve(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Domain dispatch remains inside the closed approval handler.
 async fn handle_change_apply(
     id: String,
     change_set_id: String,
@@ -1010,6 +1272,23 @@ async fn handle_change_apply(
             ErrorCode::Conflict,
             "ChangeSet is not awaiting a valid approval",
         );
+    }
+    if response
+        .plan
+        .changes
+        .first()
+        .is_some_and(|change| change.object.domain == ConfigDomain::Network)
+    {
+        return apply_network_change(
+            id,
+            approval_id,
+            approval_token,
+            record,
+            response.plan,
+            now,
+            state,
+        )
+        .await;
     }
     let execution = match load_firewall_execution_plan(&record, state).await {
         Ok(execution) if execution.preview == response.plan => execution,
@@ -1159,9 +1438,10 @@ async fn handle_change_confirm(
     let Some(record) = load_change_set(&id, &change_set_id, state).await else {
         return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
     };
-    if let Err(error) = change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
-        return error.with_id(id);
-    }
+    let response = match change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+        Ok(response) => response,
+        Err(error) => return error.with_id(id),
+    };
     if record.state != ChangeSetState::AwaitingConfirmation
         || record
             .rollback_deadline_monotonic_ms
@@ -1172,6 +1452,14 @@ async fn handle_change_confirm(
             ErrorCode::Conflict,
             "ChangeSet is not awaiting confirmation or its deadline passed",
         );
+    }
+    if response
+        .plan
+        .changes
+        .first()
+        .is_some_and(|change| change.object.domain == ConfigDomain::Network)
+    {
+        return confirm_network_change_request(id, record, response.plan, now, state).await;
     }
     let execution = match load_firewall_execution_plan(&record, state).await {
         Ok(execution) => execution,
@@ -1235,6 +1523,162 @@ async fn load_firewall_execution_plan(
     .ok_or_else(|| PendingResponseError::conflict("ChangeSet has no executable firewall plan"))?;
     FirewallExecutionPlan::decode(&payload)
         .map_err(|_| PendingResponseError::internal("stored execution plan is invalid"))
+}
+
+async fn load_network_execution_plan(
+    record: &ChangeSetRecord,
+    state: &AppState,
+) -> Result<NetworkExecutionPlan, PendingResponseError> {
+    let max_bytes = usize::try_from(state.config.storage.max_firewall_execution_plan_bytes)
+        .map_err(|_| PendingResponseError::internal("execution plan limit is invalid"))?;
+    let store = Arc::clone(&state.store);
+    let record = record.clone();
+    let payload = tokio::task::spawn_blocking(move || {
+        store.network_execution_plan(&record.id, &record.plan_digest, &record.boot_id, max_bytes)
+    })
+    .await
+    .map_err(|_| PendingResponseError::internal("execution plan storage is unavailable"))?
+    .map_err(|_| PendingResponseError::internal("execution plan storage is unavailable"))?
+    .ok_or_else(|| PendingResponseError::conflict("ChangeSet has no executable network plan"))?;
+    NetworkExecutionPlan::decode(&payload)
+        .map_err(|_| PendingResponseError::internal("stored execution plan is invalid"))
+}
+
+async fn apply_network_change(
+    id: String,
+    approval_id: String,
+    approval_token: SensitiveString,
+    record: ChangeSetRecord,
+    preview: ChangePlan,
+    now: u64,
+    state: &AppState,
+) -> ServerResponse {
+    if let Err(error) = openwrt_network_write_supported(state) {
+        return error.with_id(id);
+    }
+    let execution = match load_network_execution_plan(&record, state).await {
+        Ok(execution) if execution.preview == preview => execution,
+        Ok(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "stored execution plan binding is invalid",
+            );
+        }
+        Err(error) => return error.with_id(id),
+    };
+    if !state.config_path.is_file() {
+        return ServerResponse::error(
+            id,
+            ErrorCode::Conflict,
+            "daemon configuration must exist before arming the rollback helper",
+        );
+    }
+    let token_digest = sha256_hex(approval_token.expose().as_bytes());
+    if let Err(error) =
+        consume_change_approval(approval_id, token_digest, record.clone(), now, state).await
+    {
+        return error.with_id(id);
+    }
+    drop(approval_token);
+    let deadline = rollback_deadline(now, state);
+    let port_config = openwrt_network_port_config(record.clone(), execution, now, state);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut port = OpenWrtNetworkExecutionPort::apply(port_config)?;
+        execute_approved_change(&mut port, now, deadline, true)
+            .map_err(|_| agent_core::ExecutionPortError)
+    })
+    .await;
+    execution_response(id, &record.id, outcome, "network configuration", state).await
+}
+
+async fn confirm_network_change_request(
+    id: String,
+    record: ChangeSetRecord,
+    preview: ChangePlan,
+    now: u64,
+    state: &AppState,
+) -> ServerResponse {
+    if let Err(error) = openwrt_network_write_supported(state) {
+        return error.with_id(id);
+    }
+    let execution = match load_network_execution_plan(&record, state).await {
+        Ok(execution) if execution.preview == preview => execution,
+        Ok(_) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "stored execution plan binding is invalid",
+            );
+        }
+        Err(error) => return error.with_id(id),
+    };
+    let port_config = openwrt_network_port_config(record.clone(), execution, now, state);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut port = OpenWrtNetworkExecutionPort::confirmation(port_config);
+        confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+    })
+    .await;
+    execution_response(
+        id,
+        &record.id,
+        outcome,
+        "network configuration confirmation",
+        state,
+    )
+    .await
+}
+
+async fn execution_response(
+    id: String,
+    change_set_id: &str,
+    outcome: ExecutionWorkerResult,
+    operation: &str,
+    state: &AppState,
+) -> ServerResponse {
+    match outcome {
+        Ok(Ok(result)) => {
+            info!(change_set_id, ?result, %operation, "configuration operation completed");
+            current_change_set_response(id, change_set_id, state).await
+        }
+        Ok(Err(_)) => {
+            error!(change_set_id, %operation, "configuration operation failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Conflict,
+                "configuration operation failed; inspect the ChangeSet state",
+            )
+        }
+        Err(error) => {
+            error!(change_set_id, %operation, %error, "configuration worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "configuration executor is unavailable",
+            )
+        }
+    }
+}
+
+fn openwrt_network_port_config(
+    record: ChangeSetRecord,
+    execution: NetworkExecutionPlan,
+    now_monotonic_ms: u64,
+    state: &AppState,
+) -> OpenWrtNetworkExecutionPortConfig {
+    OpenWrtNetworkExecutionPortConfig {
+        runner: firewall_command_runner(state),
+        store: Arc::clone(&state.store),
+        runtime_root: state.budget.root().to_path_buf(),
+        config_path: state.config_path.clone(),
+        change_set_id: record.id,
+        plan_digest: record.plan_digest,
+        boot_id: record.boot_id,
+        now_monotonic_ms,
+        rollback_timeout_secs: state.config.runtime.rollback_confirm_timeout_secs,
+        max_rollback_bytes: state.config.storage.max_rollback_bytes,
+        execution,
+    }
 }
 
 #[derive(Clone, Copy)]

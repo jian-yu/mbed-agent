@@ -49,6 +49,10 @@ pub enum Command {
         mutations: Vec<FirewallMutationRequest>,
     },
     FirewallInventory,
+    NetworkPlan {
+        mutations: Vec<NetworkMutationRequest>,
+    },
+    NetworkInventory,
     ChangeApply {
         change_set_id: String,
         approval_id: String,
@@ -176,6 +180,7 @@ pub enum ResponseData {
     ChangeSet(ChangeSetResponse),
     ChangeApproval(ChangeApprovalResponse),
     FirewallInventory(FirewallInventoryResponse),
+    NetworkInventory(NetworkInventoryResponse),
     DiagnosticHistory(Vec<DiagnosticHistoryEntry>),
     TaskHistory(Vec<TaskHistoryEntry>),
     Completion(CompletionResponse),
@@ -251,6 +256,17 @@ pub struct FirewallInventoryResponse {
 pub struct FirewallInventoryEntry {
     pub digest: String,
     pub object: FirewallObject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkInventoryResponse {
+    pub objects: Vec<NetworkInventoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkInventoryEntry {
+    pub digest: String,
+    pub object: NetworkObject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1653,6 +1669,10 @@ mod tests {
                 mutations: Vec::new(),
             },
             Command::FirewallInventory,
+            Command::NetworkPlan {
+                mutations: Vec::new(),
+            },
+            Command::NetworkInventory,
             Command::ChangeApply {
                 change_set_id: "change-1".into(),
                 approval_id: "0123456789abcdef0123456789abcdef".into(),

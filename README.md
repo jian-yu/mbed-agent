@@ -243,6 +243,22 @@ runtime verification, and risk-based confirmation.
 ChangeSet/approval binding before extracting the secret. A raw token is also
 accepted from stdin when `--approval-id` is supplied.
 
+OpenWrt 21.02+ L2/L3 changes use the same lifecycle and the same binary:
+
+```sh
+cargo run -p mbed-agent -- change network-inventory > network-inventory.json
+cargo run -p mbed-agent -- change network-plan < network-mutations.json
+cargo run -p mbed-agent -- change approve CHANGE_SET_ID | \
+  cargo run -p mbed-agent -- change apply CHANGE_SET_ID
+cargo run -p mbed-agent -- change confirm CHANGE_SET_ID
+```
+
+Network mutations are closed typed objects (interfaces, bridges, VLANs, routes,
+and policy rules in the currently supported native subset), never raw shell or
+UCI text. Public network writes are always elevated to R3 because the netifd
+reload may interrupt the management path. They therefore always arm the
+independent `/etc/config/network` rollback helper and require confirmation.
+
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart
 the daemon. A credential-bearing configuration must be mode `0600` (or stricter).

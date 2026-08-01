@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::generate_password_hash;
 use agent_protocol::{
-    ClientRequest, Command, FirewallMutationRequest, PROTOCOL_VERSION, SensitiveString,
-    ServerResponse,
+    ClientRequest, Command, FirewallMutationRequest, NetworkMutationRequest, PROTOCOL_VERSION,
+    SensitiveString, ServerResponse,
 };
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,6 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 mod daemon;
 mod firewall_execution;
 mod logging;
+mod network_execution;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Mbed Agent for embedded Linux and OpenWrt")]
@@ -191,6 +192,16 @@ enum ChangeTarget {
     },
     /// Read a typed firewall mutation array from stdin and create an approval-ready plan.
     FirewallPlan {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Show a fresh typed `OpenWrt` L2/L3 inventory with exact object digests.
+    NetworkInventory {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Read a typed `OpenWrt` L2/L3 mutation array from stdin and create an approval-ready plan.
+    NetworkPlan {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
@@ -373,6 +384,14 @@ async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
             let input = read_bounded_stdin(60 * 1024, "firewall plan")?;
             let mutations: Vec<FirewallMutationRequest> = serde_json::from_slice(&input)?;
             run_client(&socket, Command::FirewallPlan { mutations }).await
+        }
+        ChangeTarget::NetworkInventory { socket } => {
+            run_client(&socket, Command::NetworkInventory).await
+        }
+        ChangeTarget::NetworkPlan { socket } => {
+            let input = read_bounded_stdin(60 * 1024, "network plan")?;
+            let mutations: Vec<NetworkMutationRequest> = serde_json::from_slice(&input)?;
+            run_client(&socket, Command::NetworkPlan { mutations }).await
         }
         ChangeTarget::Get {
             change_set_id,

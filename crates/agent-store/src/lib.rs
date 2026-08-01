@@ -381,6 +381,57 @@ impl Store {
         max_execution_bytes: usize,
         now_monotonic_ms: u64,
     ) -> Result<ChangeSetState, StoreError> {
+        self.create_domain_change_set(
+            "firewall",
+            record,
+            execution_payload,
+            max_records,
+            max_plan_bytes,
+            max_execution_bytes,
+            now_monotonic_ms,
+        )
+    }
+
+    /// Atomically creates a planned network `ChangeSet` and its executable payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds/bindings, capacity pressure, duplicate identifiers,
+    /// an expired plan, or any `SQLite` failure. No partial record is committed.
+    pub fn create_network_change_set(
+        &self,
+        record: &ChangeSetRecord,
+        execution_payload: &[u8],
+        max_records: u32,
+        max_plan_bytes: usize,
+        max_execution_bytes: usize,
+        now_monotonic_ms: u64,
+    ) -> Result<ChangeSetState, StoreError> {
+        self.create_domain_change_set(
+            "network",
+            record,
+            execution_payload,
+            max_records,
+            max_plan_bytes,
+            max_execution_bytes,
+            now_monotonic_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the two public domain APIs exactly symmetric.
+    fn create_domain_change_set(
+        &self,
+        domain: &str,
+        record: &ChangeSetRecord,
+        execution_payload: &[u8],
+        max_records: u32,
+        max_plan_bytes: usize,
+        max_execution_bytes: usize,
+        now_monotonic_ms: u64,
+    ) -> Result<ChangeSetState, StoreError> {
+        if !matches!(domain, "firewall" | "network") {
+            return Err(StoreError::ChangeSetConflict);
+        }
         validate_change_set_record(record, max_plan_bytes)?;
         if record.state != ChangeSetState::Planned {
             return Err(StoreError::ChangeSetConflict);
@@ -429,9 +480,10 @@ impl Store {
             .execute(
                 "INSERT INTO change_execution_plans
                  (change_set_id, domain, plan_digest, boot_id, payload, created_at)
-                 VALUES (?1, 'firewall', ?2, ?3, ?4, unixepoch())",
+                 VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())",
                 params![
                     record.id,
+                    domain,
                     record.plan_digest,
                     record.boot_id,
                     execution_payload
@@ -542,13 +594,51 @@ impl Store {
         boot_id: &str,
         max_payload_bytes: usize,
     ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.domain_execution_plan(
+            "firewall",
+            change_set_id,
+            plan_digest,
+            boot_id,
+            max_payload_bytes,
+        )
+    }
+
+    /// Loads a network execution payload through its exact digest and boot binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an oversized stored payload or `SQLite` failure.
+    pub fn network_execution_plan(
+        &self,
+        change_set_id: &str,
+        plan_digest: &str,
+        boot_id: &str,
+        max_payload_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.domain_execution_plan(
+            "network",
+            change_set_id,
+            plan_digest,
+            boot_id,
+            max_payload_bytes,
+        )
+    }
+
+    fn domain_execution_plan(
+        &self,
+        domain: &str,
+        change_set_id: &str,
+        plan_digest: &str,
+        boot_id: &str,
+        max_payload_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
         let connection = self.connection()?;
         let payload: Option<Vec<u8>> = connection
             .query_row(
                 "SELECT payload FROM change_execution_plans
-                 WHERE change_set_id = ?1 AND domain = 'firewall'
-                   AND plan_digest = ?2 AND boot_id = ?3",
-                params![change_set_id, plan_digest, boot_id],
+                 WHERE change_set_id = ?1 AND domain = ?2
+                   AND plan_digest = ?3 AND boot_id = ?4",
+                params![change_set_id, domain, plan_digest, boot_id],
                 |row| row.get(0),
             )
             .optional()
@@ -874,6 +964,7 @@ impl Store {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keeping the complete schema in one migration is auditable.
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
     connection
         .execute_batch(
@@ -927,7 +1018,7 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
                  ON change_sets(updated_at DESC);
              CREATE TABLE IF NOT EXISTS change_execution_plans (
                  change_set_id TEXT PRIMARY KEY REFERENCES change_sets(id) ON DELETE CASCADE,
-                 domain TEXT NOT NULL CHECK(domain IN ('firewall')),
+                 domain TEXT NOT NULL CHECK(domain IN ('firewall', 'network')),
                  plan_digest TEXT NOT NULL,
                  boot_id TEXT NOT NULL,
                  payload BLOB NOT NULL,
@@ -948,7 +1039,40 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
                  ON approvals(change_set_id);
              INSERT OR IGNORE INTO schema_migrations(version) VALUES (1), (2), (3), (4), (5);",
         )
-        .map_err(StoreError::Sqlite)
+        .map_err(StoreError::Sqlite)?;
+    let domain_migration_applied: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 6)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if !domain_migration_applied {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 BEGIN IMMEDIATE;
+                 ALTER TABLE change_execution_plans RENAME TO change_execution_plans_v5;
+                 CREATE TABLE change_execution_plans (
+                     change_set_id TEXT PRIMARY KEY REFERENCES change_sets(id) ON DELETE CASCADE,
+                     domain TEXT NOT NULL CHECK(domain IN ('firewall', 'network')),
+                     plan_digest TEXT NOT NULL,
+                     boot_id TEXT NOT NULL,
+                     payload BLOB NOT NULL,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 INSERT INTO change_execution_plans
+                     (change_set_id, domain, plan_digest, boot_id, payload, created_at)
+                 SELECT change_set_id, domain, plan_digest, boot_id, payload, created_at
+                 FROM change_execution_plans_v5;
+                 DROP TABLE change_execution_plans_v5;
+                 INSERT INTO schema_migrations(version) VALUES (6);
+                 COMMIT;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .map_err(StoreError::Sqlite)?;
+    }
+    Ok(())
 }
 
 fn decode_change_set(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeSetRecord> {
@@ -1429,6 +1553,43 @@ mod tests {
                 .firewall_execution_plan("firewall-create", PLAN_DIGEST, "boot-1", 32)
                 .expect("execution"),
             Some(b"typed".to_vec())
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn network_change_payload_is_domain_and_security_bound() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-agent-network-create-{nonce}"));
+        let store = Store::open(&root.join("agent.db"), 1024 * 1024).expect("open store");
+        let record = change_set_record("network-create", 1_000);
+        assert_eq!(
+            store
+                .create_network_change_set(&record, b"typed-network", 4, 4096, 32, 100)
+                .expect("create"),
+            ChangeSetState::AwaitingApproval
+        );
+        assert_eq!(
+            store
+                .network_execution_plan("network-create", PLAN_DIGEST, "boot-1", 32)
+                .expect("load"),
+            Some(b"typed-network".to_vec())
+        );
+        assert_eq!(
+            store
+                .firewall_execution_plan("network-create", PLAN_DIGEST, "boot-1", 32)
+                .expect("wrong domain"),
+            None
+        );
+        assert_eq!(
+            store
+                .network_execution_plan("network-create", PLAN_DIGEST, "wrong-boot", 32)
+                .expect("wrong boot"),
+            None
         );
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
