@@ -152,6 +152,8 @@ Bounded generic Linux runtime network inventory is recorded in
 [ADR 0045](docs/adr/0045-generic-linux-network-runtime-inventory.md).
 Agent-owned generic Linux volatile route ownership and staging are recorded in
 [ADR 0046](docs/adr/0046-generic-linux-runtime-route-staging.md).
+The generic Linux runtime route native transaction is recorded in
+[ADR 0047](docs/adr/0047-generic-linux-runtime-route-transaction.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

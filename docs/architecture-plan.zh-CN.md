@@ -1242,6 +1242,14 @@ typed route，并以 numeric route protocol 186 标记 native ownership；canoni
 下的有界普通文件。当前尚未执行 batch；下一切片接入 source reinspection、独立 helper、
 post-apply verify 与 SQLite canonical 原子替换后才开放 generic network plan/apply。
 
+截至 ADR 0047，generic runtime route transaction 已完成 inspect → stage → validate →
+rollback-armed activate → verify 的强制顺序。正向与逆向 batch 以 0600 文件同步写入
+`/tmp` 私有 transaction 目录；validation 重新读取并逐字节比较 renderer 输出。执行
+前再次 fresh reconcile protocol-186 state，执行后再以 projected canonical 验证 live
+语义，只有验证后的 payload 才允许交给 SQLite。staging 在 discard/drop 清理。当前
+仍缺独立 helper 对逆向 batch 与旧 network canonical 的恢复，因此 daemon 公共写入口
+继续关闭。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。
