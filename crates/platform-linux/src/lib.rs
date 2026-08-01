@@ -14,6 +14,7 @@ pub mod firewall_openwrt_execute;
 mod firewall_project;
 pub mod firewall_runtime;
 mod firewall_uci;
+pub mod network_openwrt;
 
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;
 const DISCOVERED_COMMANDS: &[&str] = &[

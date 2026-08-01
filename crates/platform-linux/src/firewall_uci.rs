@@ -31,6 +31,16 @@ impl UciSection {
 }
 
 pub(crate) fn parse_uci_show(uci_show: &str) -> Result<Vec<UciSection>, FirewallRenderError> {
+    parse_uci_show_package(uci_show, "firewall")
+}
+
+pub(crate) fn parse_uci_show_package(
+    uci_show: &str,
+    package: &str,
+) -> Result<Vec<UciSection>, FirewallRenderError> {
+    if !safe_uci_identifier(package) {
+        return Err(FirewallRenderError::MalformedUci);
+    }
     if uci_show.len() > MAX_UCI_SHOW_BYTES
         || uci_show.lines().count() > MAX_UCI_SHOW_LINES
         || uci_show.lines().any(|line| line.len() > 2_048)
@@ -41,7 +51,7 @@ pub(crate) fn parse_uci_show(uci_show: &str) -> Result<Vec<UciSection>, Firewall
     let mut sections = Vec::new();
     let mut indexes = HashMap::new();
     for line in uci_show.lines().filter(|line| !line.trim().is_empty()) {
-        let (key, raw_value) = split_line(line)?;
+        let (key, raw_value) = split_line(line, package)?;
         if key.contains('.') {
             continue;
         }
@@ -70,7 +80,7 @@ pub(crate) fn parse_uci_show(uci_show: &str) -> Result<Vec<UciSection>, Firewall
     }
 
     for line in uci_show.lines().filter(|line| !line.trim().is_empty()) {
-        let (key, raw_value) = split_line(line)?;
+        let (key, raw_value) = split_line(line, package)?;
         let Some((selector, option)) = key.rsplit_once('.') else {
             continue;
         };
@@ -93,12 +103,13 @@ pub(crate) fn parse_uci_show(uci_show: &str) -> Result<Vec<UciSection>, Firewall
     Ok(sections)
 }
 
-fn split_line(line: &str) -> Result<(&str, &str), FirewallRenderError> {
+fn split_line<'a>(line: &'a str, package: &str) -> Result<(&'a str, &'a str), FirewallRenderError> {
     let (key, value) = line
         .split_once('=')
         .ok_or(FirewallRenderError::MalformedUci)?;
     let key = key
-        .strip_prefix("firewall.")
+        .strip_prefix(package)
+        .and_then(|key| key.strip_prefix('.'))
         .ok_or(FirewallRenderError::MalformedUci)?;
     if key.is_empty() || key.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(FirewallRenderError::MalformedUci);
@@ -220,5 +231,16 @@ mod tests {
         assert!(
             parse_uci_show(&format!("firewall.x=zone\nfirewall.x.network={values}\n")).is_err()
         );
+    }
+
+    #[test]
+    fn parses_an_explicit_network_package_without_accepting_mixed_packages() {
+        let parsed = parse_uci_show_package(
+            "network.lan=interface\nnetwork.lan.proto='static'\n",
+            "network",
+        )
+        .expect("parse network");
+        assert_eq!(parsed[0].selector, "lan");
+        assert!(parse_uci_show_package("firewall.lan=interface\n", "network").is_err());
     }
 }

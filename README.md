@@ -97,8 +97,10 @@ ClawBot, and Channel-facing elevation are not implemented yet. Firewall
 configuration execution is available through the bounded ChangeSet path on
 supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
-is implemented; host network writes remain closed until each platform adapter
-has native validation and independent rollback. The local CLI exposes
+is implemented. OpenWrt 21+ additionally has fresh UCI network inventory and
+bounded `/tmp` staging for the initial interface/Bridge/VLAN/route/policy-rule
+subset; host network writes remain closed until semantic preflight and
+independent rollback are complete. The local CLI exposes
 actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
 apply, and confirmed commit for supported firewall backends. The configuration
 roadmap is intentionally broader than a
@@ -136,6 +138,9 @@ are recorded in
 The platform-neutral L2/L3 schema, semantic risk, projection, and executable
 payload boundary are recorded in
 [ADR 0041](docs/adr/0041-typed-l2-l3-network-planner.md).
+OpenWrt fresh network UCI inventory, ownership binding, capability narrowing,
+and non-installing staging are recorded in
+[ADR 0042](docs/adr/0042-openwrt-network-inventory-staging.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

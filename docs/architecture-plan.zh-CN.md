@@ -1194,6 +1194,18 @@ fwmark 和 rule priority 在本地有界校验，投影与 apply 后验证共享
 OpenWrt UCI/netifd 与普通 Linux netlink/受支持 network manager 的 fresh inventory、
 capability 裁剪、原生 validation、易失 rollback artifact 和 confirmed-commit。
 
+截至 ADR 0042，OpenWrt 21+ 的首个 L2/L3 平台切片已经完成 fresh `uci show network`
+inventory 与 `/tmp` staging：支持基础 interface（none/static/dhcp/dhcpv6）、独立
+device Bridge、显式 802.1Q/802.1ad VLAN device、route/route6 和 rule/rule6。
+typed object、原生 section selector 与 present options 来自同一个有界快照；更新、
+删除和 policy priority move 均绑定该快照，所有占用 section（包括不支持的厂商
+section）都会参与名称冲突检查。Agent-owned 使用 `mbed_managed`/`mbed_id` 标记；
+平台原生对象更新不会被静默接管，未建模 option 保留。PPPoE/协议凭据、IPv6 PD、
+高级 rule selector、route onlink/MTU、DSA bridge-vlan、swconfig、bond 和 VRF 当前
+明确为只读。输出仅是供私有 `/tmp` UCI config dir 使用的 batch，并固定要求
+`uci export network` 语法检查；尚未安装到 Flash 或 reload netifd，live apply 必须
+等独立回滚与 confirmed-commit 完成后才开放。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。
