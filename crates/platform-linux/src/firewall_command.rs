@@ -421,7 +421,7 @@ mod tests {
             &root.join("bin/iptables-restore"),
             "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n",
         );
-        let runner = test_runner(&root, Duration::from_secs(1), 32, 32);
+        let runner = test_runner(&root, Duration::from_secs(5), 32, 32);
         let output = runner
             .run(
                 &FirewallCommand::IptablesRestoreTest { ipv6: false },

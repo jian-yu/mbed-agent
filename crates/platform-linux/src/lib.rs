@@ -7,6 +7,7 @@ pub mod firewall;
 pub mod firewall_command;
 pub mod firewall_inventory;
 pub mod firewall_iptables;
+pub mod firewall_iptables_execute;
 pub mod firewall_nft;
 pub mod firewall_nft_execute;
 pub mod firewall_openwrt_execute;

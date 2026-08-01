@@ -104,6 +104,43 @@ pub struct IptablesFirewallStage {
     pub rollback_required: bool,
 }
 
+/// Conditional recovery artifacts for one iptables address family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IptablesFamilyRollback {
+    pub prior_state: IptablesFamilyState,
+    /// Apply when the family currently contains the complete Agent-owned chains.
+    pub restore_from_owned: Option<String>,
+    /// Apply when the family currently has no Agent-owned chains.
+    pub restore_from_absent: Option<String>,
+}
+
+/// Renders bounded recovery input for one freshly inspected family.
+///
+/// Existing owned state is reduced to only fixed chain declarations, exact normalized hooks, and
+/// rules inside owned chains. An absent source produces a cleanup transaction that removes only
+/// the exact owned hooks and chains if activation created them.
+///
+/// # Errors
+///
+/// Returns an error for malformed, partial, foreign, or oversized native state.
+pub fn render_iptables_family_rollback(
+    save: &str,
+) -> Result<IptablesFamilyRollback, IptablesRenderError> {
+    let prior_state = inspect_iptables_family_state(save)?;
+    match prior_state {
+        IptablesFamilyState::Absent => Ok(IptablesFamilyRollback {
+            prior_state,
+            restore_from_owned: Some(render_owned_cleanup()?),
+            restore_from_absent: None,
+        }),
+        IptablesFamilyState::AgentOwned => Ok(IptablesFamilyRollback {
+            prior_state,
+            restore_from_owned: Some(render_owned_snapshot(save, false)?),
+            restore_from_absent: Some(render_owned_snapshot(save, true)?),
+        }),
+    }
+}
+
 /// Inspects one bounded `iptables-save` or `ip6tables-save` snapshot.
 ///
 /// All six managed chains and all six exact ownership-marked jumps must be either absent or
@@ -1076,11 +1113,85 @@ fn verdict_target(
 
 fn hook_marker_matches(line: &str, binding: &ChainBinding) -> bool {
     let tokens: Vec<&str> = line.split_whitespace().collect();
-    tokens.first() == Some(&"-A")
-        && tokens.get(1) == Some(&binding.builtin)
-        && option_value(&tokens, "--comment").map(|value| value.trim_matches('"'))
-            == Some(binding.marker)
-        && option_value(&tokens, "-j") == Some(binding.managed)
+    tokens.len() == 8
+        && tokens[0] == "-A"
+        && tokens[1] == binding.builtin
+        && tokens[2] == "-m"
+        && tokens[3] == "comment"
+        && tokens[4] == "--comment"
+        && tokens[5].trim_matches('"') == binding.marker
+        && tokens[6] == "-j"
+        && tokens[7] == binding.managed
+}
+
+fn render_owned_cleanup() -> Result<String, IptablesRenderError> {
+    let mut output = String::new();
+    for table in ["filter", "mangle", "nat"] {
+        writeln!(output, "*{table}").map_err(|_| IptablesRenderError::Output)?;
+        for binding in CHAINS.iter().filter(|binding| binding.table == table) {
+            writeln!(
+                output,
+                "-D {} -m comment --comment {} -j {}",
+                binding.builtin, binding.marker, binding.managed
+            )
+            .map_err(|_| IptablesRenderError::Output)?;
+            writeln!(output, "-F {}", binding.managed).map_err(|_| IptablesRenderError::Output)?;
+            writeln!(output, "-X {}", binding.managed).map_err(|_| IptablesRenderError::Output)?;
+        }
+        output.push_str("COMMIT\n");
+    }
+    ensure_restore_capacity(output)
+}
+
+fn render_owned_snapshot(save: &str, include_hooks: bool) -> Result<String, IptablesRenderError> {
+    let mut output = String::new();
+    for table in ["filter", "mangle", "nat"] {
+        writeln!(output, "*{table}").map_err(|_| IptablesRenderError::Output)?;
+        for binding in CHAINS.iter().filter(|binding| binding.table == table) {
+            writeln!(output, ":{} - [0:0]", binding.managed)
+                .map_err(|_| IptablesRenderError::Output)?;
+            if include_hooks {
+                writeln!(
+                    output,
+                    "-A {} -m comment --comment {} -j {}",
+                    binding.builtin, binding.marker, binding.managed
+                )
+                .map_err(|_| IptablesRenderError::Output)?;
+            }
+        }
+        let mut current_table = "";
+        for line in save.lines() {
+            if let Some(value) = line.strip_prefix('*') {
+                current_table = value;
+                continue;
+            }
+            if line == "COMMIT" {
+                current_table = "";
+                continue;
+            }
+            if current_table == table
+                && CHAINS.iter().any(|binding| {
+                    binding.table == table
+                        && line
+                            .strip_prefix("-A ")
+                            .and_then(|value| value.split_whitespace().next())
+                            == Some(binding.managed)
+                })
+            {
+                writeln!(output, "{line}").map_err(|_| IptablesRenderError::Output)?;
+            }
+        }
+        output.push_str("COMMIT\n");
+    }
+    ensure_restore_capacity(output)
+}
+
+fn ensure_restore_capacity(output: String) -> Result<String, IptablesRenderError> {
+    if output.len() > MAX_RESTORE_BYTES {
+        Err(IptablesRenderError::Capacity)
+    } else {
+        Ok(output)
+    }
 }
 
 fn jump_target(line: &str) -> Option<&str> {
@@ -1261,6 +1372,42 @@ mod tests {
             inspect_iptables_family_state("*filter\0"),
             Err(IptablesRenderError::MalformedInspection)
         );
+        let conditional_hook = save.replace(
+            "-A INPUT -m comment --comment \"mbed-agent-owned:v1:input\" -j MBED_INPUT",
+            "-A INPUT -p tcp -m comment --comment \"mbed-agent-owned:v1:input\" -j MBED_INPUT",
+        );
+        assert_eq!(
+            inspect_iptables_family_state(&conditional_hook),
+            Err(IptablesRenderError::ForeignChains)
+        );
+    }
+
+    #[test]
+    fn rollback_artifacts_restore_only_owned_chains_or_remove_first_use() {
+        let mut save = owned_save();
+        save = save.replace(
+            ":MBED_INPUT - [0:0]\n",
+            ":MBED_INPUT - [0:0]\n-A MBED_INPUT -p tcp --dport 22 -j DROP\n",
+        );
+        save = save.replace(
+            "*filter\n",
+            "*filter\n:FOREIGN - [0:0]\n-A FOREIGN -j ACCEPT\n",
+        );
+        let owned = render_iptables_family_rollback(&save).expect("owned rollback");
+        assert_eq!(owned.prior_state, IptablesFamilyState::AgentOwned);
+        let existing = owned.restore_from_owned.expect("existing restore");
+        assert!(existing.contains("-A MBED_INPUT -p tcp --dport 22 -j DROP"));
+        assert!(!existing.contains("FOREIGN"));
+        assert!(!existing.contains("-A INPUT -m comment"));
+        let absent = owned.restore_from_absent.expect("absent restore");
+        assert!(absent.contains("-A INPUT -m comment --comment mbed-agent-owned:v1:input"));
+
+        let first_use = render_iptables_family_rollback("").expect("first-use rollback");
+        assert_eq!(first_use.prior_state, IptablesFamilyState::Absent);
+        assert!(first_use.restore_from_absent.is_none());
+        let cleanup = first_use.restore_from_owned.expect("cleanup");
+        assert!(cleanup.contains("-D INPUT -m comment --comment mbed-agent-owned:v1:input"));
+        assert!(cleanup.contains("-F MBED_INPUT\n-X MBED_INPUT"));
     }
 
     #[test]

@@ -1057,6 +1057,16 @@ generic 回滚包只在 `/tmp` 保存带摘要的旧 owned-table ruleset 与旧 
 独立 helper 在超时或 daemon 退出后同时恢复内核和 SQLite，不写持久 nftables 文件。
 iptables/ip6tables 因双地址族不是单一事务，仍保持写入口关闭，等待独立故障恢复切片。
 
+iptables/ip6tables 双栈 transaction 内核已经落地：两族 save 作为一个 observation
+与 boot-bound canonical state 对账，两份 restore 输入必须全部通过原生
+`--test --noflush` 后才按 IPv4、IPv6 顺序加载，并在加载前再次比较 Agent-owned
+fingerprint。代码显式覆盖“IPv4 成功、IPv6 失败”的 partial activation，不把它误报
+为未写入。基于 fresh save 的回滚 renderer 也已生成四种条件恢复：owned→owned 只
+清空并恢复六个自有链，absent→owned 精确删除 hook/链，owned→absent 重建 hook/链，
+absent→absent 不操作；带额外匹配条件的 ownership hook 现在被视为 foreign。
+独立 helper 尚未接入这些条件 artifact，因此 daemon 的 iptables 写 capability 继续
+保持关闭，避免在双族半成功时缺少进程外恢复。
+
 独立 helper 现支持原子即时恢复决策：confirm 与 rollback 共用一个 create-new 后
 通过 hard-link 原子发布的 decision inode，先到者生效，同一决定可幂等重试，冲突
 决定被拒绝。apply/verify 失败无需等待 deadline，可请求 helper 立即执行同一套

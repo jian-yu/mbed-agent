@@ -101,6 +101,84 @@ pub struct CollectedNftablesObservation {
     managed_listing: Option<String>,
 }
 
+/// One paired IPv4/IPv6 iptables observation collected without a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedIptablesObservation {
+    ipv4_save: String,
+    ipv6_save: String,
+}
+
+impl CollectedIptablesObservation {
+    #[must_use]
+    pub fn ipv4_save(&self) -> &str {
+        &self.ipv4_save
+    }
+
+    #[must_use]
+    pub fn ipv6_save(&self) -> &str {
+        &self.ipv6_save
+    }
+}
+
+/// Collects both address families as one bounded logical observation.
+///
+/// # Errors
+///
+/// Returns an error when either fixed save command fails or emits non-UTF-8 data.
+pub fn collect_iptables_observation(
+    executor: &impl FirewallCommandExecutor,
+) -> Result<CollectedIptablesObservation, GenericFirewallStateError> {
+    let ipv4 = executor
+        .execute(&FirewallCommand::IptablesSave { ipv6: false }, None)
+        .map_err(|_| GenericFirewallStateError::NativeInspection)?
+        .stdout;
+    let ipv6 = executor
+        .execute(&FirewallCommand::IptablesSave { ipv6: true }, None)
+        .map_err(|_| GenericFirewallStateError::NativeInspection)?
+        .stdout;
+    Ok(CollectedIptablesObservation {
+        ipv4_save: String::from_utf8(ipv4)
+            .map_err(|_| GenericFirewallStateError::NativeInspection)?,
+        ipv6_save: String::from_utf8(ipv6)
+            .map_err(|_| GenericFirewallStateError::NativeInspection)?,
+    })
+}
+
+/// Reconciles an already collected paired iptables observation.
+///
+/// # Errors
+///
+/// Returns an error for partial/foreign ownership, stale canonical state, or native drift.
+pub fn reconcile_iptables_observation(
+    canonical_state: Option<&[u8]>,
+    boot_id: &str,
+    observation: &CollectedIptablesObservation,
+) -> Result<GenericFirewallInventorySnapshot, GenericFirewallStateError> {
+    inspect_generic_firewall_inventory(
+        canonical_state,
+        boot_id,
+        GenericFirewallBackend::Iptables,
+        GenericFirewallObservation::Iptables {
+            ipv4_save: observation.ipv4_save(),
+            ipv6_save: observation.ipv6_save(),
+        },
+    )
+}
+
+/// Collects and reconciles a fresh dual-stack iptables inventory.
+///
+/// # Errors
+///
+/// Returns an error for native command/format failures or canonical-state mismatch.
+pub fn inspect_generic_iptables_inventory(
+    executor: &impl FirewallCommandExecutor,
+    canonical_state: Option<&[u8]>,
+    boot_id: &str,
+) -> Result<GenericFirewallInventorySnapshot, GenericFirewallStateError> {
+    let observation = collect_iptables_observation(executor)?;
+    reconcile_iptables_observation(canonical_state, boot_id, &observation)
+}
+
 impl CollectedNftablesObservation {
     #[must_use]
     pub fn managed_listing(&self) -> Option<&str> {
