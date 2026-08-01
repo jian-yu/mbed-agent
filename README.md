@@ -150,6 +150,8 @@ OpenWrt network daemon admission and confirmed commit are recorded in
 [ADR 0044](docs/adr/0044-daemon-openwrt-network-confirmed-commit.md).
 Bounded generic Linux runtime network inventory is recorded in
 [ADR 0045](docs/adr/0045-generic-linux-network-runtime-inventory.md).
+Agent-owned generic Linux volatile route ownership and staging are recorded in
+[ADR 0046](docs/adr/0046-generic-linux-runtime-route-staging.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

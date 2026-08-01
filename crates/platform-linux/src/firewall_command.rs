@@ -17,26 +17,54 @@ const COMMAND_DIRS: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirewallCommand {
     UciShowFirewall,
-    UciShowFirewallAt { staging_dir: PathBuf },
+    UciShowFirewallAt {
+        staging_dir: PathBuf,
+    },
     UciShowNetwork,
-    UciShowNetworkAt { staging_dir: PathBuf },
-    UciExportNetworkAt { staging_dir: PathBuf },
-    UciBatch { staging_dir: PathBuf },
-    Fw3PrintIpv4 { staging_dir: PathBuf },
-    Fw3PrintIpv6 { staging_dir: PathBuf },
-    Fw4Check { staging_dir: PathBuf },
+    UciShowNetworkAt {
+        staging_dir: PathBuf,
+    },
+    UciExportNetworkAt {
+        staging_dir: PathBuf,
+    },
+    UciBatch {
+        staging_dir: PathBuf,
+    },
+    Fw3PrintIpv4 {
+        staging_dir: PathBuf,
+    },
+    Fw3PrintIpv6 {
+        staging_dir: PathBuf,
+    },
+    Fw4Check {
+        staging_dir: PathBuf,
+    },
     OpenWrtFirewallReload,
     OpenWrtNetworkReload,
     IpJsonLink,
     IpJsonAddress,
     IpJsonRoute,
+    IpBatch {
+        batch_file: PathBuf,
+        continue_on_error: bool,
+    },
     NftListTables,
     NftListManagedTable,
-    NftCheck { ruleset: PathBuf },
-    NftLoad { ruleset: PathBuf },
-    IptablesSave { ipv6: bool },
-    IptablesRestoreTest { ipv6: bool },
-    IptablesRestore { ipv6: bool },
+    NftCheck {
+        ruleset: PathBuf,
+    },
+    NftLoad {
+        ruleset: PathBuf,
+    },
+    IptablesSave {
+        ipv6: bool,
+    },
+    IptablesRestoreTest {
+        ipv6: bool,
+    },
+    IptablesRestore {
+        ipv6: bool,
+    },
 }
 
 /// Bounded process result. Output is diagnostic-only and never interpreted as authorization.
@@ -240,6 +268,21 @@ impl FirewallCommandRunner {
             FirewallCommand::IpJsonLink => spec("ip", &["-j", "link", "show"]),
             FirewallCommand::IpJsonAddress => spec("ip", &["-j", "address", "show"]),
             FirewallCommand::IpJsonRoute => spec("ip", &["-j", "route", "show", "table", "all"]),
+            FirewallCommand::IpBatch {
+                batch_file,
+                continue_on_error,
+            } => {
+                let file = self.validate_staging_file(batch_file)?;
+                CommandSpecification {
+                    program: "ip",
+                    arguments: if *continue_on_error {
+                        vec!["-force".into(), "-batch".into(), file.as_os_str().into()]
+                    } else {
+                        vec!["-batch".into(), file.as_os_str().into()]
+                    },
+                    uci_config_dir: None,
+                }
+            }
             FirewallCommand::NftListTables => spec("nft", &["list", "tables"]),
             FirewallCommand::NftListManagedTable => {
                 spec("nft", &["list", "table", "inet", "mbed_agent"])
@@ -586,6 +629,42 @@ mod tests {
                 expected.into_iter().map(OsString::from).collect::<Vec<_>>()
             );
         }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn runtime_network_batch_is_bound_to_one_private_staging_file() {
+        let root = fixture_root();
+        let runtime = root.join("runtime");
+        let staging = runtime.join("staging/change-1");
+        fs::create_dir_all(&staging).expect("staging");
+        let batch = staging.join("routes.ipbatch");
+        fs::write(
+            &batch,
+            b"-4 route add blackhole 192.0.2.0/24 table 100 proto 186\n",
+        )
+        .expect("batch");
+        let runner = test_runner(&root, Duration::from_secs(5), 1024, 1024);
+        let specification = runner
+            .specification(&FirewallCommand::IpBatch {
+                batch_file: batch,
+                continue_on_error: false,
+            })
+            .expect("specification");
+        assert_eq!(specification.program, "ip");
+        assert_eq!(specification.arguments[0], "-batch");
+        assert!(
+            Path::new(&specification.arguments[1])
+                .starts_with(fs::canonicalize(&runtime).expect("canonical runtime"))
+        );
+        let rollback = runner
+            .specification(&FirewallCommand::IpBatch {
+                batch_file: staging.join("routes.ipbatch"),
+                continue_on_error: true,
+            })
+            .expect("rollback specification");
+        assert_eq!(rollback.arguments[0], "-force");
+        assert_eq!(rollback.arguments[1], "-batch");
         fs::remove_dir_all(root).expect("cleanup");
     }
 

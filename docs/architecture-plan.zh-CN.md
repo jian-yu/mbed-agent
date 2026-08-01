@@ -1233,6 +1233,15 @@ platform-native 对象并返回精确摘要。动态租约地址不会伪装成�
 均 fail closed。由于内核状态不能证明 NetworkManager、systemd-networkd、发行版脚本
 或厂商 supervisor 的持久 ownership，普通 Linux 的 plan/apply 仍关闭。
 
+截至 ADR 0046，普通 Linux 首个可写候选收敛为 Agent-owned 易失路由：只接受 enabled
+typed route，并以 numeric route protocol 186 标记 native ownership；canonical state
+按 boot ID 保存在有界易失表示中。fresh native protocol-186 route 必须与 canonical
+语义完全一致，缺失 canonical 的孤儿路由、漂移、跨 boot 状态、platform-native route
+和非 route 对象全部拒绝。renderer 从审批 plan 同时生成正向与逆向 `ip -batch`，更新
+采用 delete-before-add，rollback 反序撤销；固定 `IpBatch` 命令只接受 `/tmp` 私有目录
+下的有界普通文件。当前尚未执行 batch；下一切片接入 source reinspection、独立 helper、
+post-apply verify 与 SQLite canonical 原子替换后才开放 generic network plan/apply。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。

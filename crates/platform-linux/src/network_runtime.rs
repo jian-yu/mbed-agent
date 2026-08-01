@@ -3,17 +3,23 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
-use agent_core::{NetworkInventory, network_object_digest};
+use agent_core::{
+    NetworkInventory, NetworkMutationPlan, network_object_digest, project_network_inventory,
+};
 use agent_protocol::{
     IpNetwork, NetworkAddressMode, NetworkInterfaceConfig, NetworkObject, NetworkRoute,
     NetworkRouteType, ObjectOwnership,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 const MAX_OBJECTS: usize = 256;
 const MAX_ADDRESSES_PER_INTERFACE: usize = 32;
 const MAX_NAME_BYTES: usize = 64;
+const MAX_CANONICAL_BYTES: usize = 256 * 1024;
+const MAX_BATCH_BYTES: usize = 64 * 1024;
+const RUNTIME_ROUTE_PROTOCOL: u64 = 186;
 
 #[derive(Debug, Error)]
 pub enum RuntimeNetworkInventoryError {
@@ -23,6 +29,40 @@ pub enum RuntimeNetworkInventoryError {
     Capacity,
     #[error("runtime network object is not safely representable")]
     Unsupported,
+    #[error("runtime network canonical state is stale or corrupt")]
+    StaleState,
+    #[error("Agent-owned runtime route state is orphaned or drifted")]
+    NativeDrift,
+    #[error("network plan contains an unsupported runtime object")]
+    InvalidPlan,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeRouteCanonicalState {
+    schema_version: u32,
+    boot_id: String,
+    inventory: NetworkInventory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRouteSnapshot {
+    boot_id: String,
+    inventory: NetworkInventory,
+}
+
+impl RuntimeRouteSnapshot {
+    #[must_use]
+    pub fn inventory(&self) -> &NetworkInventory {
+        &self.inventory
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRouteStage {
+    pub apply_batch: String,
+    pub rollback_batch: String,
+    pub projected_canonical_state: Vec<u8>,
 }
 
 /// Reconstructs a safely representable generic Linux interface and route inventory.
@@ -130,6 +170,238 @@ pub fn inspect_runtime_network_inventory(
         network_object_digest(object).map_err(|_| RuntimeNetworkInventoryError::Unsupported)?;
     }
     Ok(NetworkInventory { objects })
+}
+
+/// Reconciles protocol-186 runtime routes with boot-bound volatile canonical state.
+///
+/// # Errors
+///
+/// Returns an error for malformed observations, orphaned owned routes, stale/corrupt canonical
+/// state, native drift, invalid route objects, or capacity overflow.
+pub fn reconcile_runtime_route_inventory(
+    routes_json: &str,
+    canonical_state: Option<&[u8]>,
+    boot_id: &str,
+) -> Result<RuntimeRouteSnapshot, RuntimeNetworkInventoryError> {
+    if boot_id.is_empty() || boot_id.len() > 128 || boot_id.chars().any(char::is_control) {
+        return Err(RuntimeNetworkInventoryError::StaleState);
+    }
+    let native = owned_native_routes(routes_json)?;
+    let Some(encoded) = canonical_state else {
+        if !native.is_empty() {
+            return Err(RuntimeNetworkInventoryError::NativeDrift);
+        }
+        return Ok(RuntimeRouteSnapshot {
+            boot_id: boot_id.into(),
+            inventory: NetworkInventory { objects: vec![] },
+        });
+    };
+    if encoded.is_empty() || encoded.len() > MAX_CANONICAL_BYTES {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    let canonical: RuntimeRouteCanonicalState =
+        serde_json::from_slice(encoded).map_err(|_| RuntimeNetworkInventoryError::StaleState)?;
+    if canonical.schema_version != 1 || canonical.boot_id != boot_id {
+        return Err(RuntimeNetworkInventoryError::StaleState);
+    }
+    let expected = canonical_routes(&canonical.inventory)?;
+    if route_semantics(&native)? != route_semantics(&expected)? {
+        return Err(RuntimeNetworkInventoryError::NativeDrift);
+    }
+    Ok(RuntimeRouteSnapshot {
+        boot_id: canonical.boot_id,
+        inventory: canonical.inventory,
+    })
+}
+
+/// Renders an exact typed route plan into closed apply/rollback `ip -batch` artifacts.
+///
+/// Only Agent-owned routes are accepted. Every installed route carries protocol 186; no caller
+/// text, command, argument, or path enters the artifacts.
+///
+/// # Errors
+///
+/// Returns an error for stale plans, non-route/platform-native objects, unsupported route shapes,
+/// malformed boot identity, encoding failure, or bounded output overflow.
+pub fn render_runtime_route_stage(
+    snapshot: &RuntimeRouteSnapshot,
+    plan: &NetworkMutationPlan,
+) -> Result<RuntimeRouteStage, RuntimeNetworkInventoryError> {
+    let projected = project_network_inventory(&snapshot.inventory, plan)
+        .map_err(|_| RuntimeNetworkInventoryError::InvalidPlan)?;
+    canonical_routes(&projected)?;
+    let mut apply = String::new();
+    let mut rollback = String::new();
+    for change in &plan.changes {
+        if let Some(before) = &change.before {
+            let NetworkObject::Route(route) = before else {
+                return Err(RuntimeNetworkInventoryError::InvalidPlan);
+            };
+            require_owned_route(route)?;
+            push_route_command(&mut apply, "del", route)?;
+        }
+        if let Some(after) = &change.after {
+            let NetworkObject::Route(route) = after else {
+                return Err(RuntimeNetworkInventoryError::InvalidPlan);
+            };
+            require_owned_route(route)?;
+            push_route_command(&mut apply, "add", route)?;
+        }
+    }
+    for change in plan.changes.iter().rev() {
+        if let Some(after) = &change.after {
+            let NetworkObject::Route(route) = after else {
+                return Err(RuntimeNetworkInventoryError::InvalidPlan);
+            };
+            push_route_command(&mut rollback, "del", route)?;
+        }
+        if let Some(before) = &change.before {
+            let NetworkObject::Route(route) = before else {
+                return Err(RuntimeNetworkInventoryError::InvalidPlan);
+            };
+            push_route_command(&mut rollback, "add", route)?;
+        }
+    }
+    if apply.is_empty() || apply.len() > MAX_BATCH_BYTES || rollback.len() > MAX_BATCH_BYTES {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    let canonical = RuntimeRouteCanonicalState {
+        schema_version: 1,
+        boot_id: snapshot.boot_id.clone(),
+        inventory: projected,
+    };
+    let projected_canonical_state =
+        serde_json::to_vec(&canonical).map_err(|_| RuntimeNetworkInventoryError::StaleState)?;
+    if projected_canonical_state.len() > MAX_CANONICAL_BYTES {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    Ok(RuntimeRouteStage {
+        apply_batch: apply,
+        rollback_batch: rollback,
+        projected_canonical_state,
+    })
+}
+
+fn owned_native_routes(
+    routes_json: &str,
+) -> Result<Vec<NetworkRoute>, RuntimeNetworkInventoryError> {
+    let values = json_array(routes_json)?;
+    if values.len() > MAX_OBJECTS {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    let mut routes = Vec::new();
+    for value in &values {
+        if !owned_protocol(value.get("protocol")) {
+            continue;
+        }
+        let Some(mut route) = route_object(value)? else {
+            return Err(RuntimeNetworkInventoryError::Unsupported);
+        };
+        route.ownership = ObjectOwnership::AgentOwned;
+        routes.push(route);
+    }
+    Ok(routes)
+}
+
+fn owned_protocol(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Number(value)) => value.as_u64() == Some(RUNTIME_ROUTE_PROTOCOL),
+        Some(Value::String(value)) => value == "186",
+        _ => false,
+    }
+}
+
+fn canonical_routes(
+    inventory: &NetworkInventory,
+) -> Result<Vec<NetworkRoute>, RuntimeNetworkInventoryError> {
+    if inventory.objects.len() > MAX_OBJECTS {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    inventory
+        .objects
+        .iter()
+        .map(|object| {
+            let NetworkObject::Route(route) = object else {
+                return Err(RuntimeNetworkInventoryError::InvalidPlan);
+            };
+            require_owned_route(route)?;
+            Ok(route.clone())
+        })
+        .collect()
+}
+
+fn require_owned_route(route: &NetworkRoute) -> Result<(), RuntimeNetworkInventoryError> {
+    if route.ownership != ObjectOwnership::AgentOwned || !route.enabled {
+        return Err(RuntimeNetworkInventoryError::InvalidPlan);
+    }
+    network_object_digest(&NetworkObject::Route(route.clone()))
+        .map(|_| ())
+        .map_err(|_| RuntimeNetworkInventoryError::InvalidPlan)
+}
+
+fn route_semantics(routes: &[NetworkRoute]) -> Result<Vec<Vec<u8>>, RuntimeNetworkInventoryError> {
+    let mut values = routes
+        .iter()
+        .map(|route| {
+            let mut normalized = route.clone();
+            normalized.id.clear();
+            normalized.ownership = ObjectOwnership::AgentOwned;
+            serde_json::to_vec(&normalized).map_err(|_| RuntimeNetworkInventoryError::StaleState)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    values.sort_unstable();
+    Ok(values)
+}
+
+fn push_route_command(
+    output: &mut String,
+    operation: &str,
+    route: &NetworkRoute,
+) -> Result<(), RuntimeNetworkInventoryError> {
+    use std::fmt::Write;
+    let family = if route.destination.address.is_ipv4() {
+        "-4"
+    } else {
+        "-6"
+    };
+    write!(output, "{family} route {operation} ")
+        .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    match route.route_type {
+        NetworkRouteType::Unicast => {}
+        NetworkRouteType::Blackhole => output.push_str("blackhole "),
+        NetworkRouteType::Unreachable => output.push_str("unreachable "),
+        NetworkRouteType::Prohibit => output.push_str("prohibit "),
+    }
+    if route.destination.prefix_len == 0 {
+        output.push_str("default");
+    } else {
+        write!(
+            output,
+            "{}/{}",
+            route.destination.address, route.destination.prefix_len
+        )
+        .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(gateway) = route.gateway {
+        write!(output, " via {gateway}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(interface) = &route.output_interface {
+        write!(output, " dev {interface}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(source) = route.preferred_source {
+        write!(output, " src {source}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    write!(
+        output,
+        " table {} proto {RUNTIME_ROUTE_PROTOCOL}",
+        route.table
+    )
+    .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    if let Some(metric) = route.metric {
+        write!(output, " metric {metric}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    output.push('\n');
+    Ok(())
 }
 
 fn json_array(input: &str) -> Result<Vec<Value>, RuntimeNetworkInventoryError> {
@@ -281,6 +553,7 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::{NetworkMutation, NetworkRiskContext, plan_network_mutations};
 
     #[test]
     fn reconstructs_interfaces_dynamic_addresses_and_routes() {
@@ -321,5 +594,59 @@ mod tests {
         )
         .expect("inventory");
         assert_eq!(inventory.objects.len(), 1);
+    }
+
+    #[test]
+    fn route_stage_is_protocol_owned_reversible_and_canonical_bound() {
+        let snapshot = reconcile_runtime_route_inventory("[]", None, "boot-1").expect("empty");
+        let route = NetworkRoute {
+            id: "guest-default".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            destination: IpNetwork {
+                address: "0.0.0.0".parse().expect("address"),
+                prefix_len: 0,
+            },
+            gateway: Some("192.0.2.1".parse().expect("gateway")),
+            output_interface: Some("eth0".into()),
+            preferred_source: None,
+            table: 100,
+            metric: Some(20),
+            route_type: NetworkRouteType::Unicast,
+        };
+        let plan = plan_network_mutations(
+            snapshot.inventory(),
+            &[NetworkMutation::Create(NetworkObject::Route(route))],
+            &NetworkRiskContext::default(),
+        )
+        .expect("plan");
+        let stage = render_runtime_route_stage(&snapshot, &plan).expect("stage");
+        assert_eq!(
+            stage.apply_batch,
+            "-4 route add default via 192.0.2.1 dev eth0 table 100 proto 186 metric 20\n"
+        );
+        assert_eq!(
+            stage.rollback_batch,
+            "-4 route del default via 192.0.2.1 dev eth0 table 100 proto 186 metric 20\n"
+        );
+        let reconciled = reconcile_runtime_route_inventory(
+            r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","table":100,"metric":20,"protocol":186}]"#,
+            Some(&stage.projected_canonical_state),
+            "boot-1",
+        )
+        .expect("reconcile");
+        assert_eq!(reconciled.inventory().objects.len(), 1);
+    }
+
+    #[test]
+    fn owned_native_route_without_canonical_state_fails_closed() {
+        assert!(matches!(
+            reconcile_runtime_route_inventory(
+                r#"[{"dst":"192.0.2.0/24","dev":"eth0","protocol":"186"}]"#,
+                None,
+                "boot-1"
+            ),
+            Err(RuntimeNetworkInventoryError::NativeDrift)
+        ));
     }
 }
