@@ -28,8 +28,8 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   authenticated actor a short-lived, daemon-RAM `device-admin` capability bound
   to the current boot ID and monotonic expiry. Password request buffers are
   redacted and zeroized; neither passwords nor capabilities enter SQLite.
-  Approval-token issuance and execution backends remain disabled until their
-  following safety slices are complete.
+  Approval-token issuance and the implemented firewall/network execution
+  backends use this same boot-bound authorization boundary.
 - Bounded rollback bundles now use typed, compiled target/reload mappings,
   SHA-256 snapshot verification, `O_NOFOLLOW`, durable atomic replacement, and
   a hidden independent `rollback-helper` mode in the same executable.
@@ -97,15 +97,14 @@ ClawBot, and Channel-facing elevation are not implemented yet. Firewall
 configuration execution is available through the bounded ChangeSet path on
 supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
-is implemented. OpenWrt 21+ additionally has fresh UCI network inventory and
-bounded `/tmp` staging for the initial interface/Bridge/VLAN/route/policy-rule
-subset. The native OpenWrt network transaction and independent
-`/etc/config/network` rollback target are implemented, but host network writes
-remain closed at the public admission layer until daemon/CLI is connected to
-the common R3 confirmed-commit lifecycle. The local CLI exposes
+is implemented. OpenWrt 21+ has fresh UCI network inventory and confirmed writes
+for the initial interface/Bridge/VLAN/route/policy-rule subset. Generic Linux
+with iproute2 has fresh interface/route inventory and confirmed writes for
+enabled Agent-owned volatile routes. Those routes use numeric protocol 186 and
+never write persistent network-manager configuration. The local CLI exposes
 actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
-apply, and confirmed commit for supported firewall backends. The configuration
-roadmap is intentionally broader than a
+apply, and confirmed commit for supported firewall and network backends. The
+configuration roadmap is intentionally broader than a
 few fixed operations: it targets capability-gated typed CRUD for firewall,
 interfaces/addresses, bridges/VLANs, routes, DNS/DHCP, wireless, controlled
 services, QoS, and WireGuard. OpenWrt will use UCI and its native fw3/fw4/netifd
@@ -156,6 +155,8 @@ The generic Linux runtime route native transaction is recorded in
 [ADR 0047](docs/adr/0047-generic-linux-runtime-route-transaction.md).
 Independent generic Linux runtime route recovery is recorded in
 [ADR 0048](docs/adr/0048-generic-linux-runtime-route-rollback.md).
+Generic Linux route daemon admission and confirmed commit are recorded in
+[ADR 0049](docs/adr/0049-daemon-generic-linux-runtime-route-confirmed-commit.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -265,10 +266,14 @@ cargo run -p mbed-agent -- change confirm CHANGE_SET_ID
 ```
 
 Network mutations are closed typed objects (interfaces, bridges, VLANs, routes,
-and policy rules in the currently supported native subset), never raw shell or
-UCI text. Public network writes are always elevated to R3 because the netifd
-reload may interrupt the management path. They therefore always arm the
-independent `/etc/config/network` rollback helper and require confirmation.
+and policy rules in the currently supported backend subset), never raw shell,
+argv, UCI text, or `ip` text. Public network writes are always elevated to R3
+and require confirmation. OpenWrt arms an independent `/etc/config/network`
+rollback helper. Generic Linux accepts only enabled Agent-owned routes, marks
+them protocol 186, stores canonical ownership only in bounded `/tmp` SQLite,
+and arms an independent reverse `ip -force -batch` helper. Interfaces,
+addresses, policy rules, ordinary platform routes, and persistent generic Linux
+network-manager files remain read-only.
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart

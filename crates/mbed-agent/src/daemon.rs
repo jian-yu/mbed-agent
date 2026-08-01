@@ -20,9 +20,9 @@ use agent_protocol::{
     ChangeApprovalResponse, ChangePlan, ChangeSetResponse, ChangeSetState, ClientRequest, Command,
     CompletionResponse, ConfigDomain, DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry,
     FirewallInventoryResponse, FirewallMutationRequest, FirewallObject, NetworkInventoryEntry,
-    NetworkInventoryResponse, NetworkMutationRequest, PROTOCOL_VERSION, ResponseData,
-    SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
-    TaskHistoryEntry,
+    NetworkInventoryResponse, NetworkMutationRequest, NetworkObject, ObjectOwnership,
+    PROTOCOL_VERSION, ResponseData, SensitiveString, ServerResponse, StatusResponse,
+    StoragePressure, StorageStatus, TaskHistoryEntry,
 };
 use agent_provider::{
     CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
@@ -43,7 +43,9 @@ use platform_linux::firewall_runtime::{
 use platform_linux::network_openwrt::{
     OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory,
 };
-use platform_linux::network_runtime::inspect_runtime_network_inventory;
+use platform_linux::network_runtime::{
+    inspect_runtime_network_inventory, reconcile_runtime_route_inventory,
+};
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,7 +60,10 @@ use crate::firewall_execution::{
     GenericNftablesExecutionPortConfig, OpenWrtExecutionPort, OpenWrtExecutionPortConfig,
 };
 use crate::logging;
-use crate::network_execution::{OpenWrtNetworkExecutionPort, OpenWrtNetworkExecutionPortConfig};
+use crate::network_execution::{
+    GenericRuntimeRouteExecutionPort, GenericRuntimeRouteExecutionPortConfig,
+    OpenWrtNetworkExecutionPort, OpenWrtNetworkExecutionPortConfig,
+};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOCAL_CLI_ACTOR: &str = "cli/local";
@@ -706,32 +711,39 @@ async fn handle_network_plan(
     if let Err(message) = ensure_task_storage(state).await {
         return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
     }
-    if let Err(error) = openwrt_network_write_supported(state) {
-        return error.with_id(id);
+    let backend = match network_write_backend(state) {
+        Ok(backend) => backend,
+        Err(error) => return error.with_id(id),
+    };
+    if backend == WritableNetworkBackend::GenericRuntimeRoutes
+        && !requests.iter().all(generic_runtime_route_request)
+    {
+        return ServerResponse::error(
+            id,
+            ErrorCode::InvalidRequest,
+            "generic Linux network writes support only enabled Agent-owned runtime routes",
+        );
     }
     let _configuration_guard = state.configuration_lock.lock().await;
-    let snapshot = match inspect_network_for_planning(state).await {
-        Ok(snapshot) => snapshot,
+    let inventory = match inspect_network_for_write(backend, state).await {
+        Ok(inventory) => inventory,
         Err(error) => return error.with_id(id),
     };
     let mutations = requests
         .into_iter()
         .map(network_mutation)
         .collect::<Vec<_>>();
-    let mut typed = match plan_network_mutations(
-        snapshot.inventory(),
-        &mutations,
-        &NetworkRiskContext::default(),
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            return ServerResponse::error(
-                id,
-                ErrorCode::InvalidRequest,
-                format!("network mutation plan was rejected: {error}"),
-            );
-        }
-    };
+    let mut typed =
+        match plan_network_mutations(&inventory, &mutations, &NetworkRiskContext::default()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return ServerResponse::error(
+                    id,
+                    ErrorCode::InvalidRequest,
+                    format!("network mutation plan was rejected: {error}"),
+                );
+            }
+        };
     // A native network reload can sever the approval channel even for an otherwise local object.
     typed.risk = typed.risk.max(agent_protocol::RiskLevel::R3);
     let now = match boot_monotonic_ms() {
@@ -757,9 +769,7 @@ async fn handle_network_plan(
             .iter()
             .map(|change| change.diff.clone())
             .collect(),
-        validation_checks: vec![
-            "reinspect live network UCI and validate a private staged package".into(),
-        ],
+        validation_checks: vec![network_validation_check(backend).into()],
         verification_checks: vec![
             "reconstruct and compare touched live L2/L3 network objects".into(),
         ],
@@ -850,7 +860,14 @@ async fn inspect_network_inventory(
                 .any(|command| command == "ip") =>
         {
             let runner = firewall_command_runner(state);
+            let store = Arc::clone(&state.store);
+            let max_state_bytes = usize::try_from(state.config.storage.max_network_state_bytes)
+                .map_err(|_| PendingResponseError::internal("network state limit is invalid"))?;
+            let boot_id = state.auth.boot_id().to_owned();
             tokio::task::spawn_blocking(move || {
+                let canonical = store
+                    .network_runtime_state(max_state_bytes)
+                    .map_err(|_| PendingResponseError::internal("network state is unavailable"))?;
                 let links = runner
                     .execute(&FirewallCommand::IpJsonLink, None)
                     .map_err(|_| {
@@ -869,7 +886,7 @@ async fn inspect_network_inventory(
                         PendingResponseError::unavailable("live network inventory is unavailable")
                     })?
                     .stdout;
-                inspect_runtime_network_inventory(
+                let mut inventory = inspect_runtime_network_inventory(
                     std::str::from_utf8(&links).map_err(|_| {
                         PendingResponseError::conflict("live network inventory is malformed")
                     })?,
@@ -885,7 +902,29 @@ async fn inspect_network_inventory(
                     PendingResponseError::conflict(
                         "live network inventory cannot be safely represented",
                     )
-                })
+                })?;
+                let owned = reconcile_runtime_route_inventory(
+                    std::str::from_utf8(&routes).map_err(|_| {
+                        PendingResponseError::conflict("live network inventory is malformed")
+                    })?,
+                    canonical.as_deref(),
+                    &boot_id,
+                )
+                .map_err(|error| {
+                    warn!(%error, "generic Linux Agent-owned routes cannot be reconciled");
+                    PendingResponseError::conflict(
+                        "live Agent-owned route inventory cannot be safely represented",
+                    )
+                })?;
+                inventory
+                    .objects
+                    .extend(owned.inventory().objects.iter().cloned());
+                if inventory.objects.len() > 256 {
+                    return Err(PendingResponseError::conflict(
+                        "live network inventory exceeds its safe bound",
+                    ));
+                }
+                Ok(inventory)
             })
             .await
             .map_err(|_| PendingResponseError::internal("network inventory worker failed"))?
@@ -894,6 +933,96 @@ async fn inspect_network_inventory(
             "no supported network inventory backend is available",
         )),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WritableNetworkBackend {
+    OpenWrt,
+    GenericRuntimeRoutes,
+}
+
+const fn network_validation_check(backend: WritableNetworkBackend) -> &'static str {
+    match backend {
+        WritableNetworkBackend::OpenWrt => {
+            "reinspect live UCI and run native OpenWrt network validation"
+        }
+        WritableNetworkBackend::GenericRuntimeRoutes => {
+            "reconcile Agent-owned protocol-186 routes and validate a fixed ip batch"
+        }
+    }
+}
+
+fn network_write_backend(state: &AppState) -> Result<WritableNetworkBackend, PendingResponseError> {
+    if state.platform.kind == PlatformKind::OpenWrt && state.platform.release_supported {
+        return Ok(WritableNetworkBackend::OpenWrt);
+    }
+    if state.platform.kind == PlatformKind::GenericLinux
+        && state
+            .platform
+            .available_commands
+            .iter()
+            .any(|command| command == "ip")
+    {
+        return Ok(WritableNetworkBackend::GenericRuntimeRoutes);
+    }
+    Err(PendingResponseError::conflict(
+        "no supported writable network backend is available",
+    ))
+}
+
+fn generic_runtime_route_request(request: &NetworkMutationRequest) -> bool {
+    match request {
+        NetworkMutationRequest::Create { desired }
+        | NetworkMutationRequest::Update { desired, .. } => matches!(
+            desired,
+            NetworkObject::Route(route)
+                if route.ownership == ObjectOwnership::AgentOwned && route.enabled
+        ),
+        NetworkMutationRequest::Delete { kind, .. } => kind == "route",
+        NetworkMutationRequest::Move { .. } => false,
+    }
+}
+
+async fn inspect_network_for_write(
+    backend: WritableNetworkBackend,
+    state: &AppState,
+) -> Result<NetworkInventory, PendingResponseError> {
+    match backend {
+        WritableNetworkBackend::OpenWrt => inspect_network_for_planning(state)
+            .await
+            .map(|snapshot| snapshot.inventory().clone()),
+        WritableNetworkBackend::GenericRuntimeRoutes => inspect_generic_runtime_routes(state)
+            .await
+            .map(|snapshot| snapshot.inventory().clone()),
+    }
+}
+
+async fn inspect_generic_runtime_routes(
+    state: &AppState,
+) -> Result<platform_linux::network_runtime::RuntimeRouteSnapshot, PendingResponseError> {
+    let canonical = load_generic_network_state(state).await?;
+    let runner = firewall_command_runner(state);
+    let boot_id = state.auth.boot_id().to_owned();
+    tokio::task::spawn_blocking(move || {
+        let routes = runner
+            .execute(&FirewallCommand::IpJsonRoute, None)
+            .map_err(|_| PendingResponseError::unavailable("live route inventory is unavailable"))?
+            .stdout;
+        reconcile_runtime_route_inventory(
+            std::str::from_utf8(&routes)
+                .map_err(|_| PendingResponseError::conflict("live route inventory is malformed"))?,
+            canonical.as_deref(),
+            &boot_id,
+        )
+        .map_err(|error| {
+            warn!(%error, "generic Linux Agent-owned routes cannot be safely planned");
+            PendingResponseError::conflict(
+                "live Agent-owned route inventory cannot be safely modified",
+            )
+        })
+    })
+    .await
+    .map_err(|_| PendingResponseError::internal("network planner is unavailable"))?
 }
 
 fn openwrt_network_write_supported(state: &AppState) -> Result<(), PendingResponseError> {
@@ -1611,9 +1740,10 @@ async fn apply_network_change(
     now: u64,
     state: &AppState,
 ) -> ServerResponse {
-    if let Err(error) = openwrt_network_write_supported(state) {
-        return error.with_id(id);
-    }
+    let backend = match network_write_backend(state) {
+        Ok(backend) => backend,
+        Err(error) => return error.with_id(id),
+    };
     let execution = match load_network_execution_plan(&record, state).await {
         Ok(execution) if execution.preview == preview => execution,
         Ok(_) => {
@@ -1632,6 +1762,10 @@ async fn apply_network_change(
             "daemon configuration must exist before arming the rollback helper",
         );
     }
+    let canonical_state = match canonical_for_network_backend(backend, state).await {
+        Ok(canonical) => canonical,
+        Err(error) => return error.with_id(id),
+    };
     let token_digest = sha256_hex(approval_token.expose().as_bytes());
     if let Err(error) =
         consume_change_approval(approval_id, token_digest, record.clone(), now, state).await
@@ -1640,12 +1774,15 @@ async fn apply_network_change(
     }
     drop(approval_token);
     let deadline = rollback_deadline(now, state);
-    let port_config = openwrt_network_port_config(record.clone(), execution, now, state);
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut port = OpenWrtNetworkExecutionPort::apply(port_config)?;
-        execute_approved_change(&mut port, now, deadline, true)
-            .map_err(|_| agent_core::ExecutionPortError)
-    })
+    let outcome = execute_network_change(
+        backend,
+        record.clone(),
+        execution,
+        canonical_state,
+        now,
+        deadline,
+        state,
+    )
     .await;
     execution_response(id, &record.id, outcome, "network configuration", state).await
 }
@@ -1657,9 +1794,10 @@ async fn confirm_network_change_request(
     now: u64,
     state: &AppState,
 ) -> ServerResponse {
-    if let Err(error) = openwrt_network_write_supported(state) {
-        return error.with_id(id);
-    }
+    let backend = match network_write_backend(state) {
+        Ok(backend) => backend,
+        Err(error) => return error.with_id(id),
+    };
     let execution = match load_network_execution_plan(&record, state).await {
         Ok(execution) if execution.preview == preview => execution,
         Ok(_) => {
@@ -1671,11 +1809,18 @@ async fn confirm_network_change_request(
         }
         Err(error) => return error.with_id(id),
     };
-    let port_config = openwrt_network_port_config(record.clone(), execution, now, state);
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut port = OpenWrtNetworkExecutionPort::confirmation(port_config);
-        confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
-    })
+    let canonical_state = match canonical_for_network_backend(backend, state).await {
+        Ok(canonical) => canonical,
+        Err(error) => return error.with_id(id),
+    };
+    let outcome = confirm_network_change(
+        backend,
+        record.clone(),
+        execution,
+        canonical_state,
+        now,
+        state,
+    )
     .await;
     execution_response(
         id,
@@ -1736,6 +1881,92 @@ fn openwrt_network_port_config(
         rollback_timeout_secs: state.config.runtime.rollback_confirm_timeout_secs,
         max_rollback_bytes: state.config.storage.max_rollback_bytes,
         execution,
+    }
+}
+
+fn generic_runtime_route_port_config(
+    record: ChangeSetRecord,
+    execution: NetworkExecutionPlan,
+    canonical_state: Option<Vec<u8>>,
+    now_monotonic_ms: u64,
+    state: &AppState,
+) -> GenericRuntimeRouteExecutionPortConfig {
+    GenericRuntimeRouteExecutionPortConfig {
+        runner: firewall_command_runner(state),
+        execution,
+        canonical_state,
+        store: Arc::clone(&state.store),
+        runtime_root: state.budget.root().to_path_buf(),
+        config_path: state.config_path.clone(),
+        change_set_id: record.id,
+        plan_digest: record.plan_digest,
+        boot_id: record.boot_id,
+        now_monotonic_ms,
+        rollback_timeout_secs: state.config.runtime.rollback_confirm_timeout_secs,
+        max_rollback_bytes: state.config.storage.max_rollback_bytes,
+        max_state_bytes: usize::try_from(state.config.storage.max_network_state_bytes)
+            .unwrap_or(usize::MAX),
+    }
+}
+
+async fn execute_network_change(
+    backend: WritableNetworkBackend,
+    record: ChangeSetRecord,
+    execution: NetworkExecutionPlan,
+    canonical_state: Option<Vec<u8>>,
+    now: u64,
+    deadline: u64,
+    state: &AppState,
+) -> ExecutionWorkerResult {
+    match backend {
+        WritableNetworkBackend::OpenWrt => {
+            let config = openwrt_network_port_config(record, execution, now, state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = OpenWrtNetworkExecutionPort::apply(config)?;
+                execute_approved_change(&mut port, now, deadline, true)
+                    .map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+        WritableNetworkBackend::GenericRuntimeRoutes => {
+            let config =
+                generic_runtime_route_port_config(record, execution, canonical_state, now, state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = GenericRuntimeRouteExecutionPort::apply(config)?;
+                execute_approved_change(&mut port, now, deadline, true)
+                    .map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+    }
+}
+
+async fn confirm_network_change(
+    backend: WritableNetworkBackend,
+    record: ChangeSetRecord,
+    execution: NetworkExecutionPlan,
+    canonical_state: Option<Vec<u8>>,
+    now: u64,
+    state: &AppState,
+) -> ExecutionWorkerResult {
+    match backend {
+        WritableNetworkBackend::OpenWrt => {
+            let config = openwrt_network_port_config(record, execution, now, state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = OpenWrtNetworkExecutionPort::confirmation(config);
+                confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
+        WritableNetworkBackend::GenericRuntimeRoutes => {
+            let config =
+                generic_runtime_route_port_config(record, execution, canonical_state, now, state);
+            tokio::task::spawn_blocking(move || {
+                let mut port = GenericRuntimeRouteExecutionPort::confirmation(config);
+                confirm_awaiting_execution(&mut port).map_err(|_| agent_core::ExecutionPortError)
+            })
+            .await
+        }
     }
 }
 
@@ -1972,6 +2203,29 @@ async fn canonical_for_backend(
         WritableFirewallBackend::GenericNftables | WritableFirewallBackend::GenericIptables
     ) {
         load_generic_firewall_state(state).await
+    } else {
+        Ok(None)
+    }
+}
+
+async fn load_generic_network_state(
+    state: &AppState,
+) -> Result<Option<Vec<u8>>, PendingResponseError> {
+    let max_state_bytes = usize::try_from(state.config.storage.max_network_state_bytes)
+        .map_err(|_| PendingResponseError::internal("network state limit is invalid"))?;
+    let store = Arc::clone(&state.store);
+    tokio::task::spawn_blocking(move || store.network_runtime_state(max_state_bytes))
+        .await
+        .map_err(|_| PendingResponseError::internal("network state is unavailable"))?
+        .map_err(|_| PendingResponseError::internal("network state is unavailable"))
+}
+
+async fn canonical_for_network_backend(
+    backend: WritableNetworkBackend,
+    state: &AppState,
+) -> Result<Option<Vec<u8>>, PendingResponseError> {
+    if backend == WritableNetworkBackend::GenericRuntimeRoutes {
+        load_generic_network_state(state).await
     } else {
         Ok(None)
     }
@@ -4725,6 +4979,67 @@ mod tests {
         assert_eq!(parse_uptime_ms("1.2349").expect("truncate sub-ms"), 1_234);
         assert!(parse_uptime_ms("-1.0").is_err());
         assert!(parse_uptime_ms("not-a-clock").is_err());
+    }
+
+    #[test]
+    fn generic_network_admission_accepts_only_enabled_owned_routes() {
+        let route = agent_protocol::NetworkRoute {
+            id: "agent-default".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            destination: agent_protocol::IpNetwork {
+                address: "0.0.0.0".parse().expect("address"),
+                prefix_len: 0,
+            },
+            gateway: Some("192.0.2.1".parse().expect("gateway")),
+            output_interface: Some("eth0".into()),
+            preferred_source: None,
+            table: 254,
+            metric: Some(100),
+            route_type: agent_protocol::NetworkRouteType::Unicast,
+        };
+        assert!(generic_runtime_route_request(
+            &NetworkMutationRequest::Create {
+                desired: NetworkObject::Route(route.clone()),
+            }
+        ));
+
+        let mut disabled = route.clone();
+        disabled.enabled = false;
+        assert!(!generic_runtime_route_request(
+            &NetworkMutationRequest::Create {
+                desired: NetworkObject::Route(disabled),
+            }
+        ));
+
+        let mut native = route.clone();
+        native.ownership = ObjectOwnership::PlatformNative;
+        assert!(!generic_runtime_route_request(
+            &NetworkMutationRequest::Update {
+                expected_digest: "a".repeat(64),
+                desired: NetworkObject::Route(native),
+            }
+        ));
+        assert!(generic_runtime_route_request(
+            &NetworkMutationRequest::Delete {
+                kind: "route".into(),
+                id: "agent-default".into(),
+                expected_digest: "a".repeat(64),
+            }
+        ));
+        assert!(!generic_runtime_route_request(
+            &NetworkMutationRequest::Delete {
+                kind: "interface".into(),
+                id: "eth0".into(),
+                expected_digest: "a".repeat(64),
+            }
+        ));
+        assert!(!generic_runtime_route_request(
+            &NetworkMutationRequest::Move {
+                expected_digest: "a".repeat(64),
+                desired: NetworkObject::Route(route),
+            }
+        ));
     }
 
     #[test]

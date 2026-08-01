@@ -363,15 +363,20 @@ fn restore_runtime_canonical(
     config: &agent_core::AgentConfig,
     canonical: agent_core::RuntimeCanonicalSnapshot,
 ) -> Result<(), Box<dyn Error>> {
-    let max_state_bytes = usize::try_from(config.storage.max_firewall_state_bytes)?;
     let store = agent_store::Store::open(&config.storage.path, config.storage.max_database_bytes)?;
     match canonical {
         agent_core::RuntimeCanonicalSnapshot::Present(payload) => {
-            store.replace_firewall_runtime_state(&payload, max_state_bytes)?;
+            store.replace_firewall_runtime_state(
+                &payload,
+                usize::try_from(config.storage.max_firewall_state_bytes)?,
+            )?;
         }
         agent_core::RuntimeCanonicalSnapshot::Absent => store.clear_firewall_runtime_state()?,
         agent_core::RuntimeCanonicalSnapshot::NetworkPresent(payload) => {
-            store.replace_network_runtime_state(&payload, max_state_bytes)?;
+            store.replace_network_runtime_state(
+                &payload,
+                usize::try_from(config.storage.max_network_state_bytes)?,
+            )?;
         }
         agent_core::RuntimeCanonicalSnapshot::NetworkAbsent => {
             store.clear_network_runtime_state()?;

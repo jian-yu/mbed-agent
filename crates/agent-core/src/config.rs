@@ -186,10 +186,12 @@ fn storage_record_limits_valid(storage: &StorageConfig) -> bool {
         && storage.max_diagnostic_record_bytes > 0
         && storage.max_change_plan_bytes > 0
         && storage.max_firewall_state_bytes > 0
+        && storage.max_network_state_bytes > 0
         && storage.max_firewall_execution_plan_bytes > 0
         && storage.max_diagnostic_record_bytes <= storage.max_database_bytes
         && storage.max_change_plan_bytes <= storage.max_database_bytes
         && storage.max_firewall_state_bytes <= storage.max_database_bytes
+        && storage.max_network_state_bytes <= storage.max_database_bytes
         && storage.max_firewall_execution_plan_bytes <= storage.max_database_bytes
 }
 
@@ -455,6 +457,7 @@ pub struct StorageConfig {
     pub max_change_set_records: u32,
     pub max_change_plan_bytes: u64,
     pub max_firewall_state_bytes: u64,
+    pub max_network_state_bytes: u64,
     pub max_firewall_execution_plan_bytes: u64,
 }
 
@@ -477,6 +480,7 @@ impl Default for StorageConfig {
             max_change_set_records: 32,
             max_change_plan_bytes: 64 * 1024,
             max_firewall_state_bytes: 256 * 1024,
+            max_network_state_bytes: 256 * 1024,
             max_firewall_execution_plan_bytes: 256 * 1024,
         }
     }
@@ -634,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn volatile_firewall_state_must_fit_database_budget() {
+    fn volatile_runtime_state_must_fit_database_budget() {
         let mut config = AgentConfig::default();
         config.storage.max_firewall_state_bytes = 0;
         assert!(config.validate().is_err());
@@ -643,6 +647,13 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.storage.max_firewall_state_bytes = 1024;
+        config.storage.max_network_state_bytes = 0;
+        assert!(config.validate().is_err());
+
+        config.storage.max_network_state_bytes = config.storage.max_database_bytes + 1;
+        assert!(config.validate().is_err());
+
+        config.storage.max_network_state_bytes = 1024;
         config.storage.max_firewall_execution_plan_bytes = 0;
         assert!(config.validate().is_err());
 

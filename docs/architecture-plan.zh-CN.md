@@ -556,6 +556,7 @@ max_diagnostic_record_bytes = 32768
 max_change_set_records = 32
 max_change_plan_bytes = 65536
 max_firewall_state_bytes = 262144
+max_network_state_bytes = 262144
 max_firewall_execution_plan_bytes = 262144
 
 [auth]
@@ -1256,7 +1257,15 @@ rollback-armed activate → verify 的强制顺序。正向与逆向 batch 以 0
 但最终非零状态仍记为 rollback failure。canonical result 显式区分 firewall/network，
 native rollback 成功后才恢复或清理独立 `network_runtime_state_v1` SQLite key。现有
 first-decision-wins、超时、即时 rollback、durable outcome 与子进程超时保持不变。
-下一切片只需接 daemon execution port 与公共 ChangeSet admission。
+
+截至 ADR 0049，generic Linux 易失 route 已接入 daemon 公共 ChangeSet 生命周期。
+`network-inventory` 将普通 interface/route 的只读 platform-native 视图与通过 boot-bound
+canonical 严格对账的 protocol-186 Agent-owned route 合并；`network-plan` 在该后端仅接收
+enabled Agent-owned typed route，interface、address、policy rule、普通 route 以及持久
+NetworkManager/systemd-networkd 文件仍拒绝写入。所有变更强制 R3，经过 device-admin、
+一次性 approval、全局串行执行、fixed `ip -batch` transaction、进程外逆向 batch、live
+typed verify 和显式 confirm。canonical 只进入有界 `/tmp` SQLite，设备重启不恢复、也
+不回写 Flash。
 
 ## 21. 参考项目与官方资料
 

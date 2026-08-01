@@ -156,6 +156,9 @@ pub fn inspect_runtime_network_inventory(
     }
 
     for route in &routes {
+        if owned_protocol(route.get("protocol")) {
+            continue;
+        }
         if let Some(route) = route_object(route)? {
             if !seen.insert(route.id.clone()) {
                 return Err(RuntimeNetworkInventoryError::Malformed);
@@ -594,6 +597,22 @@ mod tests {
         )
         .expect("inventory");
         assert_eq!(inventory.objects.len(), 1);
+    }
+
+    #[test]
+    fn public_runtime_inventory_excludes_protocol_owned_routes() {
+        let inventory = inspect_runtime_network_inventory(
+            "[]",
+            "[]",
+            r#"[{"dst":"192.0.2.0/24","dev":"eth0","protocol":186},{"dst":"198.51.100.0/24","dev":"eth0","protocol":"186"},{"dst":"203.0.113.0/24","dev":"eth0","protocol":"static"}]"#,
+        )
+        .expect("inventory");
+        assert_eq!(inventory.objects.len(), 1);
+        let NetworkObject::Route(route) = &inventory.objects[0] else {
+            panic!("route expected");
+        };
+        assert_eq!(route.destination.address.to_string(), "203.0.113.0");
+        assert_eq!(route.ownership, ObjectOwnership::PlatformNative);
     }
 
     #[test]
