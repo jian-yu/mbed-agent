@@ -20,6 +20,7 @@ const MAX_IPTABLES_SAVE_BYTES: u64 = 256 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum RollbackTarget {
     OpenWrtFirewall,
+    OpenWrtNetwork,
     LinuxNftablesManaged,
     LinuxNftablesRuntime,
     LinuxFirewallCanonical,
@@ -33,6 +34,7 @@ impl RollbackTarget {
     fn path(self) -> Option<&'static Path> {
         match self {
             Self::OpenWrtFirewall => Some(Path::new("/etc/config/firewall")),
+            Self::OpenWrtNetwork => Some(Path::new("/etc/config/network")),
             Self::LinuxNftablesManaged => Some(Path::new("/etc/mbed-agent/managed/firewall.nft")),
             Self::LinuxNftablesRuntime
             | Self::LinuxFirewallCanonical
@@ -48,6 +50,7 @@ impl RollbackTarget {
 #[serde(rename_all = "snake_case")]
 pub enum RollbackReload {
     OpenWrtFirewall,
+    OpenWrtNetwork,
     LinuxNftables,
     LinuxNftablesRuntime,
     LinuxIptablesRuntime,
@@ -871,6 +874,10 @@ fn execute_reload(
             PathBuf::from("/etc/init.d/firewall"),
             vec![PathBuf::from("reload")],
         ),
+        RollbackReload::OpenWrtNetwork => (
+            PathBuf::from("/etc/init.d/network"),
+            vec![PathBuf::from("reload")],
+        ),
         RollbackReload::LinuxNftables => (
             resolve_fixed_program("nft")?,
             vec![
@@ -1201,6 +1208,9 @@ fn targets_match_reload(targets: &HashSet<RollbackTarget>, reload: RollbackReloa
         RollbackReload::OpenWrtFirewall => {
             targets == &HashSet::from([RollbackTarget::OpenWrtFirewall])
         }
+        RollbackReload::OpenWrtNetwork => {
+            targets == &HashSet::from([RollbackTarget::OpenWrtNetwork])
+        }
         RollbackReload::LinuxNftables => {
             targets == &HashSet::from([RollbackTarget::LinuxNftablesManaged])
         }
@@ -1414,6 +1424,48 @@ mod tests {
         .expect("watchdog");
         assert_eq!(fs::read(&target).expect("target"), b"after");
         assert!(!root.join("rollback/txn-confirm").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn openwrt_network_bundle_restores_config_before_reload() {
+        let root = test_root("openwrt-network");
+        let rollback = root.join("rollback");
+        let target = root.join("network");
+        fs::write(&target, b"config-before").expect("target");
+        let bundle = create_bundle_with(
+            &rollback,
+            "txn-openwrt-network",
+            &[RollbackTarget::OpenWrtNetwork],
+            RollbackReload::OpenWrtNetwork,
+            5,
+            1024,
+            |_| target.clone(),
+        )
+        .expect("bundle");
+        fs::write(&target, b"config-after").expect("activation");
+        request_rollback(&rollback, "txn-openwrt-network").expect("request rollback");
+        let reload_called = Cell::new(false);
+        run_helper_with(
+            &rollback,
+            "txn-openwrt-network",
+            1024,
+            |_| target.clone(),
+            |reload, _, _| {
+                assert_eq!(reload, RollbackReload::OpenWrtNetwork);
+                assert_eq!(fs::read(&target).expect("restored first"), b"config-before");
+                reload_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("helper");
+        assert!(reload_called.get());
+        assert_eq!(fs::read(&target).expect("restored"), b"config-before");
+        assert_eq!(
+            rollback_outcome(&rollback, "txn-openwrt-network").expect("outcome"),
+            RollbackOutcome::RolledBack
+        );
+        assert!(bundle.directory.join("rolled-back").is_file());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

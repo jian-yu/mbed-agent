@@ -99,8 +99,10 @@ supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
 is implemented. OpenWrt 21+ additionally has fresh UCI network inventory and
 bounded `/tmp` staging for the initial interface/Bridge/VLAN/route/policy-rule
-subset; host network writes remain closed until semantic preflight and
-independent rollback are complete. The local CLI exposes
+subset. The native OpenWrt network transaction and independent
+`/etc/config/network` rollback target are implemented, but host network writes
+remain closed at the public admission layer until daemon/CLI is connected to
+the common R3 confirmed-commit lifecycle. The local CLI exposes
 actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
 apply, and confirmed commit for supported firewall backends. The configuration
 roadmap is intentionally broader than a
@@ -141,6 +143,9 @@ payload boundary are recorded in
 OpenWrt fresh network UCI inventory, ownership binding, capability narrowing,
 and non-installing staging are recorded in
 [ADR 0042](docs/adr/0042-openwrt-network-inventory-staging.md).
+The OpenWrt network install/reload/verify transaction and independent rollback
+target are recorded in
+[ADR 0043](docs/adr/0043-openwrt-network-transaction-rollback.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:

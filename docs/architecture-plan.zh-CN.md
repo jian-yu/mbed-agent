@@ -1206,6 +1206,16 @@ section）都会参与名称冲突检查。Agent-owned 使用 `mbed_managed`/`mb
 `uci export network` 语法检查；尚未安装到 Flash 或 reload netifd，live apply 必须
 等独立回滚与 confirmed-commit 完成后才开放。
 
+截至 ADR 0043，OpenWrt network native transaction 与独立回滚目标已经完成。执行器
+重新读取 live UCI 与 root-owned `/etc/config/network`，在私有 `/tmp` 目录应用固定
+batch，要求 staged typed inventory 与审批投影一致，并执行固定 `uci export network`
+检查。安装前再次同时比较原始 UCI bytes 与文件 SHA-256，随后通过同目录临时文件、
+fsync、atomic rename 安装并固定 reload network；reload 后重新构建 typed inventory
+验证。独立 helper 新增 `/etc/config/network` 精确 target，恢复时先校验 snapshot、
+原子恢复并同步文件，再 reload network，继续使用 confirm/rollback first-decision-wins
+协议。daemon/CLI 写入口仍关闭；下一步把 transaction port 接入 R3 device-admin、
+one-use approval、失败即时回滚、超时与 confirmed-commit 状态机。
+
 ## 21. 参考项目与官方资料
 
 - [Grok Build 官方仓库](https://github.com/xai-org/grok-build)：Rust workspace 中 runtime、tools、workspace、TUI/入口分层可供参考；不建议照搬其桌面端体量。
