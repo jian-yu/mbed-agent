@@ -21,6 +21,7 @@ pub enum Command {
     Ping,
     Status,
     Capabilities,
+    ChannelStatus,
     ActionList,
     ActionReload,
     ActionRun {
@@ -173,6 +174,7 @@ pub enum ResponseData {
     Pong { daemon_version: String },
     Status(StatusResponse),
     Capabilities(Value),
+    ChannelStatus(Vec<ChannelStatusEntry>),
     ActionList(Vec<ActionDescriptor>),
     ActionReload(ActionReloadResponse),
     ActionOutput(ActionOutputResponse),
@@ -248,6 +250,13 @@ pub struct ActionDescriptor {
     pub llm_enabled: bool,
     pub platforms: Vec<String>,
     pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelStatusEntry {
+    pub channel: String,
+    pub enabled: bool,
+    pub lifecycle: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1681,6 +1690,7 @@ mod tests {
     #[test]
     fn command_round_trip_is_stable() {
         for command in [
+            Command::ChannelStatus,
             Command::DiagnoseWan { active: true },
             Command::DiagnoseDns,
             Command::DiagnoseDhcp,

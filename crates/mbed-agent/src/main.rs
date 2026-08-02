@@ -17,6 +17,7 @@ mod action_execution;
 mod daemon;
 mod firewall_execution;
 mod logging;
+mod mqtt_channel;
 mod network_execution;
 
 #[derive(Debug, Parser)]
@@ -47,6 +48,11 @@ enum CliCommand {
     Capabilities {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
+    },
+    /// Inspect configured channel lifecycle state.
+    Channel {
+        #[command(subcommand)]
+        target: ChannelTarget,
     },
     /// List, reload, or execute declarative user/vendor actions.
     Action {
@@ -113,6 +119,15 @@ enum ActionTarget {
         action_id: String,
         #[arg(long, default_value = "{}")]
         inputs: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ChannelTarget {
+    /// Show whether each channel is disabled, connecting, online, or backing off.
+    Status {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
@@ -282,6 +297,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Ping { socket } => run_client(&socket, Command::Ping).await,
         CliCommand::Status { socket } => run_client(&socket, Command::Status).await,
         CliCommand::Capabilities { socket } => run_client(&socket, Command::Capabilities).await,
+        CliCommand::Channel {
+            target: ChannelTarget::Status { socket },
+        } => run_client(&socket, Command::ChannelStatus).await,
         CliCommand::Action { target } => run_action_target(target).await,
         CliCommand::Ask { prompt, socket } => {
             run_client(&socket, Command::Complete { prompt }).await

@@ -68,6 +68,25 @@ pub struct ApprovalRecord {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelMessageClaim {
+    New,
+    Pending,
+    Completed {
+        response_topic: String,
+        response_payload: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChannelResponse {
+    pub channel: String,
+    pub message_id: String,
+    pub response_topic: String,
+    pub response_payload: Vec<u8>,
+    pub attempts: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ApprovalConsumption<'a> {
     pub approval_id: &'a str,
@@ -138,6 +157,197 @@ impl Store {
             Ok(())
         } else {
             Err(StoreError::Integrity(result))
+        }
+    }
+
+    /// Atomically claims an inbound channel message or returns its cached state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, exhausted record capacity, or `SQLite` failure.
+    pub fn claim_channel_message(
+        &self,
+        channel: &str,
+        message_id: &str,
+        expires_unix_ms: i64,
+        now_unix_ms: i64,
+        max_records: u32,
+    ) -> Result<ChannelMessageClaim, StoreError> {
+        validate_bounded_field("channel", channel, 32)?;
+        validate_bounded_field("channel.message_id", message_id, 128)?;
+        if expires_unix_ms <= now_unix_ms || max_records == 0 {
+            return Err(StoreError::ChannelMessageRejected);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(StoreError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM channel_messages WHERE expires_unix_ms <= ?1",
+                [now_unix_ms],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let existing = transaction
+            .query_row(
+                "SELECT response_topic, response_payload FROM channel_messages
+                 WHERE channel = ?1 AND message_id = ?2",
+                params![channel, message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if let Some((topic, payload)) = existing {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return match (topic, payload) {
+                (Some(response_topic), Some(response_payload)) => {
+                    Ok(ChannelMessageClaim::Completed {
+                        response_topic,
+                        response_payload,
+                    })
+                }
+                (None, None) => Ok(ChannelMessageClaim::Pending),
+                _ => Err(StoreError::ChannelMessageRejected),
+            };
+        }
+        let count: u32 = transaction
+            .query_row("SELECT count(*) FROM channel_messages", [], |row| {
+                row.get(0)
+            })
+            .map_err(StoreError::Sqlite)?;
+        if count >= max_records {
+            return Err(StoreError::ChannelCapacity);
+        }
+        transaction
+            .execute(
+                "INSERT INTO channel_messages
+                 (channel, message_id, expires_unix_ms, attempts, next_attempt_unix_ms, created_at)
+                 VALUES (?1, ?2, ?3, 0, 0, unixepoch())",
+                params![channel, message_id, expires_unix_ms],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ChannelMessageClaim::New)
+    }
+
+    /// Attaches one bounded response to an exact claimed channel message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized output, missing/expired claims, or `SQLite` failure.
+    pub fn complete_channel_message(
+        &self,
+        channel: &str,
+        message_id: &str,
+        response_topic: &str,
+        response_payload: &[u8],
+        max_payload_bytes: usize,
+        now_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        validate_bounded_field("channel", channel, 32)?;
+        validate_bounded_field("channel.message_id", message_id, 128)?;
+        validate_bounded_field("channel.response_topic", response_topic, 512)?;
+        if response_payload.is_empty() || response_payload.len() > max_payload_bytes {
+            return Err(StoreError::PayloadTooLarge {
+                actual: response_payload.len(),
+                limit: max_payload_bytes,
+            });
+        }
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE channel_messages
+                 SET response_topic = ?1, response_payload = ?2, next_attempt_unix_ms = ?3
+                 WHERE channel = ?4 AND message_id = ?5 AND response_payload IS NULL
+                   AND expires_unix_ms > ?3",
+                params![
+                    response_topic,
+                    response_payload,
+                    now_unix_ms,
+                    channel,
+                    message_id
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::ChannelMessageRejected)
+        }
+    }
+
+    /// Returns bounded responses whose `QoS` publication should be retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt/oversized stored payloads or `SQLite` failure.
+    pub fn pending_channel_responses(
+        &self,
+        channel: &str,
+        now_unix_ms: i64,
+        limit: u16,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<PendingChannelResponse>, StoreError> {
+        validate_bounded_field("channel", channel, 32)?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT channel, message_id, response_topic, response_payload, attempts
+                 FROM channel_messages
+                 WHERE channel = ?1 AND response_payload IS NOT NULL
+                   AND expires_unix_ms > ?2 AND next_attempt_unix_ms <= ?2 AND attempts < 10
+                 ORDER BY created_at, rowid LIMIT ?3",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let rows = statement
+            .query_map(params![channel, now_unix_ms, limit], |row| {
+                Ok(PendingChannelResponse {
+                    channel: row.get(0)?,
+                    message_id: row.get(1)?,
+                    response_topic: row.get(2)?,
+                    response_payload: row.get(3)?,
+                    attempts: row.get(4)?,
+                })
+            })
+            .map_err(StoreError::Sqlite)?;
+        let records = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        if records
+            .iter()
+            .any(|record| record.response_payload.len() > max_payload_bytes)
+        {
+            return Err(StoreError::ChannelMessageRejected);
+        }
+        Ok(records)
+    }
+
+    /// Records one bounded publication attempt and schedules a later retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the message disappeared or `SQLite` cannot update it.
+    pub fn record_channel_response_attempt(
+        &self,
+        channel: &str,
+        message_id: &str,
+        next_attempt_unix_ms: i64,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE channel_messages SET attempts = attempts + 1, next_attempt_unix_ms = ?1
+                 WHERE channel = ?2 AND message_id = ?3 AND response_payload IS NOT NULL",
+                params![next_attempt_unix_ms, channel, message_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::ChannelMessageRejected)
         }
     }
 
@@ -1128,7 +1338,21 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
              );
              CREATE INDEX IF NOT EXISTS approvals_change_set_id
                  ON approvals(change_set_id);
-             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1), (2), (3), (4), (5);",
+             CREATE TABLE IF NOT EXISTS channel_messages (
+                 channel TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 expires_unix_ms INTEGER NOT NULL,
+                 response_topic TEXT,
+                 response_payload BLOB,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 next_attempt_unix_ms INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 PRIMARY KEY(channel, message_id),
+                 CHECK((response_topic IS NULL) = (response_payload IS NULL))
+             );
+             CREATE INDEX IF NOT EXISTS channel_messages_retry
+                 ON channel_messages(channel, next_attempt_unix_ms, created_at);
+             INSERT OR IGNORE INTO schema_migrations(version) VALUES (1), (2), (3), (4), (5), (7);",
         )
         .map_err(StoreError::Sqlite)?;
     let domain_migration_applied: bool = connection
@@ -1391,6 +1615,10 @@ pub enum StoreError {
     InvalidRollbackDeadline,
     #[error("approval was rejected")]
     ApprovalRejected,
+    #[error("channel message capacity has been reached")]
+    ChannelCapacity,
+    #[error("channel message claim or response was rejected")]
+    ChannelMessageRejected,
 }
 
 #[cfg(test)]
@@ -1412,6 +1640,62 @@ mod tests {
         assert!(store.database_bytes() > 0);
         drop(store);
         fs::remove_dir_all(root).expect("remove store test directory");
+    }
+
+    #[test]
+    fn channel_claim_deduplicates_and_retains_bounded_retry_output() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-agent-channel-{nonce}"));
+        let store = Store::open(&root.join("agent.db"), 1024 * 1024).expect("open store");
+        assert_eq!(
+            store
+                .claim_channel_message("mqtt", "message-1", 10_000, 1_000, 4)
+                .expect("claim"),
+            ChannelMessageClaim::New
+        );
+        assert_eq!(
+            store
+                .claim_channel_message("mqtt", "message-1", 10_000, 1_001, 4)
+                .expect("duplicate"),
+            ChannelMessageClaim::Pending
+        );
+        store
+            .complete_channel_message(
+                "mqtt",
+                "message-1",
+                "responses/message-1",
+                b"response",
+                32,
+                1_002,
+            )
+            .expect("complete");
+        assert_eq!(
+            store
+                .claim_channel_message("mqtt", "message-1", 10_000, 1_003, 4)
+                .expect("cached"),
+            ChannelMessageClaim::Completed {
+                response_topic: "responses/message-1".into(),
+                response_payload: b"response".to_vec(),
+            }
+        );
+        let pending = store
+            .pending_channel_responses("mqtt", 1_003, 4, 32)
+            .expect("pending response");
+        assert_eq!(pending.len(), 1);
+        store
+            .record_channel_response_attempt("mqtt", "message-1", 2_003)
+            .expect("attempt");
+        assert!(
+            store
+                .pending_channel_responses("mqtt", 1_004, 4, 32)
+                .expect("delayed")
+                .is_empty()
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("remove channel test directory");
     }
 
     #[test]

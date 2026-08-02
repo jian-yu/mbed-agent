@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agent_channels::{ChannelCommand, ChannelResponse, DiagnosticTarget};
 use agent_core::{
     ActionChangeDomain, ActionMode, ActionRegistry, AdminPasswordVerifier, AgentConfig, AuthError,
     AuthManager, FirewallExecutionPlan, FirewallMutation, FirewallRiskContext,
@@ -18,7 +19,7 @@ use agent_core::{
 };
 use agent_protocol::{
     ActionDescriptor, ActionReloadResponse, ChangeApprovalResponse, ChangePlan, ChangeSetResponse,
-    ChangeSetState, ClientRequest, Command, CompletionResponse, ConfigDomain,
+    ChangeSetState, ChannelStatusEntry, ClientRequest, Command, CompletionResponse, ConfigDomain,
     DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry, FirewallInventoryResponse,
     FirewallMutationRequest, FirewallObject, NetworkInventoryEntry, NetworkInventoryResponse,
     NetworkMutationRequest, NetworkObject, ObjectOwnership, PROTOCOL_VERSION, ResponseData,
@@ -62,6 +63,7 @@ use crate::firewall_execution::{
     GenericNftablesExecutionPortConfig, OpenWrtExecutionPort, OpenWrtExecutionPortConfig,
 };
 use crate::logging;
+use crate::mqtt_channel::{self, MqttInbound};
 use crate::network_execution::{
     GenericRuntimeRouteExecutionPort, GenericRuntimeRouteExecutionPortConfig,
     OpenWrtNetworkExecutionPort, OpenWrtNetworkExecutionPortConfig,
@@ -86,6 +88,7 @@ struct AppState {
     configuration_lock: Mutex<()>,
     actions: RwLock<ActionRegistry>,
     action_slots: Semaphore,
+    mqtt_status: Option<tokio::sync::watch::Receiver<agent_channels::ChannelLifecycle>>,
 }
 
 #[allow(clippy::too_many_lines)] // Startup keeps all bounded runtime resources visibly assembled.
@@ -145,6 +148,13 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let llm = build_llm_provider(&config)?;
     let llm_slots = Semaphore::new(config.runtime.max_active_tasks);
     let listener = bind_socket(&config.server.socket_path, config.server.socket_mode)?;
+    let mqtt_runtime = mqtt_channel::start(
+        config.channels.mqtt.clone(),
+        Arc::clone(&store),
+        config.storage.max_channel_message_records,
+        usize::try_from(config.storage.max_channel_payload_bytes)?,
+    )?;
+    let mqtt_status = mqtt_runtime.as_ref().map(|runtime| runtime.status.clone());
     let state = Arc::new(AppState {
         config,
         config_path: config_path.to_path_buf(),
@@ -161,7 +171,18 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         configuration_lock: Mutex::new(()),
         actions: RwLock::new(actions),
         action_slots,
+        mqtt_status,
     });
+    if let Some(mut runtime) = mqtt_runtime {
+        let channel_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(message) = runtime.inbound.recv().await {
+                let state = Arc::clone(&channel_state);
+                tokio::spawn(handle_mqtt_inbound(message, state));
+            }
+            warn!("MQTT inbound dispatcher stopped");
+        });
+    }
     let mut cleanup_interval =
         tokio::time::interval(Duration::from_secs(state.budget.cleanup_interval_secs()));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -203,7 +224,9 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Result<()> {
-    if (!config.llm.enabled && !config.auth.enabled) || !path.exists() {
+    let mqtt_credentials = config.channels.mqtt.enabled
+        && (!config.channels.mqtt.username.is_empty() || !config.channels.mqtt.password.is_empty());
+    if (!config.llm.enabled && !config.auth.enabled && !mqtt_credentials) || !path.exists() {
         return Ok(());
     }
     let mode = fs::metadata(path)?.permissions().mode();
@@ -217,6 +240,71 @@ fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Re
         ));
     }
     Ok(())
+}
+
+async fn handle_mqtt_inbound(inbound: MqttInbound, state: Arc<AppState>) {
+    let message_id = inbound.request.message_id.clone();
+    let actor_id = inbound.request.actor_id.clone();
+    let response = dispatch_channel_request(inbound.request, &state).await;
+    if inbound.respond_to.send(response).is_err() {
+        warn!(%message_id, "MQTT response receiver disappeared");
+    } else {
+        info!(%message_id, %actor_id, "MQTT read-only request completed");
+    }
+}
+
+async fn dispatch_channel_request(
+    request: agent_channels::ChannelRequest,
+    state: &AppState,
+) -> ChannelResponse {
+    let message_id = request.message_id;
+    let internal_id = format!("mqtt:{message_id}");
+    let response = match request.command {
+        ChannelCommand::Ping => ServerResponse::success(
+            internal_id,
+            ResponseData::Pong {
+                daemon_version: AGENT_VERSION.into(),
+            },
+        ),
+        ChannelCommand::Status => ServerResponse::success(internal_id, status_response(state)),
+        ChannelCommand::Ask { text } => handle_completion(internal_id, text, state).await,
+        ChannelCommand::Diagnose { target } => match target {
+            DiagnosticTarget::Wan => handle_wan_diagnosis(internal_id, false, state).await,
+            DiagnosticTarget::Dns => handle_dns_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Dhcp => handle_dhcp_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Routes => handle_route_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Interfaces => handle_interface_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Neighbors => handle_neighbor_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Firewall => handle_firewall_diagnosis(internal_id, state).await,
+            DiagnosticTarget::PolicyRouting => {
+                handle_policy_routing_diagnosis(internal_id, state).await
+            }
+            DiagnosticTarget::Listeners => handle_listener_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Wireless => handle_wireless_diagnosis(internal_id, state).await,
+            DiagnosticTarget::InterfaceStats => {
+                handle_interface_stats_diagnosis(internal_id, state).await
+            }
+            DiagnosticTarget::Conntrack => handle_conntrack_diagnosis(internal_id, state).await,
+            DiagnosticTarget::Qdisc => handle_qdisc_diagnosis(internal_id, state).await,
+        },
+    };
+    if response.ok {
+        match response
+            .result
+            .and_then(|result| serde_json::to_value(result).ok())
+        {
+            Some(result) => ChannelResponse::success(message_id, result),
+            None => ChannelResponse::error(
+                message_id,
+                "internal",
+                "the device could not encode the response",
+            ),
+        }
+    } else if let Some(error) = response.error {
+        ChannelResponse::error(message_id, error.code.as_str(), &error.message)
+    } else {
+        ChannelResponse::error(message_id, "internal", "the device request failed")
+    }
 }
 
 fn discover_boot_id() -> io::Result<String> {
@@ -406,6 +494,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::ActionList => {
             return handle_action_list(request.id, state).await;
         }
+        Command::ChannelStatus => {
+            return handle_channel_status(request.id, state);
+        }
         Command::ActionReload => {
             return handle_action_reload(request.id, state).await;
         }
@@ -528,6 +619,33 @@ async fn handle_action_list(id: String, state: &AppState) -> ServerResponse {
         })
         .collect();
     ServerResponse::success(id, ResponseData::ActionList(descriptors))
+}
+
+fn handle_channel_status(id: String, state: &AppState) -> ServerResponse {
+    let enabled = state.config.channels.mqtt.enabled;
+    let lifecycle = state
+        .mqtt_status
+        .as_ref()
+        .map_or(agent_channels::ChannelLifecycle::Disabled, |status| {
+            *status.borrow()
+        });
+    let lifecycle = match lifecycle {
+        agent_channels::ChannelLifecycle::Unconfigured => "unconfigured",
+        agent_channels::ChannelLifecycle::Bound => "bound",
+        agent_channels::ChannelLifecycle::Connecting => "connecting",
+        agent_channels::ChannelLifecycle::Online => "online",
+        agent_channels::ChannelLifecycle::Backoff => "backoff",
+        agent_channels::ChannelLifecycle::Offline => "offline",
+        agent_channels::ChannelLifecycle::Disabled => "disabled",
+    };
+    ServerResponse::success(
+        id,
+        ResponseData::ChannelStatus(vec![ChannelStatusEntry {
+            channel: "mqtt".into(),
+            enabled,
+            lifecycle: lifecycle.into(),
+        }]),
+    )
 }
 
 async fn handle_action_plan(
@@ -5910,6 +6028,7 @@ mod tests {
             configuration_lock: Mutex::new(()),
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
+            mqtt_status: None,
             config,
         };
 
@@ -6009,6 +6128,7 @@ mod tests {
             configuration_lock: Mutex::new(()),
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
+            mqtt_status: None,
             config,
         };
         (store, state)
@@ -6100,6 +6220,33 @@ max_bytes = 32
 
         drop(state);
         drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn mqtt_dispatch_surface_is_read_only_and_returns_channel_envelopes() {
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/mqtt-dispatch-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let (_store, state) = approval_test_state(&root);
+        let response = dispatch_channel_request(
+            agent_channels::ChannelRequest {
+                schema_version: agent_channels::CHANNEL_MESSAGE_SCHEMA_VERSION,
+                message_id: "mqtt-message-1".into(),
+                actor_id: "operator-1".into(),
+                conversation_id: "conversation-1".into(),
+                expires_unix_ms: i64::MAX,
+                command: ChannelCommand::Ping,
+            },
+            &state,
+        )
+        .await;
+        assert!(response.ok);
+        assert_eq!(response.message_id, "mqtt-message-1");
+        assert_eq!(response.result.expect("result")["type"], "pong");
+        drop(state);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -6225,6 +6372,7 @@ max_bytes = 32
             configuration_lock: Mutex::new(()),
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
+            mqtt_status: None,
             config,
         };
 
@@ -6319,6 +6467,7 @@ max_bytes = 32
             configuration_lock: Mutex::new(()),
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
+            mqtt_status: None,
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
@@ -6399,6 +6548,7 @@ max_bytes = 32
             configuration_lock: Mutex::new(()),
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
+            mqtt_status: None,
             config,
         };
 

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/agent-channels",
     "crates/agent-core",
     "crates/agent-provider",
     "crates/agent-protocol",
@@ -18,6 +19,7 @@ repository = "https://github.com/jian-yu/mbed-agent"
 rust-version = "1.85"
 
 [workspace.dependencies]
+agent-channels = { path = "crates/agent-channels" }
 agent-core = { path = "crates/agent-core" }
 agent-provider = { path = "crates/agent-provider" }
 agent-protocol = { path = "crates/agent-protocol" }
@@ -28,6 +30,7 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 libc = "0.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
 ring = "0.17"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.37", default-features = false }

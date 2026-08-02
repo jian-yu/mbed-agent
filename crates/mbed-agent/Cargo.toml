@@ -11,6 +11,7 @@ default = ["bundled-sqlite"]
 bundled-sqlite = ["agent-store/bundled-sqlite"]
 
 [dependencies]
+agent-channels.workspace = true
 agent-core.workspace = true
 agent-provider.workspace = true
 agent-protocol.workspace = true
@@ -20,6 +21,7 @@ clap.workspace = true
 libc.workspace = true
 platform-linux.workspace = true
 ring.workspace = true
+rumqttc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

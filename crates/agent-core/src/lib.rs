@@ -19,7 +19,10 @@ pub use auth::{
 pub use changes::{
     ChangePlanError, ChangeTransitionError, assess_plan, plan_digest, transition_change_set,
 };
-pub use config::{AgentConfig, ConfigError, ExtensionsConfig, Profile};
+pub use config::{
+    AgentConfig, ChannelsConfig, ConfigError, ExtensionsConfig, MqttChannelConfig, Profile,
+    parse_mqtts_broker,
+};
 pub use execution::{
     ChangeExecutionError, ChangeExecutionPort, ExecutionOutcome, ExecutionPortError,
     ExecutionStage, confirm_awaiting_execution, execute_approved_change,

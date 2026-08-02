@@ -32,6 +32,8 @@ max_change_plan_bytes = 65536
 max_firewall_state_bytes = 262144
 max_network_state_bytes = 262144
 max_firewall_execution_plan_bytes = 262144
+max_channel_message_records = 64
+max_channel_payload_bytes = 32768
 
 [extensions]
 enabled = false
@@ -46,6 +48,19 @@ max_inputs = 16
 max_input_bytes = 1024
 max_output_bytes = 65536
 timeout_secs = 5
+
+[channels.mqtt]
+enabled = false
+broker = "mqtts://broker.example.com:8883"
+client_id = "mbed-agent-router-1"
+device_id = "router-1"
+username = ""
+password = ""
+keep_alive_secs = 30
+reconnect_min_secs = 1
+reconnect_max_secs = 60
+max_inflight = 8
+max_packet_bytes = 32768
 
 [logging]
 level = "info"

@@ -11,6 +11,9 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   subcommands act as its local CLI over a bounded Unix socket protocol.
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
+- An optional MQTT 5 read-only channel with TLS-only broker configuration,
+  bounded inflight/packet sizes, automatic reconnect, fixed device topics, and
+  `/tmp` SQLite request deduplication plus a bounded response outbox.
 - A bounded declarative ActionSpec registry for user and vendor extensions.
   Trusted TOML manifests add read-only commands and typed inputs without a Rust
   rebuild. Execution uses exact argv, an empty environment, fixed concurrency,
@@ -98,8 +101,10 @@ inputs into the existing firewall or network mutation protocol without a Rust
 rebuild. Tool arguments are parsed and validated on-device; model text cannot
 become a shell command or bypass ChangeSet approval.
 
-Provider routing, additional model-facing network tools, MQTT, WeCom, WeChat
-ClawBot, and Channel-facing elevation are not implemented yet. Firewall
+Provider routing, additional model-facing network tools, WeCom, WeChat ClawBot,
+MQTT mutual-TLS identity, and Channel-facing elevation are not implemented yet.
+The initial MQTT channel supports ping, status, read-only diagnostics, and ask;
+it deliberately exposes no remote configuration commands. Firewall
 configuration execution is available through the bounded ChangeSet path on
 supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
@@ -167,6 +172,8 @@ Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in
 [ADR 0051](docs/adr/0051-declarative-action-change-templates.md).
+The MQTT 5 read-only transport, deduplication, and bounded outbox are recorded in
+[ADR 0052](docs/adr/0052-mqtt-read-only-channel.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -210,6 +217,35 @@ cargo run -p mbed-agent -- diagnose qdisc
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
 cargo run -p mbed-agent -- action list
+cargo run -p mbed-agent -- channel status
+```
+
+## MQTT channel
+
+Set `[channels.mqtt].enabled = true` in the root-only daemon configuration and
+provide a unique `client_id`, `device_id`, and `mqtts://host:port` broker. The
+runtime uses the system TLS trust store, so the target image must include the CA
+that signs the broker certificate. Username and password must either both be
+set or both remain empty.
+
+The daemon subscribes to
+`mbed-agent/v1/devices/{device_id}/requests` and publishes bounded responses to
+`mbed-agent/v1/devices/{device_id}/responses/{message_id}`. Requests are
+versioned JSON with an expiry no more than ten minutes in the future; devices
+therefore need a usable wall clock. The currently accepted command types are
+`ping`, `status`, `ask`, and `diagnose`. MQTT cannot invoke Action runs,
+ChangeSet planning/apply, elevation, or raw local protocol commands in this
+slice.
+
+```json
+{
+  "schema_version": 1,
+  "message_id": "request-001",
+  "actor_id": "operator-001",
+  "conversation_id": "incident-001",
+  "expires_unix_ms": 1785661800000,
+  "command": { "type": "diagnose", "target": "dns" }
+}
 ```
 
 ## User and vendor actions

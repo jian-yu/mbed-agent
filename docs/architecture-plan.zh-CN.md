@@ -471,7 +471,12 @@ v1/tenants/{tenant}/devices/{device}/artifacts/{artifact}
 
 Envelope 使用 CBOR（设备侧默认）或 JSON（调试），包含 protocol version、message id、correlation id、deadline、nonce、payload type、content hash 和签名信息。命令 QoS 1，使用 message id 去重；遥测可按重要性使用 QoS 0/1。设置有限 inflight、指数退避 + jitter、离线 outbox 上限和过期淘汰。禁止把任意 MQTT 消息直接映射为 root 操作，服务端身份与本地 policy 都必须验证。
 
-Rust 实现可优先评估 `rumqttc`，但应封装在 adapter 后并通过真实弱网、broker 重连、session expiry、证书轮换测试后定案。
+首个 MQTT 5 只读切片已经使用 `rumqttc` 接入 daemon：只接受 TLS broker、固定 device
+topic、QoS 1、有界 packet/inflight、persistent session 和封顶指数退避。版本化 JSON envelope
+只有 ping/status/ask/闭集诊断，不存在远程写命令；`message_id` 在 `/tmp` SQLite 原子去重，
+完成响应进入有界易失 outbox 并按过期时间、重试间隔和次数上限重发。用户名/密码可选且必须
+成对配置，配置含凭据时强制 root-only。mTLS、签名 envelope、broker 弱网长稳和证书轮换仍需
+后续切片与真机验证。
 
 ### 10.3 企业微信与微信生态
 
@@ -558,6 +563,8 @@ max_change_plan_bytes = 65536
 max_firewall_state_bytes = 262144
 max_network_state_bytes = 262144
 max_firewall_execution_plan_bytes = 262144
+max_channel_message_records = 64
+max_channel_payload_bytes = 32768
 
 [extensions]
 enabled = false
@@ -602,8 +609,15 @@ timeout_secs = 60
 [channels.mqtt]
 enabled = true
 broker = "mqtts://agent.example.com:8883"
-client_id = "${device.id}"
+client_id = "mbed-agent-router-1"
+device_id = "router-1"
+username = ""
+password = ""
+keep_alive_secs = 30
+reconnect_min_secs = 1
+reconnect_max_secs = 60
 max_inflight = 8
+max_packet_bytes = 32768
 
 [channels.wechat_clawbot]
 enabled = true
@@ -1121,6 +1135,11 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 - 所有 Channel 的管理员密码提权、限速、TTL 与敏感消息旁路。
 - 多 provider 路由、配额和模型健康度。
 - Channel/Provider 协议版本兼容检查；Skill/Runbook 只随外部软件包维护流程更新。
+
+当前进度：MQTT 5 首个只读纵向切片已完成，包含 TLS-only 配置、daemon 启动自动连接、
+固定 topic、QoS 1、消息 TTL、SQLite 去重、有界 outbox、重试/退避和 CLI lifecycle status；
+仅开放 ping/status/ask/诊断。远程 device-admin、ChangeSet actor 绑定、mTLS 与签名 envelope
+尚未开放，企业微信和微信 ClawBot 仍待后续官方协议适配。
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 

@@ -23,6 +23,7 @@ pub struct AgentConfig {
     pub auth: AuthConfig,
     pub llm: LlmConfig,
     pub extensions: ExtensionsConfig,
+    pub channels: ChannelsConfig,
 }
 
 impl Default for AgentConfig {
@@ -37,6 +38,7 @@ impl Default for AgentConfig {
             auth: AuthConfig::default(),
             llm: LlmConfig::default(),
             extensions: ExtensionsConfig::default(),
+            channels: ChannelsConfig::default(),
         }
     }
 }
@@ -150,6 +152,7 @@ impl AgentConfig {
         self.auth.validate()?;
         self.llm.validate()?;
         self.extensions.validate()?;
+        self.channels.validate()?;
 
         let allocated = self
             .storage
@@ -264,6 +267,134 @@ impl ExtensionsConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelsConfig {
+    pub mqtt: MqttChannelConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MqttChannelConfig {
+    pub enabled: bool,
+    pub broker: String,
+    pub client_id: String,
+    pub device_id: String,
+    pub username: String,
+    pub password: SecretString,
+    pub keep_alive_secs: u64,
+    pub reconnect_min_secs: u64,
+    pub reconnect_max_secs: u64,
+    pub max_inflight: u16,
+    pub max_packet_bytes: usize,
+}
+
+impl Default for MqttChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            broker: "mqtts://localhost:8883".into(),
+            client_id: "mbed-agent".into(),
+            device_id: "device".into(),
+            username: String::new(),
+            password: SecretString::default(),
+            keep_alive_secs: 30,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 60,
+            max_inflight: 8,
+            max_packet_bytes: 32 * 1024,
+        }
+    }
+}
+
+impl ChannelsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.mqtt.validate()
+    }
+}
+
+impl MqttChannelConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(5..=300).contains(&self.keep_alive_secs)
+            || self.reconnect_min_secs == 0
+            || self.reconnect_min_secs > self.reconnect_max_secs
+            || self.reconnect_max_secs > 300
+            || self.max_inflight == 0
+            || self.max_inflight > 64
+            || !(1024..=32 * 1024).contains(&self.max_packet_bytes)
+            || !valid_channel_identifier(&self.client_id)
+            || !valid_channel_identifier(&self.device_id)
+            || self.username.len() > 256
+            || self.username.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Validation(
+                "MQTT channel identifiers, reconnect limits, inflight count, or packet size are invalid"
+                    .into(),
+            ));
+        }
+        let has_username = !self.username.is_empty();
+        let has_password = !self.password.is_empty();
+        if has_username != has_password {
+            return Err(ConfigError::Validation(
+                "MQTT username and password must either both be configured or both be empty".into(),
+            ));
+        }
+        if self.enabled {
+            parse_mqtts_broker(&self.broker)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses the deliberately narrow production MQTT broker form.
+///
+/// # Errors
+///
+/// Returns an error unless the value is `mqtts://host:port` without userinfo,
+/// paths, queries, fragments, whitespace, or MQTT topic metacharacters.
+pub fn parse_mqtts_broker(value: &str) -> Result<(&str, u16), ConfigError> {
+    let authority = value.strip_prefix("mqtts://").ok_or_else(|| {
+        ConfigError::Validation("enabled MQTT broker must use mqtts:// TLS".into())
+    })?;
+    if authority.is_empty()
+        || authority.chars().any(char::is_whitespace)
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@'))
+    {
+        return Err(ConfigError::Validation(
+            "MQTT broker must contain only a host and explicit port".into(),
+        ));
+    }
+    let (host, port) = authority.rsplit_once(':').ok_or_else(|| {
+        ConfigError::Validation("MQTT broker must include an explicit port".into())
+    })?;
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(ConfigError::Validation(
+            "MQTT broker host is invalid".into(),
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| ConfigError::Validation("MQTT broker port is invalid".into()))?;
+    Ok((host, port))
+}
+
+fn valid_channel_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 fn storage_record_limits_valid(storage: &StorageConfig) -> bool {
     storage.max_diagnostic_records > 0
         && storage.max_task_records > 0
@@ -273,11 +404,18 @@ fn storage_record_limits_valid(storage: &StorageConfig) -> bool {
         && storage.max_firewall_state_bytes > 0
         && storage.max_network_state_bytes > 0
         && storage.max_firewall_execution_plan_bytes > 0
+        && storage.max_channel_message_records > 0
+        && storage.max_channel_message_records <= 4096
+        && storage.max_channel_payload_bytes > 0
+        && storage.max_channel_payload_bytes <= 32 * 1024
         && storage.max_diagnostic_record_bytes <= storage.max_database_bytes
         && storage.max_change_plan_bytes <= storage.max_database_bytes
         && storage.max_firewall_state_bytes <= storage.max_database_bytes
         && storage.max_network_state_bytes <= storage.max_database_bytes
         && storage.max_firewall_execution_plan_bytes <= storage.max_database_bytes
+        && u64::from(storage.max_channel_message_records)
+            .saturating_mul(storage.max_channel_payload_bytes)
+            <= storage.max_database_bytes / 2
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -544,6 +682,8 @@ pub struct StorageConfig {
     pub max_firewall_state_bytes: u64,
     pub max_network_state_bytes: u64,
     pub max_firewall_execution_plan_bytes: u64,
+    pub max_channel_message_records: u32,
+    pub max_channel_payload_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -567,6 +707,8 @@ impl Default for StorageConfig {
             max_firewall_state_bytes: 256 * 1024,
             max_network_state_bytes: 256 * 1024,
             max_firewall_execution_plan_bytes: 256 * 1024,
+            max_channel_message_records: 64,
+            max_channel_payload_bytes: 32 * 1024,
         }
     }
 }
@@ -717,6 +859,32 @@ mod tests {
 
         config.extensions.directories = vec![PathBuf::from("/etc/mbed-agent/actions.d")];
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_mqtt_requires_narrow_tls_broker_and_bounded_identity() {
+        let mut config = AgentConfig::default();
+        config.channels.mqtt.enabled = true;
+        config.channels.mqtt.broker = "mqtt://broker.example:1883".into();
+        assert!(config.validate().is_err());
+
+        config.channels.mqtt.broker = "mqtts://broker.example:8883".into();
+        assert_eq!(
+            parse_mqtts_broker(&config.channels.mqtt.broker).expect("broker"),
+            ("broker.example", 8883)
+        );
+        assert!(config.validate().is_ok());
+
+        config.channels.mqtt.device_id = "device/+/escape".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn shipped_configuration_example_remains_valid() {
+        let config: AgentConfig =
+            toml::from_str(include_str!("../../../config/mbed-agent.example.toml"))
+                .expect("example config syntax");
+        config.validate().expect("example config validation");
     }
 
     #[test]
