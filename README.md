@@ -92,9 +92,11 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   addresses. Interface counters and nonzero error/drop counters have separate
   views backed by one snapshot. Conntrack capacity has a flow-free view, while
   qdisc totals and pressure counters have separate views backed by one snapshot.
-  The registry contains 20 built-in typed tools plus explicitly opted-in
-  read-only ActionSpec tools. Tool arguments are parsed and validated on-device;
-  model text cannot become a shell command.
+The registry contains 20 built-in typed tools plus explicitly opted-in
+read-only ActionSpec tools. ActionSpec change templates can also turn typed
+inputs into the existing firewall or network mutation protocol without a Rust
+rebuild. Tool arguments are parsed and validated on-device; model text cannot
+become a shell command or bypass ChangeSet approval.
 
 Provider routing, additional model-facing network tools, MQTT, WeCom, WeChat
 ClawBot, and Channel-facing elevation are not implemented yet. Firewall
@@ -163,6 +165,8 @@ Generic Linux route daemon admission and confirmed commit are recorded in
 [ADR 0049](docs/adr/0049-daemon-generic-linux-runtime-route-confirmed-commit.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
+Approval-bound change templates are recorded in
+[ADR 0051](docs/adr/0051-declarative-action-change-templates.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -223,6 +227,8 @@ After daemon startup, list and execute an action through the same binary:
 ```sh
 mbed-agent action list
 mbed-agent action run vendor_modem_status --inputs '{"modem_id":1}'
+mbed-agent action plan block_client_mac \
+  --inputs '{"rule_id":"block_phone","client_mac":"02:00:00:00:00:01","order":100}'
 ```
 
 Manifest changes can be loaded without restarting the daemon after obtaining a
@@ -242,6 +248,16 @@ the operating system. `llm_enabled` defaults to false and must be explicitly
 enabled by the manifest owner before an action appears as an `ext_*` model tool.
 Action output remains bounded and is not persisted; only execution metadata is
 written to the volatile task ledger.
+
+An action with `mode = "change"` has no executable or argv. Its bounded
+`template_json` contains only a closed firewall or network mutation array and
+exact `{"$input":"name"}` placeholders. `action plan` substitutes validated
+JSON values (never string interpolation), deserializes the result into the
+normal typed protocol, reads a fresh native inventory, and returns an
+approval-ready ChangeSet. Apply and confirmation use the same device-admin,
+one-use token, native validation, independent rollback helper, and live verify
+path as built-in changes. Change templates are not currently exposed as LLM
+tools; channels cannot silently cause a configuration write.
 
 To enable local administrator elevation, generate a salted verifier without
 placing the plaintext password in shell arguments:

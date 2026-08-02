@@ -27,6 +27,10 @@ pub enum Command {
         action_id: String,
         inputs: Value,
     },
+    ActionPlan {
+        action_id: String,
+        inputs: Value,
+    },
     DiagnoseWan {
         active: bool,
     },
@@ -1695,6 +1699,10 @@ mod tests {
             Command::ActionRun {
                 action_id: "vendor_modem".into(),
                 inputs: serde_json::json!({"modem_id": 1}),
+            },
+            Command::ActionPlan {
+                action_id: "block_client".into(),
+                inputs: serde_json::json!({"client_mac": "02:00:00:00:00:01"}),
             },
             Command::Elevate {
                 password: SensitiveString::new("secret".into()),

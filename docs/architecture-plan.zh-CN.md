@@ -1287,8 +1287,12 @@ argv 结构、平台范围、typed inputs、资源上限和是否允许 LLM 调�
 argv element，不经过 shell 拼接；执行环境为空，cwd 固定，具有并发、超时、stdout/stderr
 和审计上限。允许以 `/bin/sh /固定/脚本.sh 参数…` 复用厂商脚本，但拒绝 `sh -c/-lc`。
 device-admin 可原子热重载 registry，失败保留旧版本；daemon 重启也会自动加载。当前只开放
-read-only Action，写 Action 必须在后续接入 typed ChangeSet、风险、验证和回滚，不能仅凭
-manifest 的自声明绕过配置安全边界。
+read-only 外部程序。`mode = "change"` 已通过 ADR 0051 开放为现有 typed firewall/network
+planner 的声明式模板：模板只能以精确 JSON placeholder 注入强类型参数，不能声明 executable、
+argv 或开放为 LLM tool；`action plan` 展开后仍由 daemon 读取 fresh inventory、校验 ownership/
+digest、计算动态风险并创建标准 ChangeSet，apply/confirm 完整复用 device-admin、一次性 approval、
+原生 validation、独立 rollback 与 confirmed-commit。尚未覆盖的配置域和任意厂商写脚本仍保持
+关闭，直到其具备等价 transaction adapter，不能仅凭 manifest 自声明绕过安全边界。
 
 ## 21. 参考项目与官方资料
 

@@ -24,3 +24,68 @@ value = "--output-json"
 kind = "integer"
 min = 0
 max = 8
+
+# Change actions are templates for the existing typed ChangeSet planners. They
+# never execute this manifest's own program and cannot be exposed directly to
+# the model. This example creates an Agent-owned MAC isolation rule, but still
+# requires the normal device-admin approval, apply, verification, and confirm.
+[[actions]]
+id = "block_client_mac"
+description = "Plan an Agent-owned firewall rule that blocks one source MAC"
+mode = "change"
+llm_enabled = false
+platforms = ["linux"]
+
+[actions.change]
+domain = "firewall"
+template_json = '''
+[
+  {
+    "operation": "create",
+    "desired": {
+      "kind": "filter_rule",
+      "spec": {
+        "id": {"$input": "rule_id"},
+        "ownership": "agent_owned",
+        "enabled": true,
+        "direction": "forward",
+        "matches": {
+          "family": "any",
+          "source_zones": [],
+          "destination_zones": [],
+          "input_interfaces": [],
+          "output_interfaces": [],
+          "source_networks": [],
+          "destination_networks": [],
+          "source_macs": [{"$input": "client_mac"}],
+          "protocols": [],
+          "source_ports": [],
+          "destination_ports": [],
+          "icmp_types": [],
+          "conntrack_states": [],
+          "source_sets": [],
+          "destination_sets": []
+        },
+        "verdict": "drop",
+        "reject_with": null,
+        "rate_limit": null,
+        "log": null,
+        "order": {"$input": "order"}
+      }
+    }
+  }
+]
+'''
+
+[actions.inputs.rule_id]
+kind = "string"
+max_bytes = 48
+
+[actions.inputs.client_mac]
+kind = "string"
+max_bytes = 17
+
+[actions.inputs.order]
+kind = "integer"
+min = 0
+max = 10000

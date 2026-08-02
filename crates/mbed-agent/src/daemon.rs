@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::{
-    ActionMode, ActionRegistry, AdminPasswordVerifier, AgentConfig, AuthError, AuthManager,
-    FirewallExecutionPlan, FirewallMutation, FirewallRiskContext, NetworkExecutionPlan,
-    NetworkInventory, NetworkMutation, NetworkRiskContext, TmpBudget, confirm_awaiting_execution,
-    execute_approved_change, firewall_object_digest, network_object_digest, plan_digest,
-    plan_firewall_mutations, plan_network_mutations,
+    ActionChangeDomain, ActionMode, ActionRegistry, AdminPasswordVerifier, AgentConfig, AuthError,
+    AuthManager, FirewallExecutionPlan, FirewallMutation, FirewallRiskContext,
+    NetworkExecutionPlan, NetworkInventory, NetworkMutation, NetworkRiskContext, TmpBudget,
+    confirm_awaiting_execution, execute_approved_change, firewall_object_digest,
+    network_object_digest, plan_digest, plan_firewall_mutations, plan_network_mutations,
 };
 use agent_protocol::{
     ActionDescriptor, ActionReloadResponse, ChangeApprovalResponse, ChangePlan, ChangeSetResponse,
@@ -412,6 +412,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::ActionRun { action_id, inputs } => {
             return handle_action_run(request.id, action_id, inputs, state).await;
         }
+        Command::ActionPlan { action_id, inputs } => {
+            return handle_action_plan(request.id, action_id, inputs, state).await;
+        }
         Command::Status => status_response(state),
         Command::Elevate { password } => {
             return handle_elevation(request.id, password.into_inner(), state).await;
@@ -517,6 +520,7 @@ async fn handle_action_list(id: String, state: &AppState) -> ServerResponse {
             description: action.description.clone(),
             mode: match action.mode {
                 ActionMode::ReadOnly => "read_only".into(),
+                ActionMode::Change => "change".into(),
             },
             llm_enabled: action.llm_enabled,
             platforms: action.platforms.clone(),
@@ -524,6 +528,56 @@ async fn handle_action_list(id: String, state: &AppState) -> ServerResponse {
         })
         .collect();
     ServerResponse::success(id, ResponseData::ActionList(descriptors))
+}
+
+async fn handle_action_plan(
+    id: String,
+    action_id: String,
+    inputs: serde_json::Value,
+    state: &AppState,
+) -> ServerResponse {
+    let invocation = {
+        let actions = state.actions.read().await;
+        actions.change_invocation(
+            &action_id,
+            state.platform.kind.as_str(),
+            &inputs,
+            &state.config.extensions,
+        )
+    };
+    let invocation = match invocation {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::InvalidRequest,
+                format!("action change request was rejected: {error}"),
+            );
+        }
+    };
+    info!(%action_id, domain = ?invocation.domain, "declarative action requested a typed change plan");
+    match invocation.domain {
+        ActionChangeDomain::Firewall => {
+            match serde_json::from_value::<Vec<FirewallMutationRequest>>(invocation.mutations) {
+                Ok(mutations) => handle_firewall_plan(id, mutations, state).await,
+                Err(error) => ServerResponse::error(
+                    id,
+                    ErrorCode::InvalidRequest,
+                    format!("firewall action template is not a valid typed mutation: {error}"),
+                ),
+            }
+        }
+        ActionChangeDomain::Network => {
+            match serde_json::from_value::<Vec<NetworkMutationRequest>>(invocation.mutations) {
+                Ok(mutations) => handle_network_plan(id, mutations, state).await,
+                Err(error) => ServerResponse::error(
+                    id,
+                    ErrorCode::InvalidRequest,
+                    format!("network action template is not a valid typed mutation: {error}"),
+                ),
+            }
+        }
+    }
 }
 
 async fn handle_action_reload(id: String, state: &AppState) -> ServerResponse {

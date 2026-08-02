@@ -45,6 +45,10 @@ must not turn model-generated text into an unrestricted root shell.
    produce typed plans and use the ChangeSet approval/validation/rollback
    lifecycle or an explicitly irreversible R4 break-glass boundary.
 
+ADR 0051 subsequently adds declarative change templates that produce existing
+typed firewall/network plans. It does not relax the external-program boundary
+defined here.
+
 ## Consequences
 
 Users and manufacturers can add bounded device-specific diagnostics without

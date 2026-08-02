@@ -108,6 +108,14 @@ enum ActionTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Expand one change template into the normal approval-ready typed `ChangeSet` path.
+    Plan {
+        action_id: String,
+        #[arg(long, default_value = "{}")]
+        inputs: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -372,6 +380,17 @@ async fn run_action_target(target: ActionTarget) -> Result<(), Box<dyn Error>> {
             }
             let inputs = serde_json::from_str(&inputs)?;
             run_client(&socket, Command::ActionRun { action_id, inputs }).await
+        }
+        ActionTarget::Plan {
+            action_id,
+            inputs,
+            socket,
+        } => {
+            if inputs.len() > 16 * 1024 {
+                return Err("action inputs exceed 16384 bytes".into());
+            }
+            let inputs = serde_json::from_str(&inputs)?;
+            run_client(&socket, Command::ActionPlan { action_id, inputs }).await
         }
     }
 }

@@ -9,8 +9,9 @@ pub mod resources;
 pub mod rollback;
 
 pub use actions::{
-    ACTION_MANIFEST_SCHEMA_VERSION, ActionArgSpec, ActionInputSpec, ActionInvocation,
-    ActionManifest, ActionMode, ActionRegistry, ActionRegistryError, ActionSpec,
+    ACTION_MANIFEST_SCHEMA_VERSION, ActionArgSpec, ActionChangeDomain, ActionChangeInvocation,
+    ActionChangeSpec, ActionInputSpec, ActionInvocation, ActionManifest, ActionMode,
+    ActionRegistry, ActionRegistryError, ActionSpec,
 };
 pub use auth::{
     AdminPasswordVerifier, AuthError, AuthManager, DeviceAdminCapability, generate_password_hash,
