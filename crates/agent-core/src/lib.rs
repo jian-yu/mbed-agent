@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod auth;
 pub mod changes;
 pub mod config;
@@ -7,13 +8,17 @@ pub mod network;
 pub mod resources;
 pub mod rollback;
 
+pub use actions::{
+    ACTION_MANIFEST_SCHEMA_VERSION, ActionArgSpec, ActionInputSpec, ActionInvocation,
+    ActionManifest, ActionMode, ActionRegistry, ActionRegistryError, ActionSpec,
+};
 pub use auth::{
     AdminPasswordVerifier, AuthError, AuthManager, DeviceAdminCapability, generate_password_hash,
 };
 pub use changes::{
     ChangePlanError, ChangeTransitionError, assess_plan, plan_digest, transition_change_set,
 };
-pub use config::{AgentConfig, ConfigError, Profile};
+pub use config::{AgentConfig, ConfigError, ExtensionsConfig, Profile};
 pub use execution::{
     ChangeExecutionError, ChangeExecutionPort, ExecutionOutcome, ExecutionPortError,
     ExecutionStage, confirm_awaiting_execution, execute_approved_change,

@@ -33,6 +33,20 @@ max_firewall_state_bytes = 262144
 max_network_state_bytes = 262144
 max_firewall_execution_plan_bytes = 262144
 
+[extensions]
+enabled = false
+directories = ["/usr/share/mbed-agent/actions.d", "/etc/mbed-agent/actions.d"]
+trusted_manifest_owner_uid = 0
+trusted_executable_owner_uid = 0
+max_manifests = 32
+max_manifest_bytes = 32768
+max_actions = 64
+max_argv = 32
+max_inputs = 16
+max_input_bytes = 1024
+max_output_bytes = 65536
+timeout_secs = 5
+
 [logging]
 level = "info"
 directives = ["agent_providers=warn", "agent_channels=info"]

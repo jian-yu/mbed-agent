@@ -11,6 +11,10 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   subcommands act as its local CLI over a bounded Unix socket protocol.
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
+- A bounded declarative ActionSpec registry for user and vendor extensions.
+  Trusted TOML manifests add read-only commands and typed inputs without a Rust
+  rebuild. Execution uses exact argv, an empty environment, fixed concurrency,
+  timeout and output limits; manifests may opt in to dynamic LLM tool exposure.
 - A metadata-only `ask` task ledger with configurable retention. It records
   outcomes, provider/model, token usage, duration, and error code, but never
   prompts or model responses.
@@ -88,9 +92,9 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   addresses. Interface counters and nonzero error/drop counters have separate
   views backed by one snapshot. Conntrack capacity has a flow-free view, while
   qdisc totals and pressure counters have separate views backed by one snapshot.
-  The registry now contains 20 typed tools. Tool arguments are parsed and
-  validated on-device, and the model can never request active probes or shell
-  commands.
+  The registry contains 20 built-in typed tools plus explicitly opted-in
+  read-only ActionSpec tools. Tool arguments are parsed and validated on-device;
+  model text cannot become a shell command.
 
 Provider routing, additional model-facing network tools, MQTT, WeCom, WeChat
 ClawBot, and Channel-facing elevation are not implemented yet. Firewall
@@ -157,6 +161,8 @@ Independent generic Linux runtime route recovery is recorded in
 [ADR 0048](docs/adr/0048-generic-linux-runtime-route-rollback.md).
 Generic Linux route daemon admission and confirmed commit are recorded in
 [ADR 0049](docs/adr/0049-daemon-generic-linux-runtime-route-confirmed-commit.md).
+Declarative user/vendor actions and their bounded execution boundary are
+recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -199,7 +205,43 @@ cargo run -p mbed-agent -- diagnose conntrack
 cargo run -p mbed-agent -- diagnose qdisc
 cargo run -p mbed-agent -- diagnose history --limit 20
 cargo run -p mbed-agent -- task history --limit 20
+cargo run -p mbed-agent -- action list
 ```
+
+## User and vendor actions
+
+Set `extensions.enabled = true`, then place mode-0600/0644 TOML manifests
+directly in `/etc/mbed-agent/actions.d` or
+`/usr/share/mbed-agent/actions.d`. The directories and files must not be
+symlinks or writable by group/other, and must match the configured trusted
+manifest owner UID (root by default). Executables and fixed shell scripts must
+likewise match the separately configured trusted executable UID. See
+[the ActionSpec example](docs/examples/action-manifest.toml).
+
+After daemon startup, list and execute an action through the same binary:
+
+```sh
+mbed-agent action list
+mbed-agent action run vendor_modem_status --inputs '{"modem_id":1}'
+```
+
+Manifest changes can be loaded without restarting the daemon after obtaining a
+device-admin capability:
+
+```sh
+mbed-agent action reload
+```
+
+An ActionSpec fixes the absolute executable and argv shape. Inputs are typed as
+bounded strings, integers, or booleans and become individual argv elements;
+they are never concatenated into a shell command. A trusted shell script is
+supported by setting the executable to `/bin/sh` and the first literal argument
+to an absolute, non-`/tmp` script path. `sh -c` and `sh -lc` are rejected. Do
+not pass secrets through actions because process arguments can be visible to
+the operating system. `llm_enabled` defaults to false and must be explicitly
+enabled by the manifest owner before an action appears as an `ext_*` model tool.
+Action output remains bounded and is not persisted; only execution metadata is
+written to the volatile task ledger.
 
 To enable local administrator elevation, generate a salted verifier without
 placing the plaintext password in shell arguments:

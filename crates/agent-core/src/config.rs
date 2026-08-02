@@ -22,6 +22,7 @@ pub struct AgentConfig {
     pub logging: LoggingConfig,
     pub auth: AuthConfig,
     pub llm: LlmConfig,
+    pub extensions: ExtensionsConfig,
 }
 
 impl Default for AgentConfig {
@@ -35,6 +36,7 @@ impl Default for AgentConfig {
             logging: LoggingConfig::default(),
             auth: AuthConfig::default(),
             llm: LlmConfig::default(),
+            extensions: ExtensionsConfig::default(),
         }
     }
 }
@@ -147,6 +149,7 @@ impl AgentConfig {
 
         self.auth.validate()?;
         self.llm.validate()?;
+        self.extensions.validate()?;
 
         let allocated = self
             .storage
@@ -174,6 +177,88 @@ impl AgentConfig {
             return Err(ConfigError::Validation(
                 "logging rotation limits are inconsistent".into(),
             ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtensionsConfig {
+    pub enabled: bool,
+    pub directories: Vec<PathBuf>,
+    pub trusted_manifest_owner_uid: u32,
+    pub trusted_executable_owner_uid: u32,
+    pub max_manifests: usize,
+    pub max_manifest_bytes: usize,
+    pub max_actions: usize,
+    pub max_argv: usize,
+    pub max_inputs: usize,
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+    pub timeout_secs: u64,
+}
+
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directories: vec![
+                PathBuf::from("/usr/share/mbed-agent/actions.d"),
+                PathBuf::from("/etc/mbed-agent/actions.d"),
+            ],
+            trusted_manifest_owner_uid: 0,
+            trusted_executable_owner_uid: 0,
+            max_manifests: 32,
+            max_manifest_bytes: 32 * 1024,
+            max_actions: 64,
+            max_argv: 32,
+            max_inputs: 16,
+            max_input_bytes: 1024,
+            max_output_bytes: 64 * 1024,
+            timeout_secs: 5,
+        }
+    }
+}
+
+impl ExtensionsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.directories.len() > 8
+            || self.max_manifests == 0
+            || self.max_manifests > 256
+            || self.max_manifest_bytes < 256
+            || self.max_manifest_bytes > 256 * 1024
+            || self.max_actions == 0
+            || self.max_actions > 256
+            || self.max_argv == 0
+            || self.max_argv > 64
+            || self.max_inputs > 32
+            || self.max_input_bytes == 0
+            || self.max_input_bytes > 16 * 1024
+            || self.max_output_bytes < 256
+            || self.max_output_bytes > 1024 * 1024
+            || !(1..=60).contains(&self.timeout_secs)
+        {
+            return Err(ConfigError::Validation(
+                "extension manifest, action, argv, input, output, and timeout limits are inconsistent"
+                    .into(),
+            ));
+        }
+        for directory in &self.directories {
+            if !directory.is_absolute()
+                || directory.starts_with("/tmp")
+                || directory.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err(ConfigError::Validation(
+                    "extension directories must be absolute normalized persistent paths outside /tmp"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -617,6 +702,21 @@ mod tests {
         config.llm.max_agent_steps = 4;
         config.llm.max_tool_context_bytes = config.llm.max_request_bytes + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn extension_registry_limits_and_paths_are_bounded() {
+        let mut config = AgentConfig::default();
+        config.extensions.enabled = true;
+        config.extensions.max_actions = 0;
+        assert!(config.validate().is_err());
+
+        config.extensions.max_actions = 64;
+        config.extensions.directories = vec![PathBuf::from("relative/actions.d")];
+        assert!(config.validate().is_err());
+
+        config.extensions.directories = vec![PathBuf::from("/etc/mbed-agent/actions.d")];
+        assert!(config.validate().is_ok());
     }
 
     #[test]

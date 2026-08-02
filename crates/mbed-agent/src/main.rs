@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use zeroize::{Zeroize, Zeroizing};
 
+mod action_execution;
 mod daemon;
 mod firewall_execution;
 mod logging;
@@ -47,6 +48,11 @@ enum CliCommand {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// List, reload, or execute declarative user/vendor actions.
+    Action {
+        #[command(subcommand)]
+        target: ActionTarget,
+    },
     /// Ask the configured LLM through the local daemon.
     Ask {
         /// Prompt sent to the configured provider.
@@ -79,6 +85,28 @@ enum CliCommand {
         transaction_id: String,
         #[arg(short, long, default_value = "/etc/mbed-agent/config.toml")]
         config: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ActionTarget {
+    /// List actions available on the detected platform.
+    List {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Reload action manifests after device-admin elevation.
+    Reload {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
+    /// Execute one read-only action with a bounded JSON input object.
+    Run {
+        action_id: String,
+        #[arg(long, default_value = "{}")]
+        inputs: String,
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
     },
 }
 
@@ -246,6 +274,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Ping { socket } => run_client(&socket, Command::Ping).await,
         CliCommand::Status { socket } => run_client(&socket, Command::Status).await,
         CliCommand::Capabilities { socket } => run_client(&socket, Command::Capabilities).await,
+        CliCommand::Action { target } => run_action_target(target).await,
         CliCommand::Ask { prompt, socket } => {
             run_client(&socket, Command::Complete { prompt }).await
         }
@@ -326,6 +355,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
             transaction_id,
             config,
         } => run_rollback_helper_command(&config, &transaction_id),
+    }
+}
+
+async fn run_action_target(target: ActionTarget) -> Result<(), Box<dyn Error>> {
+    match target {
+        ActionTarget::List { socket } => run_client(&socket, Command::ActionList).await,
+        ActionTarget::Reload { socket } => run_client(&socket, Command::ActionReload).await,
+        ActionTarget::Run {
+            action_id,
+            inputs,
+            socket,
+        } => {
+            if inputs.len() > 16 * 1024 {
+                return Err("action inputs exceed 16384 bytes".into());
+            }
+            let inputs = serde_json::from_str(&inputs)?;
+            run_client(&socket, Command::ActionRun { action_id, inputs }).await
+        }
     }
 }
 

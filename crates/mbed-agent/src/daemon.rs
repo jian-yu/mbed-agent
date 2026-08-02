@@ -10,19 +10,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::{
-    AdminPasswordVerifier, AgentConfig, AuthError, AuthManager, FirewallExecutionPlan,
-    FirewallMutation, FirewallRiskContext, NetworkExecutionPlan, NetworkInventory, NetworkMutation,
-    NetworkRiskContext, TmpBudget, confirm_awaiting_execution, execute_approved_change,
-    firewall_object_digest, network_object_digest, plan_digest, plan_firewall_mutations,
-    plan_network_mutations,
+    ActionMode, ActionRegistry, AdminPasswordVerifier, AgentConfig, AuthError, AuthManager,
+    FirewallExecutionPlan, FirewallMutation, FirewallRiskContext, NetworkExecutionPlan,
+    NetworkInventory, NetworkMutation, NetworkRiskContext, TmpBudget, confirm_awaiting_execution,
+    execute_approved_change, firewall_object_digest, network_object_digest, plan_digest,
+    plan_firewall_mutations, plan_network_mutations,
 };
 use agent_protocol::{
-    ChangeApprovalResponse, ChangePlan, ChangeSetResponse, ChangeSetState, ClientRequest, Command,
-    CompletionResponse, ConfigDomain, DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry,
-    FirewallInventoryResponse, FirewallMutationRequest, FirewallObject, NetworkInventoryEntry,
-    NetworkInventoryResponse, NetworkMutationRequest, NetworkObject, ObjectOwnership,
-    PROTOCOL_VERSION, ResponseData, SensitiveString, ServerResponse, StatusResponse,
-    StoragePressure, StorageStatus, TaskHistoryEntry,
+    ActionDescriptor, ActionReloadResponse, ChangeApprovalResponse, ChangePlan, ChangeSetResponse,
+    ChangeSetState, ClientRequest, Command, CompletionResponse, ConfigDomain,
+    DiagnosticHistoryEntry, ErrorCode, FirewallInventoryEntry, FirewallInventoryResponse,
+    FirewallMutationRequest, FirewallObject, NetworkInventoryEntry, NetworkInventoryResponse,
+    NetworkMutationRequest, NetworkObject, ObjectOwnership, PROTOCOL_VERSION, ResponseData,
+    SensitiveString, ServerResponse, StatusResponse, StoragePressure, StorageStatus,
+    TaskHistoryEntry,
 };
 use agent_provider::{
     CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
@@ -50,11 +51,12 @@ use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
+use crate::action_execution::{ActionExecutionError, execute_action};
 use crate::firewall_execution::{
     GenericIptablesExecutionPort, GenericIptablesExecutionPortConfig, GenericNftablesExecutionPort,
     GenericNftablesExecutionPortConfig, OpenWrtExecutionPort, OpenWrtExecutionPortConfig,
@@ -82,8 +84,11 @@ struct AppState {
     started: Instant,
     auth: Arc<AuthManager>,
     configuration_lock: Mutex<()>,
+    actions: RwLock<ActionRegistry>,
+    action_slots: Semaphore,
 }
 
+#[allow(clippy::too_many_lines)] // Startup keeps all bounded runtime resources visibly assembled.
 pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let config = AgentConfig::load_or_default(config_path)?;
     ensure_secret_config_permissions(config_path, &config)?;
@@ -125,12 +130,18 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     for warning in &platform.warnings {
         warn!(warning = %warning, "platform capability warning");
     }
+    let actions = ActionRegistry::load(&config.extensions)?;
+    info!(
+        loaded_actions = actions.len(),
+        "loaded declarative action registry"
+    );
 
     let tools = ToolRunner::system(
         Duration::from_secs(config.runtime.tool_timeout_secs),
         config.runtime.max_tool_output_bytes,
     );
     let diagnostic_slots = Semaphore::new(config.runtime.max_active_tasks);
+    let action_slots = Semaphore::new(config.runtime.max_active_tasks);
     let llm = build_llm_provider(&config)?;
     let llm_slots = Semaphore::new(config.runtime.max_active_tasks);
     let listener = bind_socket(&config.server.socket_path, config.server.socket_mode)?;
@@ -148,6 +159,8 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         started: Instant::now(),
         auth,
         configuration_lock: Mutex::new(()),
+        actions: RwLock::new(actions),
+        action_slots,
     });
     let mut cleanup_interval =
         tokio::time::interval(Duration::from_secs(state.budget.cleanup_interval_secs()));
@@ -390,6 +403,15 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 );
             }
         },
+        Command::ActionList => {
+            return handle_action_list(request.id, state).await;
+        }
+        Command::ActionReload => {
+            return handle_action_reload(request.id, state).await;
+        }
+        Command::ActionRun { action_id, inputs } => {
+            return handle_action_run(request.id, action_id, inputs, state).await;
+        }
         Command::Status => status_response(state),
         Command::Elevate { password } => {
             return handle_elevation(request.id, password.into_inner(), state).await;
@@ -482,6 +504,160 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         }
     };
     ServerResponse::success(request.id, result)
+}
+
+async fn handle_action_list(id: String, state: &AppState) -> ServerResponse {
+    let platform = state.platform.kind.as_str();
+    let actions = state.actions.read().await;
+    let descriptors = actions
+        .available(platform)
+        .into_iter()
+        .map(|action| ActionDescriptor {
+            id: action.id.clone(),
+            description: action.description.clone(),
+            mode: match action.mode {
+                ActionMode::ReadOnly => "read_only".into(),
+            },
+            llm_enabled: action.llm_enabled,
+            platforms: action.platforms.clone(),
+            input_schema: ActionRegistry::input_schema(action),
+        })
+        .collect();
+    ServerResponse::success(id, ResponseData::ActionList(descriptors))
+}
+
+async fn handle_action_reload(id: String, state: &AppState) -> ServerResponse {
+    let now = process_monotonic_ms(state);
+    match state.auth.is_device_admin(LOCAL_CLI_ACTOR, now) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::Unauthorized,
+                "device-admin elevation is required to reload action manifests",
+            );
+        }
+        Err(error) => {
+            error!(%error, "administrator capability check failed for action reload");
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            );
+        }
+    }
+    let config = state.config.extensions.clone();
+    let loaded = tokio::task::spawn_blocking(move || ActionRegistry::load(&config)).await;
+    let registry = match loaded {
+        Ok(Ok(registry)) => registry,
+        Ok(Err(error)) => {
+            warn!(%error, "action registry reload was rejected");
+            return ServerResponse::error(
+                id,
+                ErrorCode::Conflict,
+                format!("action registry reload was rejected: {error}"),
+            );
+        }
+        Err(error) => {
+            error!(%error, "action registry reload worker failed");
+            return ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "action registry reload is unavailable",
+            );
+        }
+    };
+    let loaded_actions = registry.len();
+    *state.actions.write().await = registry;
+    info!(loaded_actions, "declarative action registry reloaded");
+    ServerResponse::success(
+        id,
+        ResponseData::ActionReload(ActionReloadResponse { loaded_actions }),
+    )
+}
+
+async fn handle_action_run(
+    id: String,
+    action_id: String,
+    inputs: serde_json::Value,
+    state: &AppState,
+) -> ServerResponse {
+    if let Err(message) = ensure_task_storage(state).await {
+        return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
+    }
+    let invocation = {
+        let actions = state.actions.read().await;
+        actions.invocation(
+            &action_id,
+            state.platform.kind.as_str(),
+            &inputs,
+            &state.config.extensions,
+        )
+    };
+    let invocation = match invocation {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            return ServerResponse::error(
+                id,
+                ErrorCode::InvalidRequest,
+                format!("action request was rejected: {error}"),
+            );
+        }
+    };
+    let Ok(permit) = state.action_slots.try_acquire() else {
+        return ServerResponse::error(
+            id,
+            ErrorCode::ResourceExhausted,
+            "all action execution slots are busy",
+        );
+    };
+    let started = Instant::now();
+    let result = execute_action(
+        action_id.clone(),
+        invocation,
+        state.config.extensions.trusted_executable_owner_uid,
+        Duration::from_secs(state.config.extensions.timeout_secs),
+        state.config.extensions.max_output_bytes,
+    )
+    .await;
+    drop(permit);
+    match result {
+        Ok(output) => {
+            persist_action_audit(&id, &action_id, "succeeded", started.elapsed(), None, state)
+                .await;
+            info!(%action_id, exit_code = ?output.exit_code, "declarative action completed");
+            ServerResponse::success(id, ResponseData::ActionOutput(output))
+        }
+        Err(ActionExecutionError::TimedOut) => {
+            persist_action_audit(
+                &id,
+                &action_id,
+                "timed_out",
+                started.elapsed(),
+                Some(ErrorCode::ResourceExhausted),
+                state,
+            )
+            .await;
+            ServerResponse::error(
+                id,
+                ErrorCode::ResourceExhausted,
+                "action execution timed out",
+            )
+        }
+        Err(error) => {
+            persist_action_audit(
+                &id,
+                &action_id,
+                "failed",
+                started.elapsed(),
+                Some(ErrorCode::Conflict),
+                state,
+            )
+            .await;
+            warn!(%action_id, %error, "declarative action execution failed");
+            ServerResponse::error(id, ErrorCode::Conflict, "action execution failed")
+        }
+    }
 }
 
 async fn handle_elevation(id: String, password: String, state: &AppState) -> ServerResponse {
@@ -2703,7 +2879,7 @@ async fn run_read_only_agent(
         ModelMessage::Instruction(state.config.llm.system_prompt.clone()),
         ModelMessage::User(prompt),
     ];
-    let tools = read_only_agent_tools();
+    let tools = agent_tools(state).await;
     let mut snapshots = AgentSnapshots::default();
     let mut prompt_tokens = None;
     let mut completion_tokens = None;
@@ -2793,6 +2969,9 @@ async fn execute_agent_tool(
     state: &AppState,
     snapshots: &mut AgentSnapshots,
 ) -> Result<ModelMessage, AgentLoopFailure> {
+    if ReadOnlyAgentTool::from_name(&call.name).is_none() {
+        return execute_extension_agent_tool(call, request_id, state).await;
+    }
     let tool = validate_read_only_tool_call(call).map_err(|reason| {
         warn!(tool = %call.name, %reason, "model requested a rejected tool call");
         AgentLoopFailure::new(
@@ -2831,6 +3010,139 @@ async fn execute_agent_tool(
         }
         _ => execute_wan_agent_tool(call, request_id, tool, state, snapshots).await,
     }
+}
+
+#[allow(clippy::too_many_lines)] // Keeps dynamic schema admission and exact execution visibly joined.
+async fn execute_extension_agent_tool(
+    call: &ToolCall,
+    request_id: &str,
+    state: &AppState,
+) -> Result<ModelMessage, AgentLoopFailure> {
+    let action_id = call.name.strip_prefix("ext_").ok_or_else(|| {
+        AgentLoopFailure::new(ErrorCode::Upstream, "model requested an unknown tool")
+    })?;
+    if call.arguments.len()
+        > state
+            .config
+            .extensions
+            .max_input_bytes
+            .saturating_mul(state.config.extensions.max_inputs.max(1))
+    {
+        return Err(AgentLoopFailure::new(
+            ErrorCode::ResourceExhausted,
+            "extension action arguments exceed their configured bound",
+        ));
+    }
+    let inputs: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|_| {
+        AgentLoopFailure::new(
+            ErrorCode::Upstream,
+            "extension action arguments are not valid JSON",
+        )
+    })?;
+    let invocation = {
+        let actions = state.actions.read().await;
+        let action = actions
+            .get(action_id, state.platform.kind.as_str())
+            .filter(|action| action.llm_enabled)
+            .ok_or_else(|| {
+                AgentLoopFailure::new(
+                    ErrorCode::Upstream,
+                    "extension action is not enabled for the model",
+                )
+            })?;
+        if action.mode != ActionMode::ReadOnly {
+            return Err(AgentLoopFailure::new(
+                ErrorCode::Unauthorized,
+                "model-facing extension actions must be read-only",
+            ));
+        }
+        actions
+            .invocation(
+                action_id,
+                state.platform.kind.as_str(),
+                &inputs,
+                &state.config.extensions,
+            )
+            .map_err(|error| {
+                AgentLoopFailure::new(
+                    ErrorCode::Upstream,
+                    format!("extension action arguments were rejected: {error}"),
+                )
+            })?
+    };
+    ensure_task_storage(state)
+        .await
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    let permit = state.action_slots.try_acquire().map_err(|_| {
+        AgentLoopFailure::new(
+            ErrorCode::ResourceExhausted,
+            "all action execution slots are busy",
+        )
+    })?;
+    let started = Instant::now();
+    let result = execute_action(
+        action_id.into(),
+        invocation,
+        state.config.extensions.trusted_executable_owner_uid,
+        Duration::from_secs(state.config.extensions.timeout_secs),
+        state.config.extensions.max_output_bytes,
+    )
+    .await;
+    drop(permit);
+    let audit_id = format!(
+        "ext-{}",
+        sha256_hex(format!("{request_id}:{}:{action_id}", call.id).as_bytes())
+    );
+    let output = match result {
+        Ok(output) => {
+            persist_action_audit(
+                &audit_id,
+                action_id,
+                "succeeded",
+                started.elapsed(),
+                None,
+                state,
+            )
+            .await;
+            output
+        }
+        Err(ActionExecutionError::TimedOut) => {
+            persist_action_audit(
+                &audit_id,
+                action_id,
+                "timed_out",
+                started.elapsed(),
+                Some(ErrorCode::ResourceExhausted),
+                state,
+            )
+            .await;
+            return Err(AgentLoopFailure::new(
+                ErrorCode::ResourceExhausted,
+                "extension action execution timed out",
+            ));
+        }
+        Err(_) => {
+            persist_action_audit(
+                &audit_id,
+                action_id,
+                "failed",
+                started.elapsed(),
+                Some(ErrorCode::Conflict),
+                state,
+            )
+            .await;
+            return Err(AgentLoopFailure::new(
+                ErrorCode::Conflict,
+                "extension action execution failed",
+            ));
+        }
+    };
+    let content = bounded_action_observation(output, state.config.llm.max_tool_context_bytes)
+        .map_err(|message| AgentLoopFailure::new(ErrorCode::ResourceExhausted, message))?;
+    Ok(ModelMessage::Tool {
+        tool_call_id: call.id.clone(),
+        content,
+    })
 }
 
 async fn execute_interface_agent_tool(
@@ -3395,6 +3707,23 @@ fn read_only_agent_tools() -> Vec<ToolDefinition> {
             }),
         })
         .collect()
+}
+
+async fn agent_tools(state: &AppState) -> Vec<ToolDefinition> {
+    let mut tools = read_only_agent_tools();
+    let actions = state.actions.read().await;
+    tools.extend(
+        actions
+            .available(state.platform.kind.as_str())
+            .into_iter()
+            .filter(|action| action.llm_enabled && action.mode == ActionMode::ReadOnly)
+            .map(|action| ToolDefinition {
+                name: format!("ext_{}", action.id),
+                description: action.description.clone(),
+                parameters: ActionRegistry::input_schema(action),
+            }),
+    );
+    tools
 }
 
 fn validate_read_only_tool_call(call: &ToolCall) -> Result<ReadOnlyAgentTool, &'static str> {
@@ -4215,6 +4544,32 @@ fn encode_tool_observation<T: serde::Serialize>(
         .map_err(|error| format!("{tool_name} observation was not valid UTF-8: {error}"))
 }
 
+fn bounded_action_observation(
+    mut output: agent_protocol::ActionOutputResponse,
+    limit: usize,
+) -> Result<String, String> {
+    let payload_budget = limit.saturating_sub(512);
+    let stdout_limit = payload_budget.saturating_mul(3) / 4;
+    let stderr_limit = payload_budget.saturating_sub(stdout_limit);
+    if output.stdout.len() > stdout_limit {
+        truncate_utf8(&mut output.stdout, stdout_limit);
+        output.output_truncated = true;
+    }
+    if output.stderr.len() > stderr_limit {
+        truncate_utf8(&mut output.stderr, stderr_limit);
+        output.output_truncated = true;
+    }
+    encode_tool_observation(&format!("ext_{}", output.action_id), &output, limit)
+}
+
+fn truncate_utf8(value: &mut String, limit: usize) {
+    let mut boundary = limit.min(value.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
 async fn handle_wan_diagnosis(id: String, active: bool, state: &AppState) -> ServerResponse {
     if let Err(message) = ensure_task_storage(state).await {
         return ServerResponse::error(id, ErrorCode::ResourceExhausted, message);
@@ -4876,6 +5231,35 @@ async fn persist_task(id: &str, audit: TaskAudit<'_>, state: &AppState) {
     }
 }
 
+async fn persist_action_audit(
+    id: &str,
+    action_id: &str,
+    status: &str,
+    duration: Duration,
+    error_code: Option<ErrorCode>,
+    state: &AppState,
+) {
+    let record = TaskRecord {
+        id: id.into(),
+        kind: format!("action:{action_id}"),
+        status: status.into(),
+        provider: "local".into(),
+        model: String::new(),
+        prompt_tokens: None,
+        completion_tokens: None,
+        duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        error_code: error_code.map(|code| code.as_str().into()),
+        created_at: 0,
+    };
+    let store = Arc::clone(&state.store);
+    let max_records = state.config.storage.max_task_records;
+    match tokio::task::spawn_blocking(move || store.record_task(&record, max_records)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "failed to persist action audit"),
+        Err(error) => warn!(%error, "action audit worker failed"),
+    }
+}
+
 async fn handle_task_history(id: String, limit: u16, state: &AppState) -> ServerResponse {
     let store = Arc::clone(&state.store);
     let result = tokio::task::spawn_blocking(move || store.task_history(limit.clamp(1, 100))).await;
@@ -4946,6 +5330,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5469,6 +5854,8 @@ mod tests {
             auth: Arc::new(auth),
             config_path: root.join("config.toml"),
             configuration_lock: Mutex::new(()),
+            actions: RwLock::new(ActionRegistry::default()),
+            action_slots: Semaphore::new(1),
             config,
         };
 
@@ -5566,9 +5953,100 @@ mod tests {
             auth: Arc::new(auth),
             config_path: root.join("config.toml"),
             configuration_lock: Mutex::new(()),
+            actions: RwLock::new(ActionRegistry::default()),
+            action_slots: Semaphore::new(1),
             config,
         };
         (store, state)
+    }
+
+    #[tokio::test]
+    async fn declarative_action_runs_typed_argv_and_audits_without_output() {
+        let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(format!(
+            "/tmp/mbed-agent/action-test-{}-{test_id}",
+            std::process::id()
+        ));
+        let (store, mut state) = approval_test_state(&root);
+        let actions_dir = root.join("actions.d");
+        fs::create_dir(&actions_dir).expect("actions directory");
+        let manifest = actions_dir.join("test.toml");
+        fs::write(
+            &manifest,
+            r#"
+schema_version = 1
+[[actions]]
+id = "echo_vendor"
+description = "Echo one bounded vendor value"
+llm_enabled = true
+platforms = ["generic_linux"]
+executable = "/bin/echo"
+[[actions.argv]]
+kind = "input"
+name = "value"
+[actions.inputs.value]
+kind = "string"
+max_bytes = 32
+"#,
+        )
+        .expect("manifest");
+        let extensions = agent_core::ExtensionsConfig {
+            enabled: true,
+            directories: vec![actions_dir],
+            trusted_manifest_owner_uid: fs::metadata(&manifest).expect("manifest metadata").uid(),
+            ..agent_core::ExtensionsConfig::default()
+        };
+        state.config.extensions = extensions.clone();
+        state.platform.kind = PlatformKind::GenericLinux;
+        state.actions = RwLock::new(ActionRegistry::load(&extensions).expect("registry"));
+        let tools = agent_tools(&state).await;
+        assert!(tools.iter().any(|tool| {
+            tool.name == "ext_echo_vendor"
+                && tool.parameters["required"] == serde_json::json!(["value"])
+        }));
+
+        let response = handle_action_run(
+            "action-request".into(),
+            "echo_vendor".into(),
+            serde_json::json!({"value": "hello;not-a-shell"}),
+            &state,
+        )
+        .await;
+        let Some(ResponseData::ActionOutput(output)) = response.result else {
+            panic!("action output expected");
+        };
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.trim(), "hello;not-a-shell");
+        let tool_message = execute_extension_agent_tool(
+            &ToolCall {
+                id: "tool-call-1".into(),
+                name: "ext_echo_vendor".into(),
+                arguments: r#"{"value":"model-value"}"#.into(),
+            },
+            "ask-request",
+            &state,
+        )
+        .await;
+        let Ok(tool_message) = tool_message else {
+            panic!("model action should succeed");
+        };
+        let ModelMessage::Tool { content, .. } = tool_message else {
+            panic!("tool response expected");
+        };
+        assert!(content.contains("model-value"));
+        let history = store.task_history(10).expect("task audit");
+        assert!(
+            history
+                .iter()
+                .filter(|entry| entry.kind == "action:echo_vendor")
+                .count()
+                >= 2
+        );
+        assert!(!format!("{history:?}").contains("hello;not-a-shell"));
+
+        drop(state);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
@@ -5691,6 +6169,8 @@ mod tests {
             auth: Arc::new(AuthManager::disabled("test-boot".into())),
             config_path: root.join("config.toml"),
             configuration_lock: Mutex::new(()),
+            actions: RwLock::new(ActionRegistry::default()),
+            action_slots: Semaphore::new(1),
             config,
         };
 
@@ -5783,6 +6263,8 @@ mod tests {
             auth: Arc::new(AuthManager::disabled("test-boot".into())),
             config_path: root.join("config.toml"),
             configuration_lock: Mutex::new(()),
+            actions: RwLock::new(ActionRegistry::default()),
+            action_slots: Semaphore::new(1),
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
@@ -5861,6 +6343,8 @@ mod tests {
             auth: Arc::new(AuthManager::disabled("test-boot".into())),
             config_path: root.join("config.toml"),
             configuration_lock: Mutex::new(()),
+            actions: RwLock::new(ActionRegistry::default()),
+            action_slots: Semaphore::new(1),
             config,
         };
 

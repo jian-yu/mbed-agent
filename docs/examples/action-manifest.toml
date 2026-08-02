@@ -1,0 +1,26 @@
+schema_version = 1
+
+[[actions]]
+id = "vendor_modem_status"
+description = "Inspect one vendor modem without changing its state"
+mode = "read_only"
+llm_enabled = false
+platforms = ["linux"]
+executable = "/usr/bin/mmcli"
+
+[[actions.argv]]
+kind = "literal"
+value = "--modem"
+
+[[actions.argv]]
+kind = "input"
+name = "modem_id"
+
+[[actions.argv]]
+kind = "literal"
+value = "--output-json"
+
+[actions.inputs.modem_id]
+kind = "integer"
+min = 0
+max = 8

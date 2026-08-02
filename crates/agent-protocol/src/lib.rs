@@ -21,6 +21,12 @@ pub enum Command {
     Ping,
     Status,
     Capabilities,
+    ActionList,
+    ActionReload,
+    ActionRun {
+        action_id: String,
+        inputs: Value,
+    },
     DiagnoseWan {
         active: bool,
     },
@@ -163,6 +169,9 @@ pub enum ResponseData {
     Pong { daemon_version: String },
     Status(StatusResponse),
     Capabilities(Value),
+    ActionList(Vec<ActionDescriptor>),
+    ActionReload(ActionReloadResponse),
+    ActionOutput(ActionOutputResponse),
     WanDiagnostic(Box<WanDiagnosticReport>),
     DnsDiagnostic(Box<DnsDiagnosticReport>),
     DhcpDiagnostic(Box<DhcpDiagnosticReport>),
@@ -225,6 +234,31 @@ pub struct ElevationResponse {
     pub role: String,
     pub boot_id: String,
     pub expires_monotonic_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionDescriptor {
+    pub id: String,
+    pub description: String,
+    pub mode: String,
+    pub llm_enabled: bool,
+    pub platforms: Vec<String>,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionReloadResponse {
+    pub loaded_actions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionOutputResponse {
+    pub action_id: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub output_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1656,6 +1690,12 @@ mod tests {
             Command::DiagnoseInterfaceStats,
             Command::DiagnoseConntrack,
             Command::DiagnoseQdisc,
+            Command::ActionList,
+            Command::ActionReload,
+            Command::ActionRun {
+                action_id: "vendor_modem".into(),
+                inputs: serde_json::json!({"modem_id": 1}),
+            },
             Command::Elevate {
                 password: SensitiveString::new("secret".into()),
             },

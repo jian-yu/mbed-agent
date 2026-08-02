@@ -559,6 +559,20 @@ max_firewall_state_bytes = 262144
 max_network_state_bytes = 262144
 max_firewall_execution_plan_bytes = 262144
 
+[extensions]
+enabled = false
+directories = ["/usr/share/mbed-agent/actions.d", "/etc/mbed-agent/actions.d"]
+trusted_manifest_owner_uid = 0
+trusted_executable_owner_uid = 0
+max_manifests = 32
+max_manifest_bytes = 32768
+max_actions = 64
+max_argv = 32
+max_inputs = 16
+max_input_bytes = 1024
+max_output_bytes = 65536
+timeout_secs = 5
+
 [auth]
 enabled = false
 admin_password_hash = ""
@@ -1266,6 +1280,15 @@ NetworkManager/systemd-networkd 文件仍拒绝写入。所有变更强制 R3，
 一次性 approval、全局串行执行、fixed `ip -batch` transaction、进程外逆向 batch、live
 typed verify 和显式 confirm。canonical 只进入有界 `/tmp` SQLite，设备重启不恢复、也
 不回写 Flash。
+
+截至 ADR 0050，用户与厂商扩展命令不再要求修改 Rust：daemon 从受信任、非 group/world
+writable 的 ActionSpec TOML 目录加载有界 registry，manifest 声明绝对 executable、固定
+argv 结构、平台范围、typed inputs、资源上限和是否允许 LLM 调用。运行参数只可填充独立
+argv element，不经过 shell 拼接；执行环境为空，cwd 固定，具有并发、超时、stdout/stderr
+和审计上限。允许以 `/bin/sh /固定/脚本.sh 参数…` 复用厂商脚本，但拒绝 `sh -c/-lc`。
+device-admin 可原子热重载 registry，失败保留旧版本；daemon 重启也会自动加载。当前只开放
+read-only Action，写 Action 必须在后续接入 typed ChangeSet、风险、验证和回滚，不能仅凭
+manifest 的自声明绕过配置安全边界。
 
 ## 21. 参考项目与官方资料
 
