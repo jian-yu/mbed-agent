@@ -226,7 +226,11 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
 fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Result<()> {
     let mqtt_credentials = config.channels.mqtt.enabled
         && (!config.channels.mqtt.username.is_empty() || !config.channels.mqtt.password.is_empty());
-    if (!config.llm.enabled && !config.auth.enabled && !mqtt_credentials) || !path.exists() {
+    let wechat_credentials = config.channels.wechat_clawbot.enabled
+        && !config.channels.wechat_clawbot.bot_token.is_empty();
+    if (!config.llm.enabled && !config.auth.enabled && !mqtt_credentials && !wechat_credentials)
+        || !path.exists()
+    {
         return Ok(());
     }
     let mode = fs::metadata(path)?.permissions().mode();
@@ -638,13 +642,30 @@ fn handle_channel_status(id: String, state: &AppState) -> ServerResponse {
         agent_channels::ChannelLifecycle::Offline => "offline",
         agent_channels::ChannelLifecycle::Disabled => "disabled",
     };
+    let wechat = &state.config.channels.wechat_clawbot;
+    let wechat_lifecycle = if !wechat.enabled {
+        "disabled"
+    } else if wechat.bot_token.is_empty() {
+        "unconfigured"
+    } else {
+        // Binding is persisted before the long-poll adapter starts; do not
+        // report online until a live adapter owns this state.
+        "bound"
+    };
     ServerResponse::success(
         id,
-        ResponseData::ChannelStatus(vec![ChannelStatusEntry {
-            channel: "mqtt".into(),
-            enabled,
-            lifecycle: lifecycle.into(),
-        }]),
+        ResponseData::ChannelStatus(vec![
+            ChannelStatusEntry {
+                channel: "mqtt".into(),
+                enabled,
+                lifecycle: lifecycle.into(),
+            },
+            ChannelStatusEntry {
+                channel: "wechat_clawbot".into(),
+                enabled: wechat.enabled,
+                lifecycle: wechat_lifecycle.into(),
+            },
+        ]),
     )
 }
 

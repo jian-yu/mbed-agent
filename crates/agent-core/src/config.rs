@@ -271,6 +271,7 @@ impl ExtensionsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ChannelsConfig {
     pub mqtt: MqttChannelConfig,
+    pub wechat_clawbot: WeChatClawBotConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,9 +308,36 @@ impl Default for MqttChannelConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WeChatClawBotConfig {
+    pub enabled: bool,
+    pub account: String,
+    pub base_url: String,
+    pub bot_token: SecretString,
+    pub bot_agent: String,
+    pub long_poll_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+}
+
+impl Default for WeChatClawBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            account: "default".into(),
+            base_url: "https://ilinkai.weixin.qq.com".into(),
+            bot_token: SecretString::default(),
+            bot_agent: "MbedAgent/0.1.0".into(),
+            long_poll_timeout_secs: 35,
+            request_timeout_secs: 10,
+        }
+    }
+}
+
 impl ChannelsConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.mqtt.validate()
+        self.mqtt.validate()?;
+        self.wechat_clawbot.validate()
     }
 }
 
@@ -344,6 +372,63 @@ impl MqttChannelConfig {
         }
         Ok(())
     }
+}
+
+impl WeChatClawBotConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !valid_channel_identifier(&self.account)
+            || self.bot_agent.is_empty()
+            || self.bot_agent.len() > 256
+            || self.bot_agent.chars().any(char::is_control)
+            || !(10..=60).contains(&self.long_poll_timeout_secs)
+            || !(1..=60).contains(&self.request_timeout_secs)
+            || self.bot_token.expose().len() > 8192
+            || self.bot_token.expose().chars().any(char::is_control)
+        {
+            return Err(ConfigError::Validation(
+                "WeChat ClawBot account, user-agent, token, and timeout limits are invalid".into(),
+            ));
+        }
+        if self.enabled && self.bot_token.is_empty() {
+            return Err(ConfigError::Validation(
+                "enabled WeChat ClawBot requires bot_token".into(),
+            ));
+        }
+        if self.enabled {
+            parse_wechat_clawbot_base_url(&self.base_url)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses the narrow HTTPS base URL used by the official `WeChat` `ClawBot` API.
+///
+/// The persisted value deliberately contains only a scheme and authority. API
+/// paths are owned by the adapter so a configuration edit cannot redirect a
+/// request to an arbitrary path or embed credentials in the URL.
+///
+/// # Errors
+///
+/// Returns an error when the value is not an HTTPS host-only URL.
+pub fn parse_wechat_clawbot_base_url(value: &str) -> Result<&str, ConfigError> {
+    let authority = value.strip_prefix("https://").ok_or_else(|| {
+        ConfigError::Validation("WeChat ClawBot base_url must use https://".into())
+    })?;
+    if authority.is_empty()
+        || authority.len() > 253
+        || authority.chars().any(char::is_whitespace)
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b':'))
+        || !authority
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(ConfigError::Validation(
+            "WeChat ClawBot base_url must contain only an HTTPS host".into(),
+        ));
+    }
+    Ok(authority)
 }
 
 /// Parses the deliberately narrow production MQTT broker form.
@@ -423,6 +508,11 @@ fn storage_record_limits_valid(storage: &StorageConfig) -> bool {
 pub struct SecretString(String);
 
 impl SecretString {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
@@ -877,6 +967,33 @@ mod tests {
 
         config.channels.mqtt.device_id = "device/+/escape".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_wechat_clawbot_requires_https_and_a_token() {
+        let mut config = AgentConfig::default();
+        config.channels.wechat_clawbot.enabled = true;
+        assert!(config.validate().is_err());
+
+        config.channels.wechat_clawbot.bot_token = SecretString("token".into());
+        config.channels.wechat_clawbot.base_url = "http://ilinkai.weixin.qq.com".into();
+        assert!(config.validate().is_err());
+
+        config.channels.wechat_clawbot.base_url = "https://ilinkai.weixin.qq.com".into();
+        assert!(config.validate().is_ok());
+
+        config.channels.wechat_clawbot.account = "bad/account".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn wechat_clawbot_base_url_rejects_embedded_credentials_and_paths() {
+        assert!(parse_wechat_clawbot_base_url("https://user@example.test").is_err());
+        assert!(parse_wechat_clawbot_base_url("https://example.test/api").is_err());
+        assert_eq!(
+            parse_wechat_clawbot_base_url("https://example.test").expect("host"),
+            "example.test"
+        );
     }
 
     #[test]

@@ -484,12 +484,15 @@ topic、QoS 1、有界 packet/inflight、persistent session 和封顶指数退�
 
 ```text
 mbed-agent channel bind wecom
-mbed-agent channel bind wechat-clawbot [--account <name>]
+mbed-agent channel bind-wechat-clawbot [--account <name>]
 mbed-agent channel status
 mbed-agent channel unbind <name>
 ```
 
-绑定器从官方接口申请临时授权会话，将官方授权 URL 渲染为终端二维码（不支持 Unicode 二维码的终端同时打印 URL），轮询或接收本地 callback，完成后验证凭据、原子写入 root-only Channel 配置，再立即建立连接。二维码内容、临时 code 和最终凭据不得进入 SQLite、普通日志或 LLM 上下文。解绑会停止连接并删除对应配置凭据；删除前明确确认。
+绑定器从官方接口申请临时授权会话，打印官方二维码 URL（后续可按 profile
+可选接入轻量终端渲染器），轮询或接收本地 callback，完成后验证凭据、原子写入
+root-only Channel 配置，再立即建立连接。二维码内容、临时 code 和最终凭据不得进入
+SQLite、普通日志或 LLM 上下文。解绑会停止连接并删除对应配置凭据；删除前明确确认。
 
 **企业微信**优先适配官方智能机器人长连接模式：使用官方授权取得的 Bot ID/Secret 或等价凭据，由设备连接官方 WSS，完成订阅认证、心跳、消息去重、流式回复、媒体下载解密与自动重连。如果所选官方产品的“扫码创建/授权机器人”要求已登记的应用、服务商身份或回调 URI，CLI 必须在绑定前做 capability/preflight 检查并给出准确条件，不能用非官方协议模拟扫码。也应保留“手工录入官方 Bot ID + Secret”作为官方兼容路径。
 
@@ -620,10 +623,13 @@ max_inflight = 8
 max_packet_bytes = 32768
 
 [channels.wechat_clawbot]
-enabled = true
+enabled = false
 account = "default"
+base_url = "https://ilinkai.weixin.qq.com"
+bot_token = ""
 bot_agent = "MbedAgent/0.1.0"
-long_poll_timeout_secs = 40
+long_poll_timeout_secs = 35
+request_timeout_secs = 10
 
 [policy]
 default = "deny"
@@ -1138,8 +1144,10 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 
 当前进度：MQTT 5 首个只读纵向切片已完成，包含 TLS-only 配置、daemon 启动自动连接、
 固定 topic、QoS 1、消息 TTL、SQLite 去重、有界 outbox、重试/退避和 CLI lifecycle status；
-仅开放 ping/status/ask/诊断。远程 device-admin、ChangeSet actor 绑定、mTLS 与签名 envelope
-尚未开放，企业微信和微信 ClawBot 仍待后续官方协议适配。
+仅开放 ping/status/ask/诊断。微信 ClawBot 的官方 QR 绑定命令已完成：CLI 轮询官方
+`get_bot_qrcode/get_qrcode_status`，把 `bot_token/base_url` 以 0600 原子配置写入，daemon
+重启后可识别为 `bound`；官方 `getupdates/sendmessage` 长轮询适配、远程 device-admin、
+ChangeSet actor 绑定、mTLS 与签名 envelope 尚未开放。企业微信仍待官方协议适配。
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 

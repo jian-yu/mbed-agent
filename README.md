@@ -101,8 +101,10 @@ inputs into the existing firewall or network mutation protocol without a Rust
 rebuild. Tool arguments are parsed and validated on-device; model text cannot
 become a shell command or bypass ChangeSet approval.
 
-Provider routing, additional model-facing network tools, WeCom, WeChat ClawBot,
-MQTT mutual-TLS identity, and Channel-facing elevation are not implemented yet.
+Provider routing, additional model-facing network tools, WeCom, MQTT mutual-TLS
+identity, and Channel-facing elevation are not implemented yet. WeChat ClawBot
+QR binding is implemented; the daemon-side long-poll message adapter remains a
+follow-up slice.
 The initial MQTT channel supports ping, status, read-only diagnostics, and ask;
 it deliberately exposes no remote configuration commands. Firewall
 configuration execution is available through the bounded ChangeSet path on
@@ -174,6 +176,8 @@ Approval-bound change templates are recorded in
 [ADR 0051](docs/adr/0051-declarative-action-change-templates.md).
 The MQTT 5 read-only transport, deduplication, and bounded outbox are recorded in
 [ADR 0052](docs/adr/0052-mqtt-read-only-channel.md).
+The official WeChat ClawBot QR binding and atomic credential persistence are
+recorded in [ADR 0053](docs/adr/0053-wechat-clawbot-binding.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -247,6 +251,23 @@ slice.
   "command": { "type": "diagnose", "target": "dns" }
 }
 ```
+
+## WeChat ClawBot binding
+
+The CLI uses the official Tencent QR login endpoint directly; it does not use a
+project relay or store runtime cursors on Flash. Run the command on the device,
+scan the displayed URL with WeChat, and confirm the login:
+
+```sh
+mbed-agent channel bind-wechat-clawbot --account default \
+  --config /etc/mbed-agent/config.toml
+mbed-agent channel status
+```
+
+After confirmation, the returned `bot_token` and HTTPS `base_url` are written
+atomically to the root-only TOML configuration. The current daemon reports the
+channel as `bound`; the official `getupdates` long-poll transport and replies
+are being added separately, so no inbound WeChat message is accepted yet.
 
 ## User and vendor actions
 

@@ -62,6 +62,15 @@ reconnect_max_secs = 60
 max_inflight = 8
 max_packet_bytes = 32768
 
+[channels.wechat_clawbot]
+enabled = false
+account = "default"
+base_url = "https://ilinkai.weixin.qq.com"
+bot_token = ""
+bot_agent = "MbedAgent/0.1.0"
+long_poll_timeout_secs = 35
+request_timeout_secs = 10
+
 [logging]
 level = "info"
 directives = ["agent_providers=warn", "agent_channels=info"]

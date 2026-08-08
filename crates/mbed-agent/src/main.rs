@@ -1,14 +1,20 @@
 use std::error::Error;
-use std::io::{self, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_core::generate_password_hash;
+use agent_core::{
+    AgentConfig, SecretString, WeChatClawBotConfig, generate_password_hash,
+    parse_wechat_clawbot_base_url,
+};
 use agent_protocol::{
     ClientRequest, Command, FirewallMutationRequest, NetworkMutationRequest, PROTOCOL_VERSION,
     SensitiveString, ServerResponse,
 };
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use zeroize::{Zeroize, Zeroizing};
@@ -130,6 +136,14 @@ enum ChannelTarget {
     Status {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
+    },
+    /// Bind the official `WeChat` `ClawBot` account by scanning a QR code.
+    #[command(name = "bind-wechat-clawbot")]
+    BindWechatClawbot {
+        #[arg(long, default_value = "default")]
+        account: String,
+        #[arg(short, long, default_value = "/etc/mbed-agent/config.toml")]
+        config: PathBuf,
     },
 }
 
@@ -300,6 +314,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Channel {
             target: ChannelTarget::Status { socket },
         } => run_client(&socket, Command::ChannelStatus).await,
+        CliCommand::Channel {
+            target: ChannelTarget::BindWechatClawbot { account, config },
+        } => run_wechat_clawbot_bind(&account, &config).await,
         CliCommand::Action { target } => run_action_target(target).await,
         CliCommand::Ask { prompt, socket } => {
             run_client(&socket, Command::Complete { prompt }).await
@@ -523,6 +540,216 @@ async fn run_change_target(target: ChangeTarget) -> Result<(), Box<dyn Error>> {
     }
 }
 
+const WECHAT_CLAWBOT_LOGIN_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+const WECHAT_CLAWBOT_MAX_HTTP_BYTES: usize = 32 * 1024;
+const WECHAT_CLAWBOT_MAX_POLLS: usize = 180;
+
+#[derive(Deserialize)]
+struct WeChatQrCodeResponse {
+    #[serde(default)]
+    ret: Option<i32>,
+    #[serde(default)]
+    qrcode: Option<String>,
+    #[serde(default)]
+    qrcode_img_content: Option<String>,
+    #[serde(default)]
+    errmsg: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WeChatQrCodeStatusResponse {
+    #[serde(default)]
+    ret: Option<i32>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    bot_token: Option<String>,
+    #[serde(default, alias = "base_url")]
+    baseurl: Option<String>,
+    #[serde(default)]
+    errmsg: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)] // The QR state machine keeps the bounded flow visible.
+async fn run_wechat_clawbot_bind(account: &str, config_path: &Path) -> Result<(), Box<dyn Error>> {
+    if !valid_cli_identifier(account) {
+        return Err(
+            "WeChat ClawBot account must contain only letters, digits, '-', '_' or '.'".into(),
+        );
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("MbedAgent/0.1.0")
+        .build()?;
+    let qr_endpoint =
+        format!("{WECHAT_CLAWBOT_LOGIN_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3");
+    let qr: WeChatQrCodeResponse = get_json_bounded(&client, &qr_endpoint).await?;
+    if qr.ret.is_some_and(|ret| ret != 0) {
+        return Err(format!(
+            "WeChat ClawBot QR request failed: {}",
+            qr.errmsg
+                .as_deref()
+                .unwrap_or("official API returned an error")
+        )
+        .into());
+    }
+    let qr_code = qr
+        .qrcode
+        .filter(|value| !value.is_empty())
+        .ok_or("official WeChat ClawBot QR response did not contain qrcode")?;
+    let qr_display = qr
+        .qrcode_img_content
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&qr_code);
+    println!("请使用微信扫描官方二维码（二维码地址如下）：\n{qr_display}");
+
+    let status_endpoint = format!("{WECHAT_CLAWBOT_LOGIN_BASE_URL}/ilink/bot/get_qrcode_status");
+    let mut last_status = String::new();
+    for _ in 0..WECHAT_CLAWBOT_MAX_POLLS {
+        let status_url = format!(
+            "{status_endpoint}?qrcode={}",
+            percent_encode_query(qr_code.as_bytes())
+        );
+        let response: WeChatQrCodeStatusResponse = get_json_bounded(&client, &status_url).await?;
+        if response.ret.is_some_and(|ret| ret != 0) {
+            return Err(format!(
+                "WeChat ClawBot QR polling failed: {}",
+                response
+                    .errmsg
+                    .as_deref()
+                    .unwrap_or("official API returned an error")
+            )
+            .into());
+        }
+        let status = response.status.as_deref().unwrap_or("wait");
+        if status != last_status {
+            println!("二维码状态：{status}");
+            status.clone_into(&mut last_status);
+        }
+        match status.to_ascii_lowercase().as_str() {
+            "confirmed" => {
+                let token = response
+                    .bot_token
+                    .filter(|value| !value.is_empty())
+                    .ok_or("WeChat ClawBot confirmation did not return bot_token")?;
+                let base_url = response
+                    .baseurl
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| WECHAT_CLAWBOT_LOGIN_BASE_URL.into());
+                parse_wechat_clawbot_base_url(&base_url)?;
+                if token.len() > 8192 || token.chars().any(char::is_control) {
+                    return Err("WeChat ClawBot returned an invalid bot_token".into());
+                }
+                let mut config = AgentConfig::load_or_default(config_path)?;
+                config.channels.wechat_clawbot = WeChatClawBotConfig {
+                    enabled: true,
+                    account: account.into(),
+                    base_url,
+                    bot_token: SecretString::new(token),
+                    bot_agent: "MbedAgent/0.1.0".into(),
+                    long_poll_timeout_secs: 35,
+                    request_timeout_secs: 10,
+                };
+                config.validate()?;
+                write_config_atomically(config_path, &config)?;
+                println!(
+                    "微信 ClawBot 已绑定，账号 {account} 的凭据已安全写入 {}；重启 daemon 后会自动连接。",
+                    config_path.display()
+                );
+                return Ok(());
+            }
+            "expired" | "cancelled" | "canceled" => {
+                return Err(format!("WeChat ClawBot QR code {status}").into());
+            }
+            "scanned" | "scaned" | "wait" | "" => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            _ => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    }
+    Err("timed out waiting for WeChat ClawBot QR confirmation".into())
+}
+
+async fn get_json_bounded<T: for<'de> Deserialize<'de>>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, Box<dyn Error>> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > WECHAT_CLAWBOT_MAX_HTTP_BYTES as u64)
+    {
+        return Err("WeChat ClawBot response exceeds the 32 KiB bound".into());
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() > WECHAT_CLAWBOT_MAX_HTTP_BYTES {
+        return Err("WeChat ClawBot response exceeds the 32 KiB bound".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_config_atomically(path: &Path, config: &AgentConfig) -> Result<(), Box<dyn Error>> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(format!(
+                "configuration path {} must be a regular file",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let parent = path.parent().ok_or("configuration path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temp_path = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml"),
+        std::process::id(),
+        stamp
+    ));
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        let text = toml::to_string_pretty(config)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn valid_cli_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn percent_encode_query(value: &[u8]) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 fn read_bounded_stdin(limit: usize, label: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut input = Vec::new();
     io::stdin()
@@ -657,5 +884,20 @@ mod cli_tests {
                 "one-use-token".into()
             )
         );
+    }
+
+    #[test]
+    fn qr_query_values_are_percent_encoded_without_shell_interpolation() {
+        assert_eq!(percent_encode_query(b"qr id/+~"), "qr%20id%2F%2B~");
+    }
+
+    #[test]
+    fn official_qr_status_response_accepts_forward_compatible_fields() {
+        let response: WeChatQrCodeStatusResponse = serde_json::from_str(
+            r#"{"status":"confirmed","bot_token":"secret","baseurl":"https://ilinkai.weixin.qq.com","future":true}"#,
+        )
+        .expect("official response shape");
+        assert_eq!(response.status.as_deref(), Some("confirmed"));
+        assert_eq!(response.bot_token.as_deref(), Some("secret"));
     }
 }
