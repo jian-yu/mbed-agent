@@ -25,6 +25,7 @@ agent-provider = { path = "crates/agent-provider" }
 agent-protocol = { path = "crates/agent-protocol" }
 agent-store = { path = "crates/agent-store", default-features = false }
 agent-tools = { path = "crates/agent-tools" }
+base64 = "0.22"
 platform-linux = { path = "crates/platform-linux" }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"

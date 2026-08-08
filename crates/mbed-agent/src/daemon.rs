@@ -68,6 +68,7 @@ use crate::network_execution::{
     GenericRuntimeRouteExecutionPort, GenericRuntimeRouteExecutionPortConfig,
     OpenWrtNetworkExecutionPort, OpenWrtNetworkExecutionPortConfig,
 };
+use crate::wechat_clawbot::{self, WeChatInbound};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOCAL_CLI_ACTOR: &str = "cli/local";
@@ -89,6 +90,7 @@ struct AppState {
     actions: RwLock<ActionRegistry>,
     action_slots: Semaphore,
     mqtt_status: Option<tokio::sync::watch::Receiver<agent_channels::ChannelLifecycle>>,
+    wechat_status: Option<tokio::sync::watch::Receiver<agent_channels::ChannelLifecycle>>,
 }
 
 #[allow(clippy::too_many_lines)] // Startup keeps all bounded runtime resources visibly assembled.
@@ -155,6 +157,14 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         usize::try_from(config.storage.max_channel_payload_bytes)?,
     )?;
     let mqtt_status = mqtt_runtime.as_ref().map(|runtime| runtime.status.clone());
+    let wechat_runtime = wechat_clawbot::start(
+        config.channels.wechat_clawbot.clone(),
+        Arc::clone(&store),
+        config.storage.max_channel_message_records,
+    )?;
+    let wechat_status = wechat_runtime
+        .as_ref()
+        .map(|runtime| runtime.status.clone());
     let state = Arc::new(AppState {
         config,
         config_path: config_path.to_path_buf(),
@@ -172,6 +182,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         actions: RwLock::new(actions),
         action_slots,
         mqtt_status,
+        wechat_status,
     });
     if let Some(mut runtime) = mqtt_runtime {
         let channel_state = Arc::clone(&state);
@@ -181,6 +192,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
                 tokio::spawn(handle_mqtt_inbound(message, state));
             }
             warn!("MQTT inbound dispatcher stopped");
+        });
+    }
+    if let Some(mut runtime) = wechat_runtime {
+        let channel_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(message) = runtime.inbound.recv().await {
+                let state = Arc::clone(&channel_state);
+                tokio::spawn(handle_wechat_inbound(message, state));
+            }
+            warn!("WeChat ClawBot inbound dispatcher stopped");
         });
     }
     let mut cleanup_interval =
@@ -254,6 +275,17 @@ async fn handle_mqtt_inbound(inbound: MqttInbound, state: Arc<AppState>) {
         warn!(%message_id, "MQTT response receiver disappeared");
     } else {
         info!(%message_id, %actor_id, "MQTT read-only request completed");
+    }
+}
+
+async fn handle_wechat_inbound(inbound: WeChatInbound, state: Arc<AppState>) {
+    let message_id = inbound.request.message_id.clone();
+    let actor_id = inbound.request.actor_id.clone();
+    let response = dispatch_channel_request(inbound.request, &state).await;
+    if inbound.respond_to.send(response).is_err() {
+        warn!(%message_id, %actor_id, "WeChat ClawBot response receiver disappeared");
+    } else {
+        info!(%message_id, %actor_id, "WeChat ClawBot request completed");
     }
 }
 
@@ -640,17 +672,31 @@ fn handle_channel_status(id: String, state: &AppState) -> ServerResponse {
         agent_channels::ChannelLifecycle::Online => "online",
         agent_channels::ChannelLifecycle::Backoff => "backoff",
         agent_channels::ChannelLifecycle::Offline => "offline",
+        agent_channels::ChannelLifecycle::NeedsRebind => "needs_rebind",
         agent_channels::ChannelLifecycle::Disabled => "disabled",
     };
     let wechat = &state.config.channels.wechat_clawbot;
-    let wechat_lifecycle = if !wechat.enabled {
-        "disabled"
-    } else if wechat.bot_token.is_empty() {
-        "unconfigured"
-    } else {
-        // Binding is persisted before the long-poll adapter starts; do not
-        // report online until a live adapter owns this state.
-        "bound"
+    let wechat_lifecycle = state.wechat_status.as_ref().map_or_else(
+        || {
+            if !wechat.enabled {
+                agent_channels::ChannelLifecycle::Disabled
+            } else if wechat.bot_token.is_empty() {
+                agent_channels::ChannelLifecycle::Unconfigured
+            } else {
+                agent_channels::ChannelLifecycle::Bound
+            }
+        },
+        |status| *status.borrow(),
+    );
+    let wechat_lifecycle = match wechat_lifecycle {
+        agent_channels::ChannelLifecycle::Unconfigured => "unconfigured",
+        agent_channels::ChannelLifecycle::Bound => "bound",
+        agent_channels::ChannelLifecycle::Connecting => "connecting",
+        agent_channels::ChannelLifecycle::Online => "online",
+        agent_channels::ChannelLifecycle::Backoff => "backoff",
+        agent_channels::ChannelLifecycle::Offline => "offline",
+        agent_channels::ChannelLifecycle::NeedsRebind => "needs_rebind",
+        agent_channels::ChannelLifecycle::Disabled => "disabled",
     };
     ServerResponse::success(
         id,
@@ -6050,6 +6096,7 @@ mod tests {
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
             mqtt_status: None,
+            wechat_status: None,
             config,
         };
 
@@ -6150,6 +6197,7 @@ mod tests {
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
             mqtt_status: None,
+            wechat_status: None,
             config,
         };
         (store, state)
@@ -6394,6 +6442,7 @@ max_bytes = 32
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
             mqtt_status: None,
+            wechat_status: None,
             config,
         };
 
@@ -6489,6 +6538,7 @@ max_bytes = 32
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
             mqtt_status: None,
+            wechat_status: None,
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
@@ -6570,6 +6620,7 @@ max_bytes = 32
             actions: RwLock::new(ActionRegistry::default()),
             action_slots: Semaphore::new(1),
             mqtt_status: None,
+            wechat_status: None,
             config,
         };
 

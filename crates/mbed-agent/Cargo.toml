@@ -17,6 +17,7 @@ agent-provider.workspace = true
 agent-protocol.workspace = true
 agent-store.workspace = true
 agent-tools.workspace = true
+base64.workspace = true
 clap.workspace = true
 libc.workspace = true
 platform-linux.workspace = true

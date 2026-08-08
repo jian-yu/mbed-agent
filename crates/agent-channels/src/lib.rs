@@ -18,6 +18,7 @@ pub enum ChannelLifecycle {
     Online,
     Backoff,
     Offline,
+    NeedsRebind,
     Disabled,
 }
 

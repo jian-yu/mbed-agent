@@ -103,8 +103,8 @@ become a shell command or bypass ChangeSet approval.
 
 Provider routing, additional model-facing network tools, WeCom, MQTT mutual-TLS
 identity, and Channel-facing elevation are not implemented yet. WeChat ClawBot
-QR binding is implemented; the daemon-side long-poll message adapter remains a
-follow-up slice.
+QR binding and the bounded official text long-poll adapter are implemented;
+media and Channel-facing elevation remain deferred.
 The initial MQTT channel supports ping, status, read-only diagnostics, and ask;
 it deliberately exposes no remote configuration commands. Firewall
 configuration execution is available through the bounded ChangeSet path on
@@ -178,12 +178,14 @@ The MQTT 5 read-only transport, deduplication, and bounded outbox are recorded i
 [ADR 0052](docs/adr/0052-mqtt-read-only-channel.md).
 The official WeChat ClawBot QR binding and atomic credential persistence are
 recorded in [ADR 0053](docs/adr/0053-wechat-clawbot-binding.md).
+The bounded `getupdates`/`sendmessage` text transport is recorded in
+[ADR 0054](docs/adr/0054-wechat-clawbot-long-poll.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
-the daemon foundation is usable now, while L2/L3 host-changing tools and remote
-channels remain disabled until their platform transaction and rollback
-boundaries exist.
+the daemon foundation and bounded read-only channels are usable now, while
+additional remote write capabilities remain disabled until their platform
+transaction and rollback boundaries exist.
 
 ## Build and test
 
@@ -265,9 +267,12 @@ mbed-agent channel status
 ```
 
 After confirmation, the returned `bot_token` and HTTPS `base_url` are written
-atomically to the root-only TOML configuration. The current daemon reports the
-channel as `bound`; the official `getupdates` long-poll transport and replies
-are being added separately, so no inbound WeChat message is accepted yet.
+atomically to the root-only TOML configuration. The daemon automatically starts
+the official `getupdates` long poll after restart, accepts bounded text messages,
+dispatches them through the same local read-only Agent path, and replies through
+`sendmessage` with the original `context_token`. Images, voice, files, and
+remote changes are rejected until their own bounded adapters exist. A revoked
+token is reported as `needs_rebind`.
 
 ## User and vendor actions
 

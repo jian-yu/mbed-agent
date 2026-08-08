@@ -25,6 +25,7 @@ mod firewall_execution;
 mod logging;
 mod mqtt_channel;
 mod network_execution;
+mod wechat_clawbot;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Mbed Agent for embedded Linux and OpenWrt")]

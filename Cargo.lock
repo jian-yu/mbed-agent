@@ -762,6 +762,7 @@ dependencies = [
  "agent-provider",
  "agent-store",
  "agent-tools",
+ "base64",
  "clap",
  "libc",
  "platform-linux",

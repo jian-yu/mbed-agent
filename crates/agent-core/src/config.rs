@@ -380,6 +380,10 @@ impl WeChatClawBotConfig {
             || self.bot_agent.is_empty()
             || self.bot_agent.len() > 256
             || self.bot_agent.chars().any(char::is_control)
+            || !self
+                .bot_agent
+                .bytes()
+                .all(|byte| (0x20..=0x7e).contains(&byte))
             || !(10..=60).contains(&self.long_poll_timeout_secs)
             || !(1..=60).contains(&self.request_timeout_secs)
             || self.bot_token.expose().len() > 8192

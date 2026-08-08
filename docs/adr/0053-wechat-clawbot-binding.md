@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for the binding slice; message transport is deferred.
+Accepted for the binding slice.
 
 ## Context
 
@@ -20,11 +20,8 @@ confirmation it validates the HTTPS base URL and token size/control-character
 limits, loads the existing TOML configuration, and atomically replaces it with
 mode `0600`. Symlink and non-regular configuration targets are rejected.
 
-The daemon only reports `disabled`, `unconfigured`, or `bound` for this slice;
-it does not claim `online` until a Rust long-poll adapter owns a live lifecycle
-state. The token is never written to SQLite, passed as an argument, or emitted
-to logs. The adapter will follow Tencent's official `getupdates` and
-`sendmessage` contract in a later ADR, including volatile cursor and context
-token handling.
+The token is never written to SQLite, passed as an argument, or emitted to logs.
+The daemon-side lifecycle and text transport are specified separately in
+[ADR 0054](0054-wechat-clawbot-long-poll.md).
 
 Reference implementation: [Tencent openclaw-weixin](https://github.com/Tencent/openclaw-weixin).

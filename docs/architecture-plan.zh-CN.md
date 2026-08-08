@@ -454,7 +454,7 @@ trait Channel {
 
 内部消息包含：message_id、channel、actor、conversation、device target、timestamp、text、attachments、reply context、auth context。输出能力声明是否支持 streaming、edit message、buttons、markdown、files 和 approval UI。核心不得出现企业微信专有字段。
 
-每个 Channel 实现统一生命周期：`Unconfigured → Binding → Bound → Connecting → Online → Backoff/Offline → Disabled`。`Bound` 所需的 app id、bot id、refresh token、secret、证书或官方授权结果作为 Channel 配置原子写入 `/etc/mbed-agent/channels.d/<name>.toml` 或等价 UCI 配置，权限为 root-only；这是允许写 Flash 的配置数据。连接状态、临时 access token、心跳、重连计数、消息游标和去重缓存只进入内存或 `/tmp` SQLite。
+每个 Channel 实现统一生命周期：`Unconfigured → Binding → Bound → Connecting → Online → Backoff/Offline → NeedsRebind/Disabled`。`Bound` 所需的 app id、bot id、refresh token、secret、证书或官方授权结果作为 Channel 配置原子写入 `/etc/mbed-agent/channels.d/<name>.toml` 或等价 UCI 配置，权限为 root-only；这是允许写 Flash 的配置数据。连接状态、临时 access token、心跳、重连计数、消息游标和去重缓存只进入内存或 `/tmp` SQLite。
 
 守护进程启动时必须枚举所有 `enabled && bound` 的 Channel，并行但限流地自动建立连接。连接失败使用带 jitter 的指数退避，不阻塞 Agent 本地 CLI；凭据失效进入 `NeedsRebind` 并通过其他在线 Channel/CLI 告警。正常断线自动重连，守护进程重启不要求重新扫码，只有官方授权被撤销、refresh token 失效或配置被删除时才重新绑定。
 
@@ -1146,8 +1146,9 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 固定 topic、QoS 1、消息 TTL、SQLite 去重、有界 outbox、重试/退避和 CLI lifecycle status；
 仅开放 ping/status/ask/诊断。微信 ClawBot 的官方 QR 绑定命令已完成：CLI 轮询官方
 `get_bot_qrcode/get_qrcode_status`，把 `bot_token/base_url` 以 0600 原子配置写入，daemon
-重启后可识别为 `bound`；官方 `getupdates/sendmessage` 长轮询适配、远程 device-admin、
-ChangeSet actor 绑定、mTLS 与签名 envelope 尚未开放。企业微信仍待官方协议适配。
+重启后自动启动官方 `getupdates` 长轮询，接收有界文本并使用原消息 `context_token` 通过
+`sendmessage` 回复；媒体、远程 device-admin、ChangeSet actor 绑定、mTLS 与签名 envelope
+尚未开放。企业微信仍待官方协议适配。
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 
