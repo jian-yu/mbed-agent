@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 pub const CHANNEL_MESSAGE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CHANNEL_MESSAGE_BYTES: usize = 32 * 1024;
@@ -39,7 +40,56 @@ pub enum ChannelCommand {
     Ping,
     Status,
     Ask { text: String },
+    Elevate { password: ChannelSecret },
     Diagnose { target: DiagnosticTarget },
+}
+
+/// A channel-supplied administrator password that is redacted in debug output
+/// and zeroized when the message leaves memory.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ChannelSecret(String);
+
+impl ChannelSecret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        let mut value = self;
+        std::mem::take(&mut value.0)
+    }
+}
+
+impl std::fmt::Debug for ChannelSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED CHANNEL SECRET]")
+    }
+}
+
+impl Drop for ChannelSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// Converts the small, transport-neutral text command surface into a typed
+/// channel command. Only `/elevate` is intercepted; all other text remains an
+/// LLM prompt.
+#[must_use]
+pub fn command_from_text(mut text: String) -> ChannelCommand {
+    if let Some(rest) = text.strip_prefix("/elevate") {
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+            let password = rest.trim().to_owned();
+            text.zeroize();
+            return ChannelCommand::Elevate {
+                password: ChannelSecret::new(password),
+            };
+        }
+    }
+    ChannelCommand::Ask { text }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,10 +197,22 @@ pub fn decode_request(
     if request.expires_unix_ms.saturating_sub(now_unix_ms) > 10 * 60 * 1_000 {
         return Err(ChannelMessageError::InvalidField("expires_unix_ms"));
     }
-    if let ChannelCommand::Ask { text } = &request.command {
-        if text.trim().is_empty() || text.len() > MAX_CHANNEL_TEXT_BYTES || text.contains('\0') {
-            return Err(ChannelMessageError::InvalidField("command.text"));
+    match &request.command {
+        ChannelCommand::Ask { text } => {
+            if text.trim().is_empty() || text.len() > MAX_CHANNEL_TEXT_BYTES || text.contains('\0')
+            {
+                return Err(ChannelMessageError::InvalidField("command.text"));
+            }
         }
+        ChannelCommand::Elevate { password } => {
+            if password.0.is_empty()
+                || password.0.len() > 1_024
+                || password.0.chars().any(char::is_control)
+            {
+                return Err(ChannelMessageError::InvalidField("command.password"));
+            }
+        }
+        ChannelCommand::Ping | ChannelCommand::Status | ChannelCommand::Diagnose { .. } => {}
     }
     Ok(request)
 }
@@ -166,6 +228,7 @@ fn validate_command_shape(command: Option<&Value>) -> Result<(), ChannelMessageE
     let expected = match kind {
         "ping" | "status" => ["type"].as_slice(),
         "ask" => ["text", "type"].as_slice(),
+        "elevate" => ["password", "type"].as_slice(),
         "diagnose" => ["target", "type"].as_slice(),
         _ => return Err(ChannelMessageError::InvalidJson),
     };
@@ -282,5 +345,43 @@ mod tests {
             decode_request(payload, 1),
             Err(ChannelMessageError::InvalidJson)
         );
+    }
+
+    #[test]
+    fn elevate_text_becomes_redacted_typed_command() {
+        let command = command_from_text("/elevate correct horse".into());
+        assert_eq!(
+            command,
+            ChannelCommand::Elevate {
+                password: ChannelSecret::new("correct horse"),
+            }
+        );
+        assert!(!format!("{command:?}").contains("correct horse"));
+
+        assert!(matches!(
+            command_from_text("/elevateX not-a-command".into()),
+            ChannelCommand::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn elevate_payload_is_bounded_and_schema_checked() {
+        let request = ChannelRequest {
+            schema_version: CHANNEL_MESSAGE_SCHEMA_VERSION,
+            message_id: "message-1".into(),
+            actor_id: "wecom:user-1".into(),
+            conversation_id: "wecom:chat-1".into(),
+            expires_unix_ms: 10_000,
+            command: ChannelCommand::Elevate {
+                password: ChannelSecret::new("secret"),
+            },
+        };
+        let payload = serde_json::to_vec(&request).expect("encode");
+        assert!(decode_request(&payload, 1).is_ok());
+        assert!(decode_request(
+            br#"{"schema_version":1,"message_id":"m","actor_id":"a","conversation_id":"c","expires_unix_ms":10000,"command":{"type":"elevate","password":""}}"#,
+            1
+        )
+        .is_err());
     }
 }

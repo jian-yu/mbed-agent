@@ -495,6 +495,11 @@ SQLite、普通日志或 LLM 上下文。解绑会停止连接并删除对应配
 
 **企业微信**适配官方智能机器人长连接模式：使用 Bot ID/Secret，由设备连接官方 WSS，完成 `aibot_subscribe` 订阅认证、`ping` 心跳、消息去重、流式回复和指数退避自动重连。该官方长连接协议本身不提供设备侧二维码绑定，因此 CLI 采用 Secret stdin 的手工绑定路径；不得用非官方协议模拟扫码。媒体和事件保持明确拒绝/忽略，待独立的有界适配器实现。
 
+所有 Channel 的文本入口都保留一个结构化 `/elevate <password>` 命令；它不会进入
+LLM，而是直接复用 daemon 的 PBKDF2 管理员校验，签发仅绑定当前 `actor_id`、boot ID
+和 RAM TTL 的 `device-admin` capability。密码不进入 SQLite、日志或响应内容，空密码、
+超长密码和控制字符在 Channel 边界拒绝。
+
 **微信**明确使用腾讯官方 `openclaw-weixin` 所采用的微信 ClawBot/iLink Bot 能力，不再以公众号、客服、小程序作为本项目微信 Channel 的主方案，也不接入个人号逆向、Hook 或模拟客户端协议。设备端不安装 Node.js 或完整 OpenClaw；`channel-wechat-clawbot` crate 依据腾讯官方公开实现的行为和服务条款，以 Rust 实现最小适配层，从而满足嵌入式资源预算。
 
 ClawBot 绑定与运行流程：
@@ -1151,7 +1156,7 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 - MQTT 5 device protocol、mTLS、易失 outbox、去重和证书轮换。
 - 企业微信官方长连接 adapter、CLI 官方凭据绑定、自动重连。
 - 微信 ClawBot/iLink Bot Rust adapter：QR 状态机、token 落配置、getupdates 长轮询、context token、媒体和自动重连。
-- 所有 Channel 的管理员密码提权、限速、TTL 与敏感消息旁路。
+- 所有 Channel 的管理员密码提权、限速、TTL 与敏感消息旁路（首个跨 Channel `/elevate` 切片已完成）。
 - 多 provider 路由、配额和模型健康度。
 - Channel/Provider 协议版本兼容检查；Skill/Runbook 只随外部软件包维护流程更新。
 
@@ -1163,7 +1168,8 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 `sendmessage` 回复；媒体、远程 device-admin、ChangeSet actor 绑定、mTLS 与签名 envelope
 尚未开放。企业微信智能机器人首个 WSS 文本切片已完成：CLI 通过 Secret stdin
 原子写入 Bot ID/Secret，daemon 重启自动 `aibot_subscribe`、心跳、文本回调、流式回复、
-去重、ACK 观测和有界退避；媒体、事件、mTLS 与签名 envelope 尚未开放。
+去重、ACK 观测和有界退避；所有 Channel 的结构化 `/elevate` 已接通并按 actor 绑定；
+媒体、事件、mTLS 与签名 envelope 尚未开放。
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 

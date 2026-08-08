@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_channels::{ChannelCommand, ChannelResponse, DiagnosticTarget};
+use agent_channels::{ChannelCommand, ChannelResponse, DiagnosticTarget, command_from_text};
 use agent_core::{
     ActionChangeDomain, ActionMode, ActionRegistry, AdminPasswordVerifier, AgentConfig, AuthError,
     AuthManager, FirewallExecutionPlan, FirewallMutation, FirewallRiskContext,
@@ -330,6 +330,7 @@ async fn dispatch_channel_request(
     state: &AppState,
 ) -> ChannelResponse {
     let message_id = request.message_id;
+    let actor_id = request.actor_id.clone();
     let internal_id = format!("{channel}:{message_id}");
     let response = match request.command {
         ChannelCommand::Ping => ServerResponse::success(
@@ -339,7 +340,20 @@ async fn dispatch_channel_request(
             },
         ),
         ChannelCommand::Status => ServerResponse::success(internal_id, status_response(state)),
-        ChannelCommand::Ask { text } => handle_completion(internal_id, text, state).await,
+        ChannelCommand::Elevate { password } => {
+            handle_elevation(internal_id, password.into_inner(), actor_id, state).await
+        }
+        ChannelCommand::Ask { text } => match command_from_text(text) {
+            ChannelCommand::Elevate { password } => {
+                handle_elevation(internal_id, password.into_inner(), actor_id, state).await
+            }
+            ChannelCommand::Ask { text } => handle_completion(internal_id, text, state).await,
+            _ => ServerResponse::error(
+                internal_id,
+                ErrorCode::InvalidRequest,
+                "channel command is not supported in this context",
+            ),
+        },
         ChannelCommand::Diagnose { target } => match target {
             DiagnosticTarget::Wan => handle_wan_diagnosis(internal_id, false, state).await,
             DiagnosticTarget::Dns => handle_dns_diagnosis(internal_id, state).await,
@@ -580,7 +594,13 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         }
         Command::Status => status_response(state),
         Command::Elevate { password } => {
-            return handle_elevation(request.id, password.into_inner(), state).await;
+            return handle_elevation(
+                request.id,
+                password.into_inner(),
+                LOCAL_CLI_ACTOR.into(),
+                state,
+            )
+            .await;
         }
         Command::ChangeGet { change_set_id } => {
             return handle_change_get(request.id, change_set_id, state).await;
@@ -963,18 +983,24 @@ async fn handle_action_run(
     }
 }
 
-async fn handle_elevation(id: String, password: String, state: &AppState) -> ServerResponse {
+async fn handle_elevation(
+    id: String,
+    password: String,
+    actor_id: String,
+    state: &AppState,
+) -> ServerResponse {
     let password = Zeroizing::new(password);
     let auth = Arc::clone(&state.auth);
+    let actor_id_for_auth = actor_id.clone();
     let now_monotonic_ms = u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let outcome = tokio::task::spawn_blocking(move || {
-        auth.elevate(LOCAL_CLI_ACTOR, password.as_bytes(), now_monotonic_ms)
+        auth.elevate(&actor_id_for_auth, password.as_bytes(), now_monotonic_ms)
     })
     .await;
     match outcome {
         Ok(Ok(capability)) => {
             info!(
-                actor_id = LOCAL_CLI_ACTOR,
+                actor_id = %actor_id,
                 "device administrator capability granted"
             );
             ServerResponse::success(
@@ -994,7 +1020,7 @@ async fn handle_elevation(id: String, password: String, state: &AppState) -> Ser
         ),
         Ok(Err(AuthError::InvalidCredentials | AuthError::Locked)) => {
             warn!(
-                actor_id = LOCAL_CLI_ACTOR,
+                actor_id = %actor_id,
                 "device administrator authentication failed"
             );
             ServerResponse::error(
@@ -6123,6 +6149,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn elevation_is_boot_bound_and_does_not_persist_passwords() {
         let test_id = TEST_ID.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(format!(
@@ -6165,7 +6192,13 @@ mod tests {
             config,
         };
 
-        let rejected = handle_elevation("wrong".into(), "wrong password".into(), &state).await;
+        let rejected = handle_elevation(
+            "wrong".into(),
+            "wrong password".into(),
+            LOCAL_CLI_ACTOR.into(),
+            &state,
+        )
+        .await;
         assert_eq!(
             rejected.error.expect("unauthorized").code,
             ErrorCode::Unauthorized
@@ -6173,6 +6206,7 @@ mod tests {
         let granted = handle_elevation(
             "correct".into(),
             "test administrator password".into(),
+            LOCAL_CLI_ACTOR.into(),
             &state,
         )
         .await;
@@ -6187,6 +6221,37 @@ mod tests {
                 .auth
                 .is_device_admin("cli/local", 1)
                 .expect("auth state")
+        );
+        let channel_response = dispatch_channel_request(
+            "wecom",
+            agent_channels::ChannelRequest {
+                schema_version: agent_channels::CHANNEL_MESSAGE_SCHEMA_VERSION,
+                message_id: "wecom-elevate-1".into(),
+                actor_id: "wecom:user-1".into(),
+                conversation_id: "wecom:chat-1".into(),
+                expires_unix_ms: i64::MAX,
+                command: ChannelCommand::Elevate {
+                    password: agent_channels::ChannelSecret::new("test administrator password"),
+                },
+            },
+            &state,
+        )
+        .await;
+        let channel_capability: agent_protocol::ElevationResponse = serde_json::from_value(
+            channel_response
+                .result
+                .expect("channel elevation result")
+                .get("data")
+                .cloned()
+                .expect("channel elevation payload"),
+        )
+        .expect("channel elevation response");
+        assert_eq!(channel_capability.actor_id, "wecom:user-1");
+        assert!(
+            state
+                .auth
+                .is_device_admin("wecom:user-1", 1)
+                .expect("channel auth state")
         );
         let database = fs::read(&state.config.storage.path).expect("database bytes");
         assert!(
@@ -6437,6 +6502,7 @@ max_bytes = 32
         handle_elevation(
             "elevate".into(),
             "test administrator password".into(),
+            LOCAL_CLI_ACTOR.into(),
             &state,
         )
         .await;

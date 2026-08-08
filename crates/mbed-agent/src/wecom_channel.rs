@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_channels::{
-    CHANNEL_MESSAGE_SCHEMA_VERSION, ChannelCommand, ChannelLifecycle, ChannelRequest,
-    ChannelResponse, decode_request,
+    CHANNEL_MESSAGE_SCHEMA_VERSION, ChannelLifecycle, ChannelRequest, ChannelResponse,
+    command_from_text, decode_request,
 };
 use agent_core::{WeComBotConfig, parse_wecom_ws_url};
 use agent_store::{ChannelMessageClaim, Store};
@@ -345,7 +345,7 @@ async fn handle_callback(
         actor_id: format!("wecom:{user}"),
         conversation_id: format!("wecom:{}", body.chatid.as_deref().unwrap_or(&user)),
         expires_unix_ms: now.saturating_add(9 * 60 * 1_000),
-        command: ChannelCommand::Ask { text },
+        command: command_from_text(text),
     };
     if decode_request(&serde_json::to_vec(&request).unwrap_or_default(), now).is_err() {
         return;

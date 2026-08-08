@@ -296,6 +296,14 @@ Only bounded text callbacks are dispatched to the Agent; events and media are
 ignored until their bounded adapters are added. Repeated authentication failure
 transitions the channel to `needs_rebind`.
 
+All configured channels share the same bounded administrator elevation path. In
+a verified one-to-one or approved group conversation, send `/elevate` followed
+by the administrator password. The password is handled as a redacted typed
+command, checked against the daemon's boot-bound verifier, and immediately
+zeroized; it is never forwarded to the LLM, written to SQLite, or logged. The
+resulting `device-admin` capability is scoped to that channel actor and the
+current boot.
+
 ## User and vendor actions
 
 Set `extensions.enabled = true`, then place mode-0600/0644 TOML manifests

@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_channels::{
     CHANNEL_MESSAGE_SCHEMA_VERSION, ChannelLifecycle, ChannelRequest, ChannelResponse,
-    decode_request,
+    command_from_text, decode_request,
 };
 use agent_core::{WeChatClawBotConfig, parse_wechat_clawbot_base_url};
 use agent_store::{ChannelMessageClaim, Store};
@@ -306,7 +306,7 @@ async fn handle_message(
         actor_id: format!("wechat:{from_user_id}"),
         conversation_id: format!("wechat:{conversation_id}"),
         expires_unix_ms: expires,
-        command: agent_channels::ChannelCommand::Ask { text },
+        command: command_from_text(text),
     };
     if decode_request(&serde_json::to_vec(&request).unwrap_or_default(), now).is_err() {
         warn!(%message_id, "WeChat ClawBot message failed channel validation");

@@ -20,6 +20,8 @@ root-only 配置文件中持久化，运行时状态和消息去重只落 `/tmp`
   录并清理 pending，连接健康由心跳 ACK 决定。
 - 重复消息通过 `/tmp` SQLite 原子 claim 丢弃；daemon 重启后不恢复消息状态。
 - 连续认证失败进入 `needs_rebind`，不会无限重试错误凭据。
+- 文本 `/elevate <password>` 在 Channel 边界转换为脱敏结构化命令，直接进入本地
+  管理员校验，不送入 LLM；密码只在 bounded 内存路径中存在。
 
 CLI 使用：
 
