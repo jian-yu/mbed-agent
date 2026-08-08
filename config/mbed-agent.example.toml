@@ -71,6 +71,20 @@ bot_agent = "MbedAgent/0.1.0"
 long_poll_timeout_secs = 35
 request_timeout_secs = 10
 
+[channels.wecom]
+enabled = false
+account = "default"
+bot_id = ""
+secret = ""
+ws_url = "wss://openws.work.weixin.qq.com"
+heartbeat_secs = 30
+reconnect_min_secs = 1
+reconnect_max_secs = 60
+max_inflight = 4
+max_frame_bytes = 32768
+reply_ack_timeout_secs = 5
+max_auth_failures = 3
+
 [logging]
 level = "info"
 directives = ["agent_providers=warn", "agent_channels=info"]

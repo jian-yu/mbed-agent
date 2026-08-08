@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_core::{
-    AgentConfig, SecretString, WeChatClawBotConfig, generate_password_hash,
-    parse_wechat_clawbot_base_url,
+    AgentConfig, SecretString, WeChatClawBotConfig, WeComBotConfig, generate_password_hash,
+    parse_wechat_clawbot_base_url, parse_wecom_ws_url,
 };
 use agent_protocol::{
     ClientRequest, Command, FirewallMutationRequest, NetworkMutationRequest, PROTOCOL_VERSION,
@@ -26,6 +26,7 @@ mod logging;
 mod mqtt_channel;
 mod network_execution;
 mod wechat_clawbot;
+mod wecom_channel;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Mbed Agent for embedded Linux and OpenWrt")]
@@ -143,6 +144,18 @@ enum ChannelTarget {
     BindWechatClawbot {
         #[arg(long, default_value = "default")]
         account: String,
+        #[arg(short, long, default_value = "/etc/mbed-agent/config.toml")]
+        config: PathBuf,
+    },
+    /// Bind an official `WeCom` smart bot using Bot ID and a secret read from stdin.
+    #[command(name = "bind-wecom")]
+    BindWecom {
+        #[arg(long)]
+        bot_id: String,
+        #[arg(long, default_value = "default")]
+        account: String,
+        #[arg(long, default_value = "wss://openws.work.weixin.qq.com")]
+        ws_url: String,
         #[arg(short, long, default_value = "/etc/mbed-agent/config.toml")]
         config: PathBuf,
     },
@@ -306,6 +319,7 @@ enum ChangeTarget {
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Args::parse().command {
         CliCommand::Daemon { config } => daemon::run(&config).await,
@@ -318,6 +332,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Channel {
             target: ChannelTarget::BindWechatClawbot { account, config },
         } => run_wechat_clawbot_bind(&account, &config).await,
+        CliCommand::Channel {
+            target:
+                ChannelTarget::BindWecom {
+                    bot_id,
+                    account,
+                    ws_url,
+                    config,
+                },
+        } => run_wecom_bind(&bot_id, &account, &ws_url, &config),
         CliCommand::Action { target } => run_action_target(target).await,
         CliCommand::Ask { prompt, socket } => {
             run_client(&socket, Command::Complete { prompt }).await
@@ -672,6 +695,38 @@ async fn run_wechat_clawbot_bind(account: &str, config_path: &Path) -> Result<()
     Err("timed out waiting for WeChat ClawBot QR confirmation".into())
 }
 
+fn run_wecom_bind(
+    bot_id: &str,
+    account: &str,
+    ws_url: &str,
+    config_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    if !valid_cli_identifier(account) {
+        return Err("WeCom account must contain only letters, digits, '-', '_' or '.'".into());
+    }
+    if bot_id.is_empty() || bot_id.len() > 256 || bot_id.chars().any(char::is_control) {
+        return Err("WeCom bot_id is empty or exceeds its 256-byte bound".into());
+    }
+    parse_wecom_ws_url(ws_url)?;
+    let secret = read_secret_stdin("WeCom bot secret", 8 * 1024)?;
+    let mut config = AgentConfig::load_or_default(config_path)?;
+    config.channels.wecom = WeComBotConfig {
+        enabled: true,
+        account: account.into(),
+        bot_id: bot_id.into(),
+        secret: SecretString::new(secret),
+        ws_url: ws_url.into(),
+        ..WeComBotConfig::default()
+    };
+    config.validate()?;
+    write_config_atomically(config_path, &config)?;
+    println!(
+        "企业微信智能机器人已绑定，账号 {account} 的配置已写入 {}；重启 daemon 后会自动建立 WSS 连接。",
+        config_path.display()
+    );
+    Ok(())
+}
+
 async fn get_json_bounded<T: for<'de> Deserialize<'de>>(
     client: &reqwest::Client,
     url: &str,
@@ -786,6 +841,25 @@ fn read_password_stdin() -> Result<Zeroizing<Vec<u8>>, Box<dyn Error>> {
         return Err("administrator password must not be empty".into());
     }
     Ok(password)
+}
+
+fn read_secret_stdin(label: &str, limit: usize) -> Result<String, Box<dyn Error>> {
+    let mut secret = Zeroizing::new(Vec::with_capacity(128));
+    io::stdin()
+        .lock()
+        .take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut secret)?;
+    if secret.len() > limit {
+        return Err(format!("{label} exceeds {limit} bytes").into());
+    }
+    while matches!(secret.last(), Some(b'\n' | b'\r')) {
+        secret.pop();
+    }
+    if secret.is_empty() {
+        return Err(format!("{label} must not be empty").into());
+    }
+    let bytes = std::mem::take(&mut *secret);
+    String::from_utf8(bytes).map_err(|_| format!("{label} must be valid UTF-8").into())
 }
 
 fn read_approval_stdin(

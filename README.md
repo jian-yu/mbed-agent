@@ -101,10 +101,10 @@ inputs into the existing firewall or network mutation protocol without a Rust
 rebuild. Tool arguments are parsed and validated on-device; model text cannot
 become a shell command or bypass ChangeSet approval.
 
-Provider routing, additional model-facing network tools, WeCom, MQTT mutual-TLS
-identity, and Channel-facing elevation are not implemented yet. WeChat ClawBot
-QR binding and the bounded official text long-poll adapter are implemented;
-media and Channel-facing elevation remain deferred.
+Provider routing, additional model-facing network tools, and MQTT mutual-TLS
+identity remain deferred. WeChat ClawBot QR binding and the bounded official
+text long-poll adapter are implemented. WeCom smart-bot WSS binding and the
+bounded text callback adapter are also implemented; media remains deferred.
 The initial MQTT channel supports ping, status, read-only diagnostics, and ask;
 it deliberately exposes no remote configuration commands. Firewall
 configuration execution is available through the bounded ChangeSet path on
@@ -274,6 +274,28 @@ dispatches them through the same local read-only Agent path, and replies through
 remote changes are rejected until their own bounded adapters exist. A revoked
 token is reported as `needs_rebind`.
 
+## WeCom smart-bot binding
+
+The official WeCom smart-bot long-connection mode uses a Bot ID and Secret;
+there is no device-side QR flow for this protocol. Read the Secret from stdin
+so it is not exposed in shell history, then restart (or start) the daemon:
+
+```sh
+printf '%s\n' "$WECOM_BOT_SECRET" | mbed-agent channel bind-wecom \
+  --bot-id BOT_ID --account default \
+  --config /etc/mbed-agent/config.toml
+mbed-agent channel status
+```
+
+The command validates a host-only `wss://` endpoint and atomically writes the
+root-only configuration. The daemon connects directly to the WeCom WSS service
+after every restart, authenticates with `aibot_subscribe`, sends bounded
+heartbeats, reconnects with backoff, deduplicates callback message IDs in the
+volatile SQLite store, and replies with the official streaming response frame.
+Only bounded text callbacks are dispatched to the Agent; events and media are
+ignored until their bounded adapters are added. Repeated authentication failure
+transitions the channel to `needs_rebind`.
+
 ## User and vendor actions
 
 Set `extensions.enabled = true`, then place mode-0600/0644 TOML manifests
@@ -341,8 +363,8 @@ printf '%s\n' 'replace-with-a-strong-password' \
 The returned capability expires after `auth.capability_ttl_secs` and disappears
 on daemon restart. Failed authentication is rate-limited per actor with
 `auth.max_failures` and `auth.lockout_secs`. The same authenticator is designed
-for verified MQTT, WeCom, and WeChat actors, but those adapters are not connected
-yet. Passwords are never accepted as command-line arguments.
+for verified MQTT, WeCom, and WeChat actors; channel adapters do not bypass local
+policy. Passwords are never accepted as command-line arguments.
 
 Typed firewall mutations can be planned, inspected, approved, executed, and
 confirmed through the same binary. `firewall-plan` reads a JSON array of closed

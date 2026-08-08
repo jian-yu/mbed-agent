@@ -272,6 +272,7 @@ impl ExtensionsConfig {
 pub struct ChannelsConfig {
     pub mqtt: MqttChannelConfig,
     pub wechat_clawbot: WeChatClawBotConfig,
+    pub wecom: WeComBotConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +321,42 @@ pub struct WeChatClawBotConfig {
     pub request_timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WeComBotConfig {
+    pub enabled: bool,
+    pub account: String,
+    pub bot_id: String,
+    pub secret: SecretString,
+    pub ws_url: String,
+    pub heartbeat_secs: u64,
+    pub reconnect_min_secs: u64,
+    pub reconnect_max_secs: u64,
+    pub max_inflight: u16,
+    pub max_frame_bytes: usize,
+    pub reply_ack_timeout_secs: u64,
+    pub max_auth_failures: u8,
+}
+
+impl Default for WeComBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            account: "default".into(),
+            bot_id: String::new(),
+            secret: SecretString::default(),
+            ws_url: "wss://openws.work.weixin.qq.com".into(),
+            heartbeat_secs: 30,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 60,
+            max_inflight: 4,
+            max_frame_bytes: 32 * 1024,
+            reply_ack_timeout_secs: 5,
+            max_auth_failures: 3,
+        }
+    }
+}
+
 impl Default for WeChatClawBotConfig {
     fn default() -> Self {
         Self {
@@ -337,7 +374,8 @@ impl Default for WeChatClawBotConfig {
 impl ChannelsConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         self.mqtt.validate()?;
-        self.wechat_clawbot.validate()
+        self.wechat_clawbot.validate()?;
+        self.wecom.validate()
     }
 }
 
@@ -403,6 +441,72 @@ impl WeChatClawBotConfig {
         }
         Ok(())
     }
+}
+
+impl WeComBotConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !valid_channel_identifier(&self.account)
+            || self.bot_id.len() > 256
+            || self.bot_id.is_empty() && self.enabled
+            || self.bot_id.chars().any(char::is_control)
+            || self.secret.expose().len() > 8192
+            || self.secret.expose().chars().any(char::is_control)
+            || !(10..=120).contains(&self.heartbeat_secs)
+            || self.reconnect_min_secs == 0
+            || self.reconnect_min_secs > self.reconnect_max_secs
+            || self.reconnect_max_secs > 300
+            || !(1..=16).contains(&self.max_inflight)
+            || !(1024..=32 * 1024).contains(&self.max_frame_bytes)
+            || !(1..=30).contains(&self.reply_ack_timeout_secs)
+            || !(1..=10).contains(&self.max_auth_failures)
+        {
+            return Err(ConfigError::Validation(
+                "WeCom account, bot credentials, heartbeat, reconnect, inflight, frame, and acknowledgement limits are invalid".into(),
+            ));
+        }
+        if self.enabled && self.secret.is_empty() {
+            return Err(ConfigError::Validation(
+                "enabled WeCom bot requires secret".into(),
+            ));
+        }
+        if self.enabled {
+            parse_wecom_ws_url(&self.ws_url)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses the bounded WSS endpoint accepted by the `WeCom` smart-bot protocol.
+///
+/// # Errors
+///
+/// Returns an error when the endpoint is not a host-only `wss://` URL.
+pub fn parse_wecom_ws_url(value: &str) -> Result<&str, ConfigError> {
+    let authority = value.strip_prefix("wss://").ok_or_else(|| {
+        ConfigError::Validation("enabled WeCom ws_url must use wss:// TLS".into())
+    })?;
+    if authority.is_empty()
+        || authority.len() > 253
+        || authority.chars().any(char::is_whitespace)
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@'))
+        || !authority
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
+    {
+        return Err(ConfigError::Validation(
+            "WeCom ws_url must contain only a WSS host and optional port".into(),
+        ));
+    }
+    if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+            return Err(ConfigError::Validation(
+                "WeCom ws_url port must be between 1 and 65535".into(),
+            ));
+        }
+    }
+    Ok(authority)
 }
 
 /// Parses the narrow HTTPS base URL used by the official `WeChat` `ClawBot` API.
@@ -998,6 +1102,33 @@ mod tests {
             parse_wechat_clawbot_base_url("https://example.test").expect("host"),
             "example.test"
         );
+    }
+
+    #[test]
+    fn enabled_wecom_requires_bot_credentials_and_wss_endpoint() {
+        let mut config = AgentConfig::default();
+        config.channels.wecom.enabled = true;
+        assert!(config.validate().is_err());
+
+        config.channels.wecom.bot_id = "bot-1".into();
+        config.channels.wecom.secret = SecretString::new("secret");
+        config.channels.wecom.ws_url = "https://openws.work.weixin.qq.com".into();
+        assert!(config.validate().is_err());
+
+        config.channels.wecom.ws_url = "wss://openws.work.weixin.qq.com".into();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            parse_wecom_ws_url("wss://example.test:443").expect("endpoint"),
+            "example.test:443"
+        );
+    }
+
+    #[test]
+    fn wecom_endpoint_rejects_paths_credentials_and_bad_ports() {
+        assert!(parse_wecom_ws_url("wss://user@example.test").is_err());
+        assert!(parse_wecom_ws_url("wss://example.test/api").is_err());
+        assert!(parse_wecom_ws_url("wss://example.test:0").is_err());
+        assert!(parse_wecom_ws_url("wss://example.test:65536").is_err());
     }
 
     #[test]

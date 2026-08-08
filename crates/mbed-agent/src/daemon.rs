@@ -69,6 +69,7 @@ use crate::network_execution::{
     OpenWrtNetworkExecutionPort, OpenWrtNetworkExecutionPortConfig,
 };
 use crate::wechat_clawbot::{self, WeChatInbound};
+use crate::wecom_channel::{self, WeComInbound};
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOCAL_CLI_ACTOR: &str = "cli/local";
@@ -91,6 +92,7 @@ struct AppState {
     action_slots: Semaphore,
     mqtt_status: Option<tokio::sync::watch::Receiver<agent_channels::ChannelLifecycle>>,
     wechat_status: Option<tokio::sync::watch::Receiver<agent_channels::ChannelLifecycle>>,
+    wecom_status: Option<tokio::sync::watch::Receiver<agent_channels::ChannelLifecycle>>,
 }
 
 #[allow(clippy::too_many_lines)] // Startup keeps all bounded runtime resources visibly assembled.
@@ -165,6 +167,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
     let wechat_status = wechat_runtime
         .as_ref()
         .map(|runtime| runtime.status.clone());
+    let wecom_runtime = wecom_channel::start(
+        config.channels.wecom.clone(),
+        Arc::clone(&store),
+        config.storage.max_channel_message_records,
+    )?;
+    let wecom_status = wecom_runtime.as_ref().map(|runtime| runtime.status.clone());
     let state = Arc::new(AppState {
         config,
         config_path: config_path.to_path_buf(),
@@ -183,6 +191,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         action_slots,
         mqtt_status,
         wechat_status,
+        wecom_status,
     });
     if let Some(mut runtime) = mqtt_runtime {
         let channel_state = Arc::clone(&state);
@@ -202,6 +211,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
                 tokio::spawn(handle_wechat_inbound(message, state));
             }
             warn!("WeChat ClawBot inbound dispatcher stopped");
+        });
+    }
+    if let Some(mut runtime) = wecom_runtime {
+        let channel_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Some(message) = runtime.inbound.recv().await {
+                let state = Arc::clone(&channel_state);
+                tokio::spawn(handle_wecom_inbound(message, state));
+            }
+            warn!("WeCom inbound dispatcher stopped");
         });
     }
     let mut cleanup_interval =
@@ -245,11 +264,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Result<()> {
-    let mqtt_credentials = config.channels.mqtt.enabled
-        && (!config.channels.mqtt.username.is_empty() || !config.channels.mqtt.password.is_empty());
-    let wechat_credentials = config.channels.wechat_clawbot.enabled
-        && !config.channels.wechat_clawbot.bot_token.is_empty();
-    if (!config.llm.enabled && !config.auth.enabled && !mqtt_credentials && !wechat_credentials)
+    let mqtt_credentials =
+        !config.channels.mqtt.username.is_empty() || !config.channels.mqtt.password.is_empty();
+    let wechat_credentials = !config.channels.wechat_clawbot.bot_token.is_empty();
+    let wecom_credentials =
+        !config.channels.wecom.bot_id.is_empty() || !config.channels.wecom.secret.is_empty();
+    if (!config.llm.enabled
+        && !config.auth.enabled
+        && !mqtt_credentials
+        && !wechat_credentials
+        && !wecom_credentials)
         || !path.exists()
     {
         return Ok(());
@@ -270,7 +294,7 @@ fn ensure_secret_config_permissions(path: &Path, config: &AgentConfig) -> io::Re
 async fn handle_mqtt_inbound(inbound: MqttInbound, state: Arc<AppState>) {
     let message_id = inbound.request.message_id.clone();
     let actor_id = inbound.request.actor_id.clone();
-    let response = dispatch_channel_request(inbound.request, &state).await;
+    let response = dispatch_channel_request("mqtt", inbound.request, &state).await;
     if inbound.respond_to.send(response).is_err() {
         warn!(%message_id, "MQTT response receiver disappeared");
     } else {
@@ -281,7 +305,7 @@ async fn handle_mqtt_inbound(inbound: MqttInbound, state: Arc<AppState>) {
 async fn handle_wechat_inbound(inbound: WeChatInbound, state: Arc<AppState>) {
     let message_id = inbound.request.message_id.clone();
     let actor_id = inbound.request.actor_id.clone();
-    let response = dispatch_channel_request(inbound.request, &state).await;
+    let response = dispatch_channel_request("wechat_clawbot", inbound.request, &state).await;
     if inbound.respond_to.send(response).is_err() {
         warn!(%message_id, %actor_id, "WeChat ClawBot response receiver disappeared");
     } else {
@@ -289,12 +313,24 @@ async fn handle_wechat_inbound(inbound: WeChatInbound, state: Arc<AppState>) {
     }
 }
 
+async fn handle_wecom_inbound(inbound: WeComInbound, state: Arc<AppState>) {
+    let message_id = inbound.request.message_id.clone();
+    let actor_id = inbound.request.actor_id.clone();
+    let response = dispatch_channel_request("wecom", inbound.request, &state).await;
+    if inbound.respond_to.send(response).is_err() {
+        warn!(%message_id, %actor_id, "WeCom response receiver disappeared");
+    } else {
+        info!(%message_id, %actor_id, "WeCom request completed");
+    }
+}
+
 async fn dispatch_channel_request(
+    channel: &str,
     request: agent_channels::ChannelRequest,
     state: &AppState,
 ) -> ChannelResponse {
     let message_id = request.message_id;
-    let internal_id = format!("mqtt:{message_id}");
+    let internal_id = format!("{channel}:{message_id}");
     let response = match request.command {
         ChannelCommand::Ping => ServerResponse::success(
             internal_id,
@@ -698,6 +734,29 @@ fn handle_channel_status(id: String, state: &AppState) -> ServerResponse {
         agent_channels::ChannelLifecycle::NeedsRebind => "needs_rebind",
         agent_channels::ChannelLifecycle::Disabled => "disabled",
     };
+    let wecom = &state.config.channels.wecom;
+    let wecom_lifecycle = state.wecom_status.as_ref().map_or_else(
+        || {
+            if !wecom.enabled {
+                agent_channels::ChannelLifecycle::Disabled
+            } else if wecom.bot_id.is_empty() || wecom.secret.is_empty() {
+                agent_channels::ChannelLifecycle::Unconfigured
+            } else {
+                agent_channels::ChannelLifecycle::Bound
+            }
+        },
+        |status| *status.borrow(),
+    );
+    let wecom_lifecycle = match wecom_lifecycle {
+        agent_channels::ChannelLifecycle::Unconfigured => "unconfigured",
+        agent_channels::ChannelLifecycle::Bound => "bound",
+        agent_channels::ChannelLifecycle::Connecting => "connecting",
+        agent_channels::ChannelLifecycle::Online => "online",
+        agent_channels::ChannelLifecycle::Backoff => "backoff",
+        agent_channels::ChannelLifecycle::Offline => "offline",
+        agent_channels::ChannelLifecycle::NeedsRebind => "needs_rebind",
+        agent_channels::ChannelLifecycle::Disabled => "disabled",
+    };
     ServerResponse::success(
         id,
         ResponseData::ChannelStatus(vec![
@@ -710,6 +769,11 @@ fn handle_channel_status(id: String, state: &AppState) -> ServerResponse {
                 channel: "wechat_clawbot".into(),
                 enabled: wechat.enabled,
                 lifecycle: wechat_lifecycle.into(),
+            },
+            ChannelStatusEntry {
+                channel: "wecom".into(),
+                enabled: wecom.enabled,
+                lifecycle: wecom_lifecycle.into(),
             },
         ]),
     )
@@ -6097,6 +6161,7 @@ mod tests {
             action_slots: Semaphore::new(1),
             mqtt_status: None,
             wechat_status: None,
+            wecom_status: None,
             config,
         };
 
@@ -6198,6 +6263,7 @@ mod tests {
             action_slots: Semaphore::new(1),
             mqtt_status: None,
             wechat_status: None,
+            wecom_status: None,
             config,
         };
         (store, state)
@@ -6301,6 +6367,7 @@ max_bytes = 32
         ));
         let (_store, state) = approval_test_state(&root);
         let response = dispatch_channel_request(
+            "mqtt",
             agent_channels::ChannelRequest {
                 schema_version: agent_channels::CHANNEL_MESSAGE_SCHEMA_VERSION,
                 message_id: "mqtt-message-1".into(),
@@ -6443,6 +6510,7 @@ max_bytes = 32
             action_slots: Semaphore::new(1),
             mqtt_status: None,
             wechat_status: None,
+            wecom_status: None,
             config,
         };
 
@@ -6539,6 +6607,7 @@ max_bytes = 32
             action_slots: Semaphore::new(1),
             mqtt_status: None,
             wechat_status: None,
+            wecom_status: None,
             config,
         };
         let response = handle_completion("agent-loop".into(), "check WAN".into(), &state).await;
@@ -6621,6 +6690,7 @@ max_bytes = 32
             action_slots: Semaphore::new(1),
             mqtt_status: None,
             wechat_status: None,
+            wecom_status: None,
             config,
         };
 

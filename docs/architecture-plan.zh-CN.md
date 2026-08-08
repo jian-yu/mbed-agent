@@ -9,7 +9,7 @@
 
 Mbed Agent 定位为运行在 OpenWrt、Buildroot、Yocto 等小型嵌入式 Linux 设备上的专业网络运维 Agent。它不是把通用聊天机器人简单塞进路由器，而是一个“设备本地确定性控制面 + 可替换 LLM 推理面”的系统：本地侧采集状态、执行诊断、验证配置、管理权限、保存审计记录和完成故障回滚；LLM 负责理解自然语言、选择诊断路径、解释证据和提出结构化操作计划。
 
-首版建议只发布一个 Rust 可执行程序 `mbed-agent`：`daemon` 子命令运行守护进程，其他子命令作为本地 CLI；另有可选的 LuCI，以及按需加载的工具和 Channel 适配器。核心运行时保持单进程、有限并发、无动态插件装载；扩展采用编译期 feature、声明式 Skill/Runbook 和受控外部程序三种方式。企业微信和微信官方 Channel 由设备直接连接，不依赖项目自建云端中继；CLI 负责显示官方授权二维码并完成绑定。设备侧不运行大模型，默认通过 HTTPS 使用远端模型；在资源较充足的边缘网关上，也可通过 OpenAI-compatible 接口连接本地推理服务。
+首版建议只发布一个 Rust 可执行程序 `mbed-agent`：`daemon` 子命令运行守护进程，其他子命令作为本地 CLI；另有可选的 LuCI，以及按需加载的工具和 Channel 适配器。核心运行时保持单进程、有限并发、无动态插件装载；扩展采用编译期 feature、声明式 Skill/Runbook 和受控外部程序三种方式。企业微信和微信官方 Channel 由设备直接连接，不依赖项目自建云端中继；CLI 按各官方产品的授权方式完成绑定（微信 ClawBot 使用二维码，企业微信智能机器人使用 Bot ID/Secret）。设备侧不运行大模型，默认通过 HTTPS 使用远端模型；在资源较充足的边缘网关上，也可通过 OpenAI-compatible 接口连接本地推理服务。
 
 本方案采用严格的易失运行时：除 `/etc/config/*` 与 `/etc/mbed-agent/` 下的配置、Channel 绑定凭据外，Agent 运行产生的会话、任务、审计、快照、日志和附件一律不得写入 Flash。唯一数据库为 `/tmp/mbed-agent/agent.db` 中的 SQLite；守护进程重启时可继续使用同一次开机内的数据，整机重启或断电后无需恢复。
 
@@ -17,7 +17,7 @@ Mbed Agent 定位为运行在 OpenWrt、Buildroot、Yocto 等小型嵌入式 Lin
 
 ### 1.1 已确认的产品约束
 
-1. 企业微信使用官方智能机器人能力；个人微信明确使用腾讯微信 ClawBot/iLink Bot 能力。二者均由设备直连，CLI 展示官方授权二维码完成绑定，凭据自动保存为配置，daemon 启动后自动连接全部已绑定 Channel。
+1. 企业微信使用官方智能机器人能力；个人微信明确使用腾讯微信 ClawBot/iLink Bot 能力。二者均由设备直连，凭据自动保存为配置，daemon 启动后自动连接全部已绑定 Channel；仅微信 ClawBot 使用二维码，企业微信长连接使用 Bot ID/Secret。
 2. Agent 运行时除配置文件和 Channel 绑定凭据外不得写 Flash；OpenWrt 业务配置变更也是受策略保护的配置写入。
 3. 唯一数据库为 SQLite，固定使用 `/tmp/mbed-agent/agent.db`，无需跨设备重启或断电恢复。
 4. 任意 Channel 的 actor 均可通过设备管理员密码校验，短时提升为 `device-admin`；密码校验完全在设备本地完成。
@@ -480,13 +480,12 @@ topic、QoS 1、有界 packet/inflight、persistent session 和封顶指数退�
 
 ### 10.3 企业微信与微信生态
 
-企业微信与微信 Channel 均由设备直接使用腾讯官方开放能力接入，不经过项目自建云 Relay。CLI 提供统一绑定命令：
+企业微信与微信 Channel 均由设备直接使用腾讯官方开放能力接入，不经过项目自建云 Relay。CLI 提供绑定和状态命令：
 
 ```text
-mbed-agent channel bind wecom
 mbed-agent channel bind-wechat-clawbot [--account <name>]
+printf '<secret>' | mbed-agent channel bind-wecom --bot-id <id>
 mbed-agent channel status
-mbed-agent channel unbind <name>
 ```
 
 绑定器从官方接口申请临时授权会话，打印官方二维码 URL（后续可按 profile
@@ -494,7 +493,7 @@ mbed-agent channel unbind <name>
 root-only Channel 配置，再立即建立连接。二维码内容、临时 code 和最终凭据不得进入
 SQLite、普通日志或 LLM 上下文。解绑会停止连接并删除对应配置凭据；删除前明确确认。
 
-**企业微信**优先适配官方智能机器人长连接模式：使用官方授权取得的 Bot ID/Secret 或等价凭据，由设备连接官方 WSS，完成订阅认证、心跳、消息去重、流式回复、媒体下载解密与自动重连。如果所选官方产品的“扫码创建/授权机器人”要求已登记的应用、服务商身份或回调 URI，CLI 必须在绑定前做 capability/preflight 检查并给出准确条件，不能用非官方协议模拟扫码。也应保留“手工录入官方 Bot ID + Secret”作为官方兼容路径。
+**企业微信**适配官方智能机器人长连接模式：使用 Bot ID/Secret，由设备连接官方 WSS，完成 `aibot_subscribe` 订阅认证、`ping` 心跳、消息去重、流式回复和指数退避自动重连。该官方长连接协议本身不提供设备侧二维码绑定，因此 CLI 采用 Secret stdin 的手工绑定路径；不得用非官方协议模拟扫码。媒体和事件保持明确拒绝/忽略，待独立的有界适配器实现。
 
 **微信**明确使用腾讯官方 `openclaw-weixin` 所采用的微信 ClawBot/iLink Bot 能力，不再以公众号、客服、小程序作为本项目微信 Channel 的主方案，也不接入个人号逆向、Hook 或模拟客户端协议。设备端不安装 Node.js 或完整 OpenClaw；`channel-wechat-clawbot` crate 依据腾讯官方公开实现的行为和服务条款，以 Rust 实现最小适配层，从而满足嵌入式资源预算。
 
@@ -630,6 +629,20 @@ bot_token = ""
 bot_agent = "MbedAgent/0.1.0"
 long_poll_timeout_secs = 35
 request_timeout_secs = 10
+
+[channels.wecom]
+enabled = false
+account = "default"
+bot_id = ""
+secret = ""
+ws_url = "wss://openws.work.weixin.qq.com"
+heartbeat_secs = 30
+reconnect_min_secs = 1
+reconnect_max_secs = 60
+max_inflight = 4
+max_frame_bytes = 32768
+reply_ack_timeout_secs = 5
+max_auth_failures = 3
 
 [policy]
 default = "deny"
@@ -921,7 +934,7 @@ mbed-agent log clear
 
 ### 16.1 “为什么路由器不能上网？”
 
-1. 企业微信官方智能机器人 Channel 已在设备上完成扫码/凭据绑定，daemon 通过官方 WSS 直接收到消息并使用官方字段映射 actor。
+1. 企业微信官方智能机器人 Channel 已在设备上完成 Bot ID/Secret 凭据绑定，daemon 通过官方 WSS 直接收到消息并使用官方字段映射 actor。
 2. Agent 识别为只读 WAN Runbook，自动执行 R0/R1 探针。
 3. 发现 WAN 有地址和默认路由，公共 IP 可达，但 DNS 查询超时。
 4. 检查 dnsmasq 上游与日志，形成“上游 DNS 不可达”的证据链。
@@ -1136,7 +1149,7 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 ### Phase 4：直连多 Channel（4–6 周）
 
 - MQTT 5 device protocol、mTLS、易失 outbox、去重和证书轮换。
-- 企业微信官方长连接 adapter、CLI 二维码/官方凭据绑定、自动重连。
+- 企业微信官方长连接 adapter、CLI 官方凭据绑定、自动重连。
 - 微信 ClawBot/iLink Bot Rust adapter：QR 状态机、token 落配置、getupdates 长轮询、context token、媒体和自动重连。
 - 所有 Channel 的管理员密码提权、限速、TTL 与敏感消息旁路。
 - 多 provider 路由、配额和模型健康度。
@@ -1148,7 +1161,9 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 `get_bot_qrcode/get_qrcode_status`，把 `bot_token/base_url` 以 0600 原子配置写入，daemon
 重启后自动启动官方 `getupdates` 长轮询，接收有界文本并使用原消息 `context_token` 通过
 `sendmessage` 回复；媒体、远程 device-admin、ChangeSet actor 绑定、mTLS 与签名 envelope
-尚未开放。企业微信仍待官方协议适配。
+尚未开放。企业微信智能机器人首个 WSS 文本切片已完成：CLI 通过 Secret stdin
+原子写入 Bot ID/Secret，daemon 重启自动 `aibot_subscribe`、心跳、文本回调、流式回复、
+去重、ACK 观测和有界退避；媒体、事件、mTLS 与签名 envelope 尚未开放。
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 
@@ -1167,7 +1182,7 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 - Rust + Tokio；单 daemon，多 adapter，所有队列有界。
 - LLM 不直接执行命令，typed tool + 本地 policy 为唯一执行入口。
 - OpenWrt 原生控制面优先；UCI 变更使用 `/tmp` snapshot 与同次开机内的独立回滚。
-- 企业微信/微信官方 Channel 由设备直连，CLI 完成官方扫码/凭据绑定，daemon 启动后自动连接。
+- 企业微信/微信官方 Channel 由设备直连，CLI 按产品完成官方凭据绑定（微信扫码、企业微信 Bot ID/Secret），daemon 启动后自动连接。
 - SQLite 是唯一运行时存储，固定在 `/tmp`，不引入设备端向量数据库或跨重启恢复。
 - 除配置与 Channel 绑定凭据外，Agent 运行态严禁写 Flash。
 - 任意 Channel actor 都可以通过本地校验管理员密码，临时提升为 `device-admin`。

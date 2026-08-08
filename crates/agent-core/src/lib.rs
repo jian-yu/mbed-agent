@@ -21,7 +21,8 @@ pub use changes::{
 };
 pub use config::{
     AgentConfig, ChannelsConfig, ConfigError, ExtensionsConfig, MqttChannelConfig, Profile,
-    SecretString, WeChatClawBotConfig, parse_mqtts_broker, parse_wechat_clawbot_base_url,
+    SecretString, WeChatClawBotConfig, WeComBotConfig, parse_mqtts_broker,
+    parse_wechat_clawbot_base_url, parse_wecom_ws_url,
 };
 pub use execution::{
     ChangeExecutionError, ChangeExecutionPort, ExecutionOutcome, ExecutionPortError,
