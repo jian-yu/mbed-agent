@@ -105,8 +105,9 @@ Provider routing, additional model-facing network tools, and MQTT mutual-TLS
 identity remain deferred. WeChat ClawBot QR binding and the bounded official
 text long-poll adapter are implemented. WeCom smart-bot WSS binding and the
 bounded text callback adapter are also implemented; media remains deferred.
-The initial MQTT channel supports ping, status, read-only diagnostics, and ask;
-it deliberately exposes no remote configuration commands. Firewall
+The channels support ping, status, read-only diagnostics, ask, and the bounded
+typed ChangeSet plan/approval/apply/confirm flow. They never expose arbitrary
+shell commands. Firewall
 configuration execution is available through the bounded ChangeSet path on
 supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
@@ -303,6 +304,21 @@ command, checked against the daemon's boot-bound verifier, and immediately
 zeroized; it is never forwarded to the LLM, written to SQLite, or logged. The
 resulting `device-admin` capability is scoped to that channel actor and the
 current boot.
+
+After elevation, the same channel can use the typed ChangeSet flow without
+shell interpolation:
+
+```text
+/firewall-inventory
+/firewall-plan [{"operation":"create", ...}]
+/change-get <change-set-id>
+/change-approve <change-set-id>
+/change-apply <change-set-id> <approval-id> <one-use-token>
+/change-confirm <change-set-id>
+```
+
+Plans are still validated against a fresh firewall/network inventory; approval,
+one-use tokens, rollback and confirmed commit remain mandatory for writes.
 
 ## User and vendor actions
 

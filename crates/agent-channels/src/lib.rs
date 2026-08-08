@@ -39,9 +39,40 @@ pub struct ChannelRequest {
 pub enum ChannelCommand {
     Ping,
     Status,
-    Ask { text: String },
-    Elevate { password: ChannelSecret },
-    Diagnose { target: DiagnosticTarget },
+    Ask {
+        text: String,
+    },
+    Elevate {
+        password: ChannelSecret,
+    },
+    Diagnose {
+        target: DiagnosticTarget,
+    },
+    FirewallInventory,
+    NetworkInventory,
+    FirewallPlan {
+        mutations_json: String,
+    },
+    NetworkPlan {
+        mutations_json: String,
+    },
+    ChangeGet {
+        change_set_id: String,
+    },
+    ChangeApprove {
+        change_set_id: String,
+    },
+    ChangeApply {
+        change_set_id: String,
+        approval_id: String,
+        approval_token: ChannelSecret,
+    },
+    ChangeConfirm {
+        change_set_id: String,
+    },
+    ChangeReject {
+        change_set_id: String,
+    },
 }
 
 /// A channel-supplied administrator password that is redacted in debug output
@@ -76,8 +107,8 @@ impl Drop for ChannelSecret {
 }
 
 /// Converts the small, transport-neutral text command surface into a typed
-/// channel command. Only `/elevate` is intercepted; all other text remains an
-/// LLM prompt.
+/// channel command. The bounded inventory/ChangeSet commands and `/elevate` are
+/// intercepted; all other text remains an LLM prompt.
 #[must_use]
 pub fn command_from_text(mut text: String) -> ChannelCommand {
     if let Some(rest) = text.strip_prefix("/elevate") {
@@ -87,6 +118,65 @@ pub fn command_from_text(mut text: String) -> ChannelCommand {
             return ChannelCommand::Elevate {
                 password: ChannelSecret::new(password),
             };
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/firewall-inventory") {
+        if rest.trim().is_empty() {
+            return ChannelCommand::FirewallInventory;
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/network-inventory") {
+        if rest.trim().is_empty() {
+            return ChannelCommand::NetworkInventory;
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/firewall-plan") {
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+            return ChannelCommand::FirewallPlan {
+                mutations_json: rest.trim().to_owned(),
+            };
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/network-plan") {
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+            return ChannelCommand::NetworkPlan {
+                mutations_json: rest.trim().to_owned(),
+            };
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/change-apply") {
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+            let mut fields = rest.split_whitespace();
+            let change_set_id = fields.next().unwrap_or_default().to_owned();
+            let approval_id = fields.next().unwrap_or_default().to_owned();
+            let mut approval_token = fields.next().unwrap_or_default().to_owned();
+            if fields.next().is_some() {
+                approval_token.clear();
+            }
+            text.zeroize();
+            return ChannelCommand::ChangeApply {
+                change_set_id,
+                approval_id,
+                approval_token: ChannelSecret::new(approval_token),
+            };
+        }
+    }
+    for (prefix, command) in [
+        ("/change-get", 0_u8),
+        ("/change-approve", 1),
+        ("/change-confirm", 2),
+        ("/change-reject", 3),
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+                let change_set_id = rest.trim().to_owned();
+                return match command {
+                    0 => ChannelCommand::ChangeGet { change_set_id },
+                    1 => ChannelCommand::ChangeApprove { change_set_id },
+                    2 => ChannelCommand::ChangeConfirm { change_set_id },
+                    _ => ChannelCommand::ChangeReject { change_set_id },
+                };
+            }
         }
     }
     ChannelCommand::Ask { text }
@@ -212,7 +302,34 @@ pub fn decode_request(
                 return Err(ChannelMessageError::InvalidField("command.password"));
             }
         }
-        ChannelCommand::Ping | ChannelCommand::Status | ChannelCommand::Diagnose { .. } => {}
+        ChannelCommand::FirewallPlan { mutations_json }
+        | ChannelCommand::NetworkPlan { mutations_json } => {
+            if mutations_json.is_empty() || mutations_json.len() > MAX_CHANNEL_MESSAGE_BYTES {
+                return Err(ChannelMessageError::InvalidField("command.mutations_json"));
+            }
+        }
+        ChannelCommand::ChangeApply {
+            change_set_id,
+            approval_id,
+            approval_token,
+        } => {
+            validate_command_id(change_set_id, "command.change_set_id")?;
+            validate_command_id(approval_id, "command.approval_id")?;
+            if approval_token.0.is_empty() || approval_token.0.len() > 256 {
+                return Err(ChannelMessageError::InvalidField("command.approval_token"));
+            }
+        }
+        ChannelCommand::ChangeGet { change_set_id }
+        | ChannelCommand::ChangeApprove { change_set_id }
+        | ChannelCommand::ChangeConfirm { change_set_id }
+        | ChannelCommand::ChangeReject { change_set_id } => {
+            validate_command_id(change_set_id, "command.change_set_id")?;
+        }
+        ChannelCommand::Ping
+        | ChannelCommand::Status
+        | ChannelCommand::Diagnose { .. }
+        | ChannelCommand::FirewallInventory
+        | ChannelCommand::NetworkInventory => {}
     }
     Ok(request)
 }
@@ -226,10 +343,15 @@ fn validate_command_shape(command: Option<&Value>) -> Result<(), ChannelMessageE
         .and_then(Value::as_str)
         .ok_or(ChannelMessageError::InvalidJson)?;
     let expected = match kind {
-        "ping" | "status" => ["type"].as_slice(),
+        "ping" | "status" | "firewall_inventory" | "network_inventory" => ["type"].as_slice(),
         "ask" => ["text", "type"].as_slice(),
         "elevate" => ["password", "type"].as_slice(),
         "diagnose" => ["target", "type"].as_slice(),
+        "firewall_plan" | "network_plan" => ["mutations_json", "type"].as_slice(),
+        "change_get" | "change_approve" | "change_confirm" | "change_reject" => {
+            ["change_set_id", "type"].as_slice()
+        }
+        "change_apply" => ["approval_id", "approval_token", "change_set_id", "type"].as_slice(),
         _ => return Err(ChannelMessageError::InvalidJson),
     };
     if command.len() != expected.len()
@@ -283,6 +405,14 @@ pub fn mqtt_response_topic(
 }
 
 fn validate_id(value: &str, field: &'static str) -> Result<(), ChannelMessageError> {
+    if value.is_empty() || value.len() > MAX_CHANNEL_ID_BYTES || value.chars().any(char::is_control)
+    {
+        return Err(ChannelMessageError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_command_id(value: &str, field: &'static str) -> Result<(), ChannelMessageError> {
     if value.is_empty() || value.len() > MAX_CHANNEL_ID_BYTES || value.chars().any(char::is_control)
     {
         return Err(ChannelMessageError::InvalidField(field));
@@ -383,5 +513,31 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    #[test]
+    fn change_text_commands_are_typed_without_shell_interpolation() {
+        assert_eq!(
+            command_from_text("/firewall-inventory".into()),
+            ChannelCommand::FirewallInventory
+        );
+        assert_eq!(
+            command_from_text("/firewall-plan []".into()),
+            ChannelCommand::FirewallPlan {
+                mutations_json: "[]".into()
+            }
+        );
+        assert_eq!(
+            command_from_text("/change-apply change-1 approval-1 token-1".into()),
+            ChannelCommand::ChangeApply {
+                change_set_id: "change-1".into(),
+                approval_id: "approval-1".into(),
+                approval_token: ChannelSecret::new("token-1"),
+            }
+        );
+        assert!(matches!(
+            command_from_text("/firewall-planx []".into()),
+            ChannelCommand::Ask { .. }
+        ));
     }
 }

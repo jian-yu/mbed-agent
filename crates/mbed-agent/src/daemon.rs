@@ -324,6 +324,7 @@ async fn handle_wecom_inbound(inbound: WeComInbound, state: Arc<AppState>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch_channel_request(
     channel: &str,
     request: agent_channels::ChannelRequest,
@@ -354,6 +355,55 @@ async fn dispatch_channel_request(
                 "channel command is not supported in this context",
             ),
         },
+        ChannelCommand::FirewallInventory => handle_firewall_inventory(internal_id, state).await,
+        ChannelCommand::NetworkInventory => handle_network_inventory(internal_id, state).await,
+        ChannelCommand::FirewallPlan { mutations_json } => {
+            match serde_json::from_str::<Vec<FirewallMutationRequest>>(&mutations_json) {
+                Ok(requests) => handle_firewall_plan(internal_id, requests, actor_id, state).await,
+                Err(error) => ServerResponse::error(
+                    internal_id,
+                    ErrorCode::InvalidRequest,
+                    format!("firewall mutation JSON is invalid: {error}"),
+                ),
+            }
+        }
+        ChannelCommand::NetworkPlan { mutations_json } => {
+            match serde_json::from_str::<Vec<NetworkMutationRequest>>(&mutations_json) {
+                Ok(requests) => handle_network_plan(internal_id, requests, actor_id, state).await,
+                Err(error) => ServerResponse::error(
+                    internal_id,
+                    ErrorCode::InvalidRequest,
+                    format!("network mutation JSON is invalid: {error}"),
+                ),
+            }
+        }
+        ChannelCommand::ChangeGet { change_set_id } => {
+            handle_change_get(internal_id, change_set_id, actor_id, state).await
+        }
+        ChannelCommand::ChangeApprove { change_set_id } => {
+            handle_change_approve(internal_id, change_set_id, actor_id, state).await
+        }
+        ChannelCommand::ChangeApply {
+            change_set_id,
+            approval_id,
+            approval_token,
+        } => {
+            handle_change_apply(
+                internal_id,
+                change_set_id,
+                approval_id,
+                agent_protocol::SensitiveString::new(approval_token.into_inner()),
+                actor_id,
+                state,
+            )
+            .await
+        }
+        ChannelCommand::ChangeConfirm { change_set_id } => {
+            handle_change_confirm(internal_id, change_set_id, actor_id, state).await
+        }
+        ChannelCommand::ChangeReject { change_set_id } => {
+            handle_change_reject(internal_id, change_set_id, actor_id, state).await
+        }
         ChannelCommand::Diagnose { target } => match target {
             DiagnosticTarget::Wan => handle_wan_diagnosis(internal_id, false, state).await,
             DiagnosticTarget::Dns => handle_dns_diagnosis(internal_id, state).await,
@@ -603,19 +653,22 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             .await;
         }
         Command::ChangeGet { change_set_id } => {
-            return handle_change_get(request.id, change_set_id, state).await;
+            return handle_change_get(request.id, change_set_id, LOCAL_CLI_ACTOR.into(), state)
+                .await;
         }
         Command::ChangeApprove { change_set_id } => {
-            return handle_change_approve(request.id, change_set_id, state).await;
+            return handle_change_approve(request.id, change_set_id, LOCAL_CLI_ACTOR.into(), state)
+                .await;
         }
         Command::FirewallPlan { mutations } => {
-            return handle_firewall_plan(request.id, mutations, state).await;
+            return handle_firewall_plan(request.id, mutations, LOCAL_CLI_ACTOR.into(), state)
+                .await;
         }
         Command::FirewallInventory => {
             return handle_firewall_inventory(request.id, state).await;
         }
         Command::NetworkPlan { mutations } => {
-            return handle_network_plan(request.id, mutations, state).await;
+            return handle_network_plan(request.id, mutations, LOCAL_CLI_ACTOR.into(), state).await;
         }
         Command::NetworkInventory => {
             return handle_network_inventory(request.id, state).await;
@@ -630,15 +683,18 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 change_set_id,
                 approval_id,
                 approval_token,
+                LOCAL_CLI_ACTOR.into(),
                 state,
             )
             .await;
         }
         Command::ChangeConfirm { change_set_id } => {
-            return handle_change_confirm(request.id, change_set_id, state).await;
+            return handle_change_confirm(request.id, change_set_id, LOCAL_CLI_ACTOR.into(), state)
+                .await;
         }
         Command::ChangeReject { change_set_id } => {
-            return handle_change_reject(request.id, change_set_id, state).await;
+            return handle_change_reject(request.id, change_set_id, LOCAL_CLI_ACTOR.into(), state)
+                .await;
         }
         Command::DiagnoseWan { active } => {
             return handle_wan_diagnosis(request.id, active, state).await;
@@ -828,7 +884,9 @@ async fn handle_action_plan(
     match invocation.domain {
         ActionChangeDomain::Firewall => {
             match serde_json::from_value::<Vec<FirewallMutationRequest>>(invocation.mutations) {
-                Ok(mutations) => handle_firewall_plan(id, mutations, state).await,
+                Ok(mutations) => {
+                    handle_firewall_plan(id, mutations, LOCAL_CLI_ACTOR.into(), state).await
+                }
                 Err(error) => ServerResponse::error(
                     id,
                     ErrorCode::InvalidRequest,
@@ -838,7 +896,9 @@ async fn handle_action_plan(
         }
         ActionChangeDomain::Network => {
             match serde_json::from_value::<Vec<NetworkMutationRequest>>(invocation.mutations) {
-                Ok(mutations) => handle_network_plan(id, mutations, state).await,
+                Ok(mutations) => {
+                    handle_network_plan(id, mutations, LOCAL_CLI_ACTOR.into(), state).await
+                }
                 Err(error) => ServerResponse::error(
                     id,
                     ErrorCode::InvalidRequest,
@@ -1053,14 +1113,19 @@ async fn handle_elevation(
     }
 }
 
-async fn handle_change_get(id: String, change_set_id: String, state: &AppState) -> ServerResponse {
+async fn handle_change_get(
+    id: String,
+    change_set_id: String,
+    actor_id: String,
+    state: &AppState,
+) -> ServerResponse {
     if !valid_change_set_id(&change_set_id) {
         return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
     }
     let store = Arc::clone(&state.store);
     let lookup_id = change_set_id.clone();
     match tokio::task::spawn_blocking(move || store.change_set(&lookup_id)).await {
-        Ok(Ok(Some(record))) => match change_set_response(record, LOCAL_CLI_ACTOR, state) {
+        Ok(Ok(Some(record))) => match change_set_response(record, &actor_id, state) {
             Ok(response) => ServerResponse::success(id, ResponseData::ChangeSet(response)),
             Err(response) => response.with_id(id),
         },
@@ -1073,9 +1138,11 @@ async fn handle_change_get(id: String, change_set_id: String, state: &AppState) 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_firewall_plan(
     id: String,
     requests: Vec<FirewallMutationRequest>,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     if let Err(message) = ensure_task_storage(state).await {
@@ -1120,7 +1187,7 @@ async fn handle_firewall_plan(
         schema_version: agent_protocol::CHANGE_PLAN_SCHEMA_VERSION,
         plan_id: plan_id.clone(),
         boot_id: state.auth.boot_id().to_owned(),
-        actor_id: LOCAL_CLI_ACTOR.into(),
+        actor_id: actor_id.clone(),
         created_monotonic_ms: now,
         expires_monotonic_ms,
         risk: typed.risk,
@@ -1164,7 +1231,7 @@ async fn handle_firewall_plan(
         plan_digest: digest,
         plan_payload,
         state: ChangeSetState::Planned,
-        actor_id: LOCAL_CLI_ACTOR.into(),
+        actor_id: actor_id.clone(),
         boot_id: state.auth.boot_id().to_owned(),
         risk: plan.risk,
         expires_monotonic_ms,
@@ -1172,7 +1239,16 @@ async fn handle_firewall_plan(
         created_at: 0,
         updated_at: 0,
     };
-    persist_firewall_change(id, plan_id, record, execution_payload, now, state).await
+    persist_firewall_change(
+        id,
+        plan_id,
+        record,
+        execution_payload,
+        now,
+        &actor_id,
+        state,
+    )
+    .await
 }
 
 async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerResponse {
@@ -1211,6 +1287,7 @@ async fn handle_firewall_inventory(id: String, state: &AppState) -> ServerRespon
 async fn handle_network_plan(
     id: String,
     requests: Vec<NetworkMutationRequest>,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     if let Err(message) = ensure_task_storage(state).await {
@@ -1265,7 +1342,7 @@ async fn handle_network_plan(
         schema_version: agent_protocol::CHANGE_PLAN_SCHEMA_VERSION,
         plan_id: plan_id.clone(),
         boot_id: state.auth.boot_id().to_owned(),
-        actor_id: LOCAL_CLI_ACTOR.into(),
+        actor_id: actor_id.clone(),
         created_monotonic_ms: now,
         expires_monotonic_ms,
         risk: typed.risk,
@@ -1311,7 +1388,7 @@ async fn handle_network_plan(
         plan_digest: digest,
         plan_payload,
         state: ChangeSetState::Planned,
-        actor_id: LOCAL_CLI_ACTOR.into(),
+        actor_id: actor_id.clone(),
         boot_id: state.auth.boot_id().to_owned(),
         risk: plan.risk,
         expires_monotonic_ms,
@@ -1319,7 +1396,16 @@ async fn handle_network_plan(
         created_at: 0,
         updated_at: 0,
     };
-    persist_network_change(id, plan_id, record, execution_payload, now, state).await
+    persist_network_change(
+        id,
+        plan_id,
+        record,
+        execution_payload,
+        now,
+        &actor_id,
+        state,
+    )
+    .await
 }
 
 async fn handle_network_inventory(id: String, state: &AppState) -> ServerResponse {
@@ -1596,6 +1682,7 @@ async fn persist_network_change(
     record: ChangeSetRecord,
     execution_payload: Vec<u8>,
     now: u64,
+    actor_id: &str,
     state: &AppState,
 ) -> ServerResponse {
     let Ok(max_plan_bytes) = usize::try_from(state.config.storage.max_change_plan_bytes) else {
@@ -1622,7 +1709,7 @@ async fn persist_network_change(
     match create {
         Ok(Ok(_)) => {
             info!(change_set_id = %plan_id, "approval-ready network ChangeSet created");
-            current_change_set_response(id, &plan_id, state).await
+            current_change_set_response(id, &plan_id, actor_id, state).await
         }
         Ok(Err(error)) => store_error_response(id, &error),
         Err(error) => {
@@ -1732,6 +1819,7 @@ async fn persist_firewall_change(
     record: ChangeSetRecord,
     execution_payload: Vec<u8>,
     now: u64,
+    actor_id: &str,
     state: &AppState,
 ) -> ServerResponse {
     let Ok(max_plan_bytes) = usize::try_from(state.config.storage.max_change_plan_bytes) else {
@@ -1758,7 +1846,7 @@ async fn persist_firewall_change(
     match create {
         Ok(Ok(_)) => {
             info!(change_set_id = %plan_id, "approval-ready firewall ChangeSet created");
-            current_change_set_response(id, &plan_id, state).await
+            current_change_set_response(id, &plan_id, actor_id, state).await
         }
         Ok(Err(error)) => store_error_response(id, &error),
         Err(error) => {
@@ -1837,13 +1925,14 @@ fn conservative_firewall_risk_context(
 async fn handle_change_approve(
     id: String,
     change_set_id: String,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     if !valid_change_set_id(&change_set_id) {
         return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
     }
     let capability_now = process_monotonic_ms(state);
-    match state.auth.is_device_admin(LOCAL_CLI_ACTOR, capability_now) {
+    match state.auth.is_device_admin(&actor_id, capability_now) {
         Ok(true) => {}
         Ok(false) => {
             return ServerResponse::error(
@@ -1869,7 +1958,7 @@ async fn handle_change_approve(
     let Some(record) = load_change_set(&id, &change_set_id, state).await else {
         return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
     };
-    if let Err(response) = change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+    if let Err(response) = change_set_response(record.clone(), &actor_id, state) {
         return response.with_id(id);
     }
     if record.state != ChangeSetState::AwaitingApproval {
@@ -1938,6 +2027,7 @@ async fn handle_change_apply(
     change_set_id: String,
     approval_id: String,
     approval_token: SensitiveString,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     if !valid_change_set_id(&change_set_id)
@@ -1954,7 +2044,7 @@ async fn handle_change_apply(
     let Some(record) = load_change_set(&id, &change_set_id, state).await else {
         return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
     };
-    let response = match change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+    let response = match change_set_response(record.clone(), &actor_id, state) {
         Ok(response) => response,
         Err(error) => return error.with_id(id),
     };
@@ -1978,6 +2068,7 @@ async fn handle_change_apply(
             record,
             response.plan,
             now,
+            actor_id,
             state,
         )
         .await;
@@ -2032,7 +2123,7 @@ async fn handle_change_apply(
     match outcome {
         Ok(Ok(result)) => {
             info!(change_set_id = %record.id, ?result, "configuration change executed");
-            current_change_set_response(id, &record.id, state).await
+            current_change_set_response(id, &record.id, &actor_id, state).await
         }
         Ok(Err(_)) => {
             error!(change_set_id = %record.id, "configuration change execution failed");
@@ -2098,13 +2189,14 @@ async fn consume_change_approval(
 async fn handle_change_confirm(
     id: String,
     change_set_id: String,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     if !valid_change_set_id(&change_set_id) || !valid_execution_transaction_id(&change_set_id) {
         return ServerResponse::error(id, ErrorCode::InvalidRequest, "invalid ChangeSet id");
     }
     let capability_now = process_monotonic_ms(state);
-    match state.auth.is_device_admin(LOCAL_CLI_ACTOR, capability_now) {
+    match state.auth.is_device_admin(&actor_id, capability_now) {
         Ok(true) => {}
         Ok(false) => {
             return ServerResponse::error(
@@ -2130,7 +2222,7 @@ async fn handle_change_confirm(
     let Some(record) = load_change_set(&id, &change_set_id, state).await else {
         return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
     };
-    let response = match change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+    let response = match change_set_response(record.clone(), &actor_id, state) {
         Ok(response) => response,
         Err(error) => return error.with_id(id),
     };
@@ -2151,7 +2243,8 @@ async fn handle_change_confirm(
         .first()
         .is_some_and(|change| change.object.domain == ConfigDomain::Network)
     {
-        return confirm_network_change_request(id, record, response.plan, now, state).await;
+        return confirm_network_change_request(id, record, response.plan, now, &actor_id, state)
+            .await;
     }
     let execution = match load_firewall_execution_plan(&record, state).await {
         Ok(execution) => execution,
@@ -2177,7 +2270,7 @@ async fn handle_change_confirm(
     match outcome {
         Ok(Ok(result)) => {
             info!(change_set_id = %record.id, ?result, "configuration change confirmed");
-            current_change_set_response(id, &record.id, state).await
+            current_change_set_response(id, &record.id, &actor_id, state).await
         }
         Ok(Err(_)) => {
             error!(change_set_id = %record.id, "configuration confirmation failed");
@@ -2236,6 +2329,7 @@ async fn load_network_execution_plan(
         .map_err(|_| PendingResponseError::internal("stored execution plan is invalid"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_network_change(
     id: String,
     approval_id: String,
@@ -2243,6 +2337,7 @@ async fn apply_network_change(
     record: ChangeSetRecord,
     preview: ChangePlan,
     now: u64,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     let backend = match network_write_backend(state) {
@@ -2289,7 +2384,15 @@ async fn apply_network_change(
         state,
     )
     .await;
-    execution_response(id, &record.id, outcome, "network configuration", state).await
+    execution_response(
+        id,
+        &record.id,
+        &actor_id,
+        outcome,
+        "network configuration",
+        state,
+    )
+    .await
 }
 
 async fn confirm_network_change_request(
@@ -2297,6 +2400,7 @@ async fn confirm_network_change_request(
     record: ChangeSetRecord,
     preview: ChangePlan,
     now: u64,
+    actor_id: &str,
     state: &AppState,
 ) -> ServerResponse {
     let backend = match network_write_backend(state) {
@@ -2330,6 +2434,7 @@ async fn confirm_network_change_request(
     execution_response(
         id,
         &record.id,
+        actor_id,
         outcome,
         "network configuration confirmation",
         state,
@@ -2340,6 +2445,7 @@ async fn confirm_network_change_request(
 async fn execution_response(
     id: String,
     change_set_id: &str,
+    actor_id: &str,
     outcome: ExecutionWorkerResult,
     operation: &str,
     state: &AppState,
@@ -2347,7 +2453,7 @@ async fn execution_response(
     match outcome {
         Ok(Ok(result)) => {
             info!(change_set_id, ?result, %operation, "configuration operation completed");
-            current_change_set_response(id, change_set_id, state).await
+            current_change_set_response(id, change_set_id, actor_id, state).await
         }
         Ok(Err(_)) => {
             error!(change_set_id, %operation, "configuration operation failed");
@@ -2759,12 +2865,13 @@ fn firewall_command_runner(state: &AppState) -> FirewallCommandRunner {
 async fn current_change_set_response(
     id: String,
     change_set_id: &str,
+    actor_id: &str,
     state: &AppState,
 ) -> ServerResponse {
     let Some(record) = load_change_set(&id, change_set_id, state).await else {
         return ServerResponse::error(id, ErrorCode::Internal, "ChangeSet state is unavailable");
     };
-    match change_set_response(record, LOCAL_CLI_ACTOR, state) {
+    match change_set_response(record, actor_id, state) {
         Ok(response) => ServerResponse::success(id, ResponseData::ChangeSet(response)),
         Err(error) => error.with_id(id),
     }
@@ -2773,6 +2880,7 @@ async fn current_change_set_response(
 async fn handle_change_reject(
     id: String,
     change_set_id: String,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     if !valid_change_set_id(&change_set_id) {
@@ -2781,7 +2889,7 @@ async fn handle_change_reject(
     let Some(record) = load_change_set(&id, &change_set_id, state).await else {
         return ServerResponse::error(id, ErrorCode::NotFound, "ChangeSet not found");
     };
-    let mut response = match change_set_response(record.clone(), LOCAL_CLI_ACTOR, state) {
+    let mut response = match change_set_response(record.clone(), &actor_id, state) {
         Ok(response) => response,
         Err(error) => return error.with_id(id),
     };
@@ -6493,8 +6601,13 @@ max_bytes = 32
             )
             .expect("await approval");
 
-        let denied =
-            handle_change_approve("approve-denied".into(), plan.plan_id.clone(), &state).await;
+        let denied = handle_change_approve(
+            "approve-denied".into(),
+            plan.plan_id.clone(),
+            LOCAL_CLI_ACTOR.into(),
+            &state,
+        )
+        .await;
         assert_eq!(
             denied.error.expect("admin required").code,
             ErrorCode::Unauthorized
@@ -6506,7 +6619,13 @@ max_bytes = 32
             &state,
         )
         .await;
-        let approved = handle_change_approve("approve".into(), plan.plan_id.clone(), &state).await;
+        let approved = handle_change_approve(
+            "approve".into(),
+            plan.plan_id.clone(),
+            LOCAL_CLI_ACTOR.into(),
+            &state,
+        )
+        .await;
         let Some(ResponseData::ChangeApproval(approval)) = approved.result else {
             panic!("expected approval response");
         };

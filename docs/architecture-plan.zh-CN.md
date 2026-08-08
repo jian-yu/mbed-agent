@@ -471,9 +471,10 @@ v1/tenants/{tenant}/devices/{device}/artifacts/{artifact}
 
 Envelope 使用 CBOR（设备侧默认）或 JSON（调试），包含 protocol version、message id、correlation id、deadline、nonce、payload type、content hash 和签名信息。命令 QoS 1，使用 message id 去重；遥测可按重要性使用 QoS 0/1。设置有限 inflight、指数退避 + jitter、离线 outbox 上限和过期淘汰。禁止把任意 MQTT 消息直接映射为 root 操作，服务端身份与本地 policy 都必须验证。
 
-首个 MQTT 5 只读切片已经使用 `rumqttc` 接入 daemon：只接受 TLS broker、固定 device
+首个 MQTT 5 切片已经使用 `rumqttc` 接入 daemon：只接受 TLS broker、固定 device
 topic、QoS 1、有界 packet/inflight、persistent session 和封顶指数退避。版本化 JSON envelope
-只有 ping/status/ask/闭集诊断，不存在远程写命令；`message_id` 在 `/tmp` SQLite 原子去重，
+支持 ping/status/ask/闭集诊断以及 typed ChangeSet plan/get/approve/apply/confirm/reject；
+`message_id` 在 `/tmp` SQLite 原子去重，
 完成响应进入有界易失 outbox 并按过期时间、重试间隔和次数上限重发。用户名/密码可选且必须
 成对配置，配置含凭据时强制 root-only。mTLS、签名 envelope、broker 弱网长稳和证书轮换仍需
 后续切片与真机验证。
