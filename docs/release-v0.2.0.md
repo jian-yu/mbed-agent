@@ -22,5 +22,7 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
 3. OpenWrt 21.02 fw3 和 22.03+ fw4 至少各完成一次 QEMU 或真实设备事务测试。
 4. 通用 Linux nftables 和 iptables 至少各完成一次 namespace/真实内核测试。
 5. 运行态 Flash 写入快照只允许配置和批准的业务配置变化。
-6. 生成 release binary、OpenWrt package、checksum、SBOM 和构建元数据。
+6. 使用 `scripts/prepare-release-artifacts.sh` 生成 release binary、checksum、
+   Cargo 依赖图（SBOM 输入）和构建元数据；组织级发布服务再将依赖图转换为要求的
+   SPDX/CycloneDX SBOM。
 7. 完成 72 小时 Channel 重连/重复消息/低水位测试后，才把 RC 提升为正式版。

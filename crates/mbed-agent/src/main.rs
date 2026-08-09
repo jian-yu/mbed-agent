@@ -611,7 +611,7 @@ async fn run_wechat_clawbot_bind(account: &str, config_path: &Path) -> Result<()
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("MbedAgent/0.1.0")
+        .user_agent(concat!("MbedAgent/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let qr_endpoint =
         format!("{WECHAT_CLAWBOT_LOGIN_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3");
@@ -679,7 +679,7 @@ async fn run_wechat_clawbot_bind(account: &str, config_path: &Path) -> Result<()
                     account: account.into(),
                     base_url,
                     bot_token: SecretString::new(token),
-                    bot_agent: "MbedAgent/0.1.0".into(),
+                    bot_agent: concat!("MbedAgent/", env!("CARGO_PKG_VERSION")).into(),
                     long_poll_timeout_secs: 35,
                     request_timeout_secs: 10,
                 };

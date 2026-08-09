@@ -374,7 +374,7 @@ impl Default for WeChatClawBotConfig {
             account: "default".into(),
             base_url: "https://ilinkai.weixin.qq.com".into(),
             bot_token: SecretString::default(),
-            bot_agent: "MbedAgent/0.1.0".into(),
+            bot_agent: format!("MbedAgent/{}", env!("CARGO_PKG_VERSION")),
             long_poll_timeout_secs: 35,
             request_timeout_secs: 10,
         }

@@ -28,6 +28,8 @@ jobs:
         run: |
           test -f openwrt/Makefile
           test -f .github/workflows/openwrt-sdk.yml
+          test -f .github/workflows/release-candidate.yml
+          sh scripts/validate-version.sh
           sh scripts/validate-openwrt-matrix.sh
           test -f openwrt/files/etc/config/mbed-agent
           test -f openwrt/files/etc/mbed-agent/config.toml
@@ -43,6 +45,8 @@ jobs:
           sh -n scripts/measure-daemon-rss.sh
           sh -n scripts/check-persistent-write-set.sh
           sh -n scripts/build-openwrt-sdk-package.sh
+          sh -n scripts/prepare-release-artifacts.sh
+          sh -n scripts/validate-version.sh
           sh scripts/run-linux-namespace-smoke.sh
           sh scripts/check-release-footprint.sh target/release/mbed-agent
           sh scripts/measure-daemon-rss.sh target/release/mbed-agent config/mbed-agent.example.toml

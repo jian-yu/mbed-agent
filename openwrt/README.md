@@ -35,3 +35,16 @@ sh scripts/build-openwrt-sdk-package.sh \
 脚本只接受 `targets.tsv` 中存在的 release/target/subtarget 组合；构建缓存固定在
 `/tmp/mbed-agent-openwrt-sdk-build`，完成后默认删除。设置
 `MBED_AGENT_KEEP_SDK=1` 可保留该明确目录用于排障。
+
+## Release artifacts
+
+正式或 RC 构建可用以下入口聚合 binary、依赖图、工具链信息、manifest 和 checksum：
+
+```sh
+sh scripts/prepare-release-artifacts.sh target/release/mbed-agent
+```
+
+输出目录默认为 `dist/release/`；`sbom.cargo.json` 是设备构建不依赖额外工具的原始
+依赖清单，发布服务应在上传前转换为组织要求的 SPDX/CycloneDX SBOM。交叉构建时
+可设置 `MBED_AGENT_METADATA_PLATFORM`，使 Cargo 依赖图只解析目标平台。
+校验聚合产物时在输出目录执行 `sha256sum -c checksums.sha256`。

@@ -678,6 +678,9 @@ mod tests {
         let value = serde_json::to_value(body).expect("encode");
         assert_eq!(value["msg"]["item_list"][0]["type"], 1);
         assert_eq!(value["msg"]["context_token"], "ctx");
-        assert_eq!(value["base_info"]["bot_agent"], "MbedAgent/0.1.0");
+        assert_eq!(
+            value["base_info"]["bot_agent"],
+            concat!("MbedAgent/", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
