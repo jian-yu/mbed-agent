@@ -1104,7 +1104,9 @@ pub enum NetworkPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::{CHANGE_PLAN_SCHEMA_VERSION, NetworkPolicyAction, NetworkVlanProtocol};
+    use agent_protocol::{
+        CHANGE_PLAN_SCHEMA_VERSION, NetworkDhcpMode, NetworkPolicyAction, NetworkVlanProtocol,
+    };
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn interface(id: &str, address: Ipv4Addr) -> NetworkObject {
@@ -1324,6 +1326,9 @@ mod tests {
                 limit: 100,
                 lease_time: "12h".into(),
                 force: false,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Server,
+                ndp_mode: NetworkDhcpMode::Hybrid,
             });
         } else {
             unreachable!();
@@ -1341,6 +1346,9 @@ mod tests {
                 limit: 100,
                 lease_time: "12h".into(),
                 force: false,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Server,
+                ndp_mode: NetworkDhcpMode::Hybrid,
             });
         } else {
             unreachable!();

@@ -791,6 +791,36 @@ pub struct NetworkDhcpServerConfig {
     pub lease_time: String,
     /// Whether the server may start even when no clients are detected.
     pub force: bool,
+    /// `DHCPv6` service mode for the interface.
+    #[serde(default = "default_dhcpv6_mode")]
+    pub dhcpv6_mode: NetworkDhcpMode,
+    /// IPv6 Router Advertisement (`RA`) mode for the interface.
+    #[serde(default = "default_ra_mode")]
+    pub ra_mode: NetworkDhcpMode,
+    /// Neighbor Discovery Proxy (`NDP`) mode for the interface.
+    #[serde(default = "default_ndp_mode")]
+    pub ndp_mode: NetworkDhcpMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkDhcpMode {
+    Disabled,
+    Server,
+    Relay,
+    Hybrid,
+}
+
+const fn default_dhcpv6_mode() -> NetworkDhcpMode {
+    NetworkDhcpMode::Server
+}
+
+const fn default_ra_mode() -> NetworkDhcpMode {
+    NetworkDhcpMode::Server
+}
+
+const fn default_ndp_mode() -> NetworkDhcpMode {
+    NetworkDhcpMode::Hybrid
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1877,6 +1907,23 @@ mod tests {
         assert!(interface.dhcp_request_options.is_empty());
         assert!(!interface.dhcp_no_release);
         assert!(interface.dhcp_server.is_none());
+    }
+
+    #[test]
+    fn dhcp_server_modes_are_backward_compatible() {
+        let server: NetworkDhcpServerConfig = serde_json::from_str(
+            r#"{
+                "enabled":true,
+                "start":100,
+                "limit":100,
+                "lease_time":"12h",
+                "force":false
+            }"#,
+        )
+        .expect("decode legacy DHCP server");
+        assert_eq!(server.dhcpv6_mode, NetworkDhcpMode::Server);
+        assert_eq!(server.ra_mode, NetworkDhcpMode::Server);
+        assert_eq!(server.ndp_mode, NetworkDhcpMode::Hybrid);
     }
 
     #[test]

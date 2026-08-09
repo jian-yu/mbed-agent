@@ -12,9 +12,10 @@ use agent_core::{
     NetworkInventory, NetworkMutationPlan, network_object_digest, validate_network_object,
 };
 use agent_protocol::{
-    ChangeOperation, IpNetwork, NetworkAddressMode, NetworkBridge, NetworkDhcpServerConfig,
-    NetworkFamily, NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule,
-    NetworkRoute, NetworkRouteType, NetworkVlan, NetworkVlanProtocol, ObjectOwnership,
+    ChangeOperation, IpNetwork, NetworkAddressMode, NetworkBridge, NetworkDhcpMode,
+    NetworkDhcpServerConfig, NetworkFamily, NetworkInterfaceConfig, NetworkObject,
+    NetworkPolicyAction, NetworkPolicyRule, NetworkRoute, NetworkRouteType, NetworkVlan,
+    NetworkVlanProtocol, ObjectOwnership,
 };
 use thiserror::Error;
 
@@ -444,6 +445,9 @@ fn decode_dhcp_server(section: &UciSection) -> Option<NetworkDhcpServerConfig> {
         limit: optional_u16(section, "limit").ok()?.unwrap_or(150),
         lease_time: optional(section, "leasetime").unwrap_or("12h").to_owned(),
         force: optional_bool(section, "force").ok()?.unwrap_or(false),
+        dhcpv6_mode: dhcp_mode(section, "dhcpv6", NetworkDhcpMode::Server)?,
+        ra_mode: dhcp_mode(section, "ra", NetworkDhcpMode::Server)?,
+        ndp_mode: dhcp_mode(section, "ndp", NetworkDhcpMode::Hybrid)?,
     })
 }
 
@@ -942,6 +946,9 @@ fn render_dhcp_options(
         ("limit", value.limit.to_string()),
         ("leasetime", value.lease_time.clone()),
         ("force", boolean(value.force)),
+        ("dhcpv6", dhcp_mode_value(value.dhcpv6_mode).into()),
+        ("ra", dhcp_mode_value(value.ra_mode).into()),
+        ("ndp", dhcp_mode_value(value.ndp_mode).into()),
     ] {
         writeln!(batch, "set dhcp.{section}.{name}={}", quote(&value)?)
             .map_err(|_| NetworkRenderError::Output)?;
@@ -959,7 +966,19 @@ fn supported_dhcp_options() -> &'static [&'static str] {
         "limit",
         "leasetime",
         "force",
+        "dhcpv6",
+        "ra",
+        "ndp",
     ]
+}
+
+fn dhcp_mode_value(value: NetworkDhcpMode) -> &'static str {
+    match value {
+        NetworkDhcpMode::Disabled => "disabled",
+        NetworkDhcpMode::Server => "server",
+        NetworkDhcpMode::Relay => "relay",
+        NetworkDhcpMode::Hybrid => "hybrid",
+    }
 }
 
 fn render_update(
@@ -1402,6 +1421,21 @@ fn optional_u16(section: &UciSection, name: &str) -> Result<Option<u16>, ()> {
         .map_err(|_| ())
 }
 
+fn dhcp_mode(
+    section: &UciSection,
+    name: &str,
+    default: NetworkDhcpMode,
+) -> Option<NetworkDhcpMode> {
+    match optional(section, name) {
+        None => Some(default),
+        Some("disabled") => Some(NetworkDhcpMode::Disabled),
+        Some("server") => Some(NetworkDhcpMode::Server),
+        Some("relay") => Some(NetworkDhcpMode::Relay),
+        Some("hybrid") => Some(NetworkDhcpMode::Hybrid),
+        _ => None,
+    }
+}
+
 fn optional_ip(section: &UciSection, name: &str) -> Result<Option<IpAddr>, ()> {
     optional(section, name)
         .map(str::parse)
@@ -1627,6 +1661,9 @@ dhcp.lan.start='100'\n\
 dhcp.lan.limit='100'\n\
 dhcp.lan.leasetime='12h'\n\
 dhcp.lan.force='1'\n\
+dhcp.lan.dhcpv6='server'\n\
+dhcp.lan.ra='hybrid'\n\
+dhcp.lan.ndp='relay'\n\
 dhcp.lan.vendor_keep='yes'\n";
 
     fn guest_interface(ownership: ObjectOwnership) -> NetworkObject {
@@ -1660,6 +1697,9 @@ dhcp.lan.vendor_keep='yes'\n";
                 limit: 100,
                 lease_time: "12h".into(),
                 force: false,
+                dhcpv6_mode: NetworkDhcpMode::Disabled,
+                ra_mode: NetworkDhcpMode::Disabled,
+                ndp_mode: NetworkDhcpMode::Disabled,
             }),
         })
     }
@@ -1770,6 +1810,9 @@ dhcp.lan.vendor_keep='yes'\n";
                 limit: 100,
                 lease_time: "12h".into(),
                 force: true,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Hybrid,
+                ndp_mode: NetworkDhcpMode::Relay,
             })
         );
         let binding = snapshot
@@ -1784,6 +1827,43 @@ dhcp.lan.vendor_keep='yes'\n";
                 .dhcp_present_options
                 .iter()
                 .any(|option| option == "vendor_keep")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_dhcp_modes_without_claiming_native_sections() {
+        let native = "dhcp.lan=dhcp\n\
+dhcp.lan.interface='lan'\n\
+dhcp.lan.dhcpv6='unknown'\n";
+        let snapshot = inspect_openwrt_network_inventory_with_dhcp(NETWORK_FIXTURE, native)
+            .expect("native unknown mode is read-only");
+        assert_eq!(snapshot.dhcp_read_only_sections(), ["lan"]);
+        let interface = snapshot
+            .inventory()
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                NetworkObject::Interface(value) if value.id == "lan" => Some(value),
+                _ => None,
+            })
+            .expect("lan interface");
+        assert!(interface.dhcp_server.is_none());
+        let binding = snapshot
+            .bindings()
+            .iter()
+            .find(|binding| binding.id == "lan")
+            .expect("lan binding");
+        assert!(binding.dhcp_section.is_none());
+
+        let managed = "dhcp.mbed_lan=dhcp\n\
+dhcp.mbed_lan.mbed_managed='1'\n\
+dhcp.mbed_lan.interface='lan'\n\
+dhcp.mbed_lan.ra='unknown'\n";
+        assert_eq!(
+            inspect_openwrt_network_inventory_with_dhcp(NETWORK_FIXTURE, managed),
+            Err(NetworkRenderError::UnsupportedManagedSection(
+                "mbed_lan".into()
+            ))
         );
     }
 
@@ -1871,6 +1951,13 @@ dhcp.lan.vendor_keep='yes'\n";
         assert!(stage.dhcp_uci_batch.contains("dhcp.guest.start='100'"));
         assert!(stage.dhcp_uci_batch.contains("dhcp.guest.limit='100'"));
         assert!(stage.dhcp_uci_batch.contains("dhcp.guest.leasetime='12h'"));
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("dhcp.guest.dhcpv6='disabled'")
+        );
+        assert!(stage.dhcp_uci_batch.contains("dhcp.guest.ra='disabled'"));
+        assert!(stage.dhcp_uci_batch.contains("dhcp.guest.ndp='disabled'"));
         assert!(stage.dhcp_uci_batch.ends_with("commit dhcp\n"));
         assert!(stage.uci_batch.ends_with("commit network\n"));
         assert_eq!(stage.validations, [OpenWrtNetworkValidation::UciExport]);
