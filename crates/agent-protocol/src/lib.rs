@@ -746,6 +746,19 @@ pub struct NetworkInterfaceConfig {
     pub addresses: Vec<IpNetwork>,
     pub mtu: Option<u32>,
     pub mac_override: Option<String>,
+    /// Whether the platform may keep resolver addresses learned from the peer.
+    #[serde(default = "default_peerdns")]
+    pub peerdns: bool,
+    /// Explicit resolver addresses for platforms that support interface DNS overrides.
+    #[serde(default)]
+    pub dns_servers: Vec<IpAddr>,
+    /// Bounded DNS search suffixes for the interface.
+    #[serde(default)]
+    pub dns_search: Vec<String>,
+}
+
+const fn default_peerdns() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1805,6 +1818,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn network_interface_dns_fields_are_backward_compatible() {
+        let interface: NetworkInterfaceConfig = serde_json::from_str(
+            r#"{
+                "id":"lan",
+                "ownership":"platform_native",
+                "enabled":true,
+                "device":"br-lan",
+                "ipv4_mode":"static",
+                "ipv6_mode":"disabled",
+                "addresses":[{"address":"192.0.2.1","prefix_len":24}],
+                "mtu":1500,
+                "mac_override":null
+            }"#,
+        )
+        .expect("decode legacy interface");
+        assert!(interface.peerdns);
+        assert!(interface.dns_servers.is_empty());
+        assert!(interface.dns_search.is_empty());
     }
 
     #[test]

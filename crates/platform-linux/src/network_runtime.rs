@@ -155,6 +155,9 @@ pub fn inspect_runtime_network_inventory(
             mtu,
             // The current kernel address does not prove a configured MAC override.
             mac_override: None,
+            peerdns: true,
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
         }));
     }
 

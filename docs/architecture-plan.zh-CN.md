@@ -302,8 +302,8 @@ MAC”之类的单一需求增加专用脚本。每个配置对象至少支持 `
 | 领域 | 最大 typed 配置范围 | OpenWrt 后端 | 普通 Linux 后端 | 主要限制 |
 |---|---|---|---|---|
 | 防火墙 | zone、默认策略、forwarding、filter rule、MAC/IP/CIDR、协议/端口、接口、address set、DNAT/SNAT/redirect、masquerade、启停、顺序 | `/etc/config/firewall` UCI，统一服务 fw3/iptables 与 fw4/nftables | Agent 专属 nft table/chain/set；无 nft 时使用专属 iptables chain/ipset | 不生成 raw expression；不自动改第三方 chain；涉及管理路径为 R3 |
-| L2/L3 网络 | interface/device、静态/动态地址、MTU、MAC override、Bridge、VLAN、bond、VRF、默认/静态路由、policy rule | network UCI + netifd/ubus，按 swconfig/DSA capability 裁剪 | netlink 运行态；持久化仅通过识别出的 NetworkManager、systemd-networkd 或厂商受支持 adapter | 修改当前管理接口、默认路由或 LAN 地址为 R3；未知网络管理器只允许运行态或只读 |
-| DNS | 上游 resolver、搜索域、split DNS、缓存参数、静态主机、DNSSEC 开关 | dhcp UCI + dnsmasq/odhcpd | systemd-resolved、NetworkManager 或 Agent 托管 dnsmasq 片段 | 不覆盖未知手工 `/etc/resolv.conf`；凭据型 DoH/DoT 参数按 secret 处理 |
+| L2/L3 网络 | interface/device、静态/动态地址、MTU、MAC override、接口级 `peerdns`/resolver/search、Bridge、VLAN、bond、VRF、默认/静态路由、policy rule | network UCI + netifd/ubus，按 swconfig/DSA capability 裁剪 | netlink 运行态；持久化仅通过识别出的 NetworkManager、systemd-networkd 或厂商受支持 adapter | 修改当前管理接口、默认路由或 LAN 地址为 R3；未知网络管理器只允许运行态或只读 |
+| DNS | 上游 resolver、搜索域、split DNS、缓存参数、静态主机、DNSSEC 开关 | interface `peerdns`/`dns`/`dns_search` 已通过 network UCI 支持；其余由 dhcp UCI + dnsmasq/odhcpd 扩展 | systemd-resolved、NetworkManager 或 Agent 托管 dnsmasq 片段 | 不覆盖未知手工 `/etc/resolv.conf`；凭据型 DoH/DoT 参数按 secret 处理 |
 | DHCP | 地址池、租期、静态租约、option、RA/DHCPv6 模式 | dhcp UCI + dnsmasq/odhcpd | Agent 托管 dnsmasq/odhcpd adapter | 地址池冲突、网段越界和管理地址冲突必须在 stage 阶段拒绝 |
 | 无线 | radio 启停、国家码、信道/带宽/功率、SSID、模式、加密、密钥、网络绑定、隔离、MAC policy | wireless UCI + netifd/hostapd | 仅在识别并支持 hostapd/wpa_supplicant 管理方式时写 Agent 托管片段 | 扫描与配置分级；改管理 SSID/密钥为 R3；密钥不进 SQLite/日志/LLM |
 | 服务 | reload/restart/start/stop、受支持服务的 enable/disable、有限 typed 参数 | ubus/procd/init script allowlist | systemd/OpenRC/BusyBox init adapter allowlist | 不接受任意 service 名；enable/disable 属于持久配置 |
@@ -1262,21 +1262,24 @@ route 和 policy rule 都具有摘要绑定的 create/update/delete；policy rul
 只改变 priority 的 move。地址族、前缀、VLAN/MTU、聚合端口、VRF table、next-hop、
 fwmark 和 rule priority 在本地有界校验，投影与 apply 后验证共享同一 typed 状态。
 管理接口/地址、默认路由和管理 route table 的变更固定提升为 R3，启用中对象的修改
-或删除按潜在业务中断处理。当前仅完成领域边界，主机写入口保持关闭，下一步分别交付
-OpenWrt UCI/netifd 与普通 Linux netlink/受支持 network manager 的 fresh inventory、
-capability 裁剪、原生 validation、易失 rollback artifact 和 confirmed-commit。
+或删除按潜在业务中断处理。OpenWrt UCI/netifd 与普通 Linux netlink 的首批
+fresh inventory、capability 裁剪、原生 validation、易失 rollback artifact 和
+confirmed-commit 已接入；未知 network manager 仍保持只读，后续领域按同一契约扩展。
 
-截至 ADR 0042，OpenWrt 21+ 的首个 L2/L3 平台切片已经完成 fresh `uci show network`
+截至 ADR 0060，OpenWrt 21+ 的首个 L2/L3 平台切片已经完成 fresh `uci show network`
 inventory 与 `/tmp` staging：支持基础 interface（none/static/dhcp/dhcpv6）、独立
-device Bridge、显式 802.1Q/802.1ad VLAN device、route/route6 和 rule/rule6。
+device Bridge、显式 802.1Q/802.1ad VLAN device、route/route6 和 rule/rule6；interface
+同时支持受界面级 typed 校验约束的 `peerdns`、`dns` 和 `dns_search`。这些 resolver
+字段与网络对象共用 snapshot digest、R3 审批、原生验证、确认提交和回滚；不会把
+普通 Linux 的 `/etc/resolv.conf` 或未知网络管理器误当作可写目标。
 typed object、原生 section selector 与 present options 来自同一个有界快照；更新、
 删除和 policy priority move 均绑定该快照，所有占用 section（包括不支持的厂商
 section）都会参与名称冲突检查。Agent-owned 使用 `mbed_managed`/`mbed_id` 标记；
 平台原生对象更新不会被静默接管，未建模 option 保留。PPPoE/协议凭据、IPv6 PD、
 高级 rule selector、route onlink/MTU、DSA bridge-vlan、swconfig、bond 和 VRF 当前
 明确为只读。输出仅是供私有 `/tmp` UCI config dir 使用的 batch，并固定要求
-`uci export network` 语法检查；尚未安装到 Flash 或 reload netifd，live apply 必须
-等独立回滚与 confirmed-commit 完成后才开放。
+`uci export network` 语法检查；已接入 OpenWrt native transaction、独立回滚和
+confirmed-commit，业务配置只在明确批准后写入 `/etc/config/network`。
 
 截至 ADR 0043，OpenWrt network native transaction 与独立回滚目标已经完成。执行器
 重新读取 live UCI 与 root-owned `/etc/config/network`，在私有 `/tmp` 目录应用固定

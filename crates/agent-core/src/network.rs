@@ -538,7 +538,39 @@ fn validate_interface(value: &NetworkInterfaceConfig) -> Result<(), NetworkPlanE
     {
         return Err(NetworkPlanError::InvalidField("interface address mode"));
     }
+    if value.dns_servers.len() > 8 || value.dns_search.len() > 16 {
+        return Err(NetworkPlanError::Capacity);
+    }
+    let mut dns_servers = HashSet::new();
+    for server in &value.dns_servers {
+        if server.is_unspecified() || server.is_multicast() || !dns_servers.insert(server) {
+            return Err(NetworkPlanError::InvalidField("interface DNS server"));
+        }
+    }
+    let mut search = HashSet::new();
+    for suffix in &value.dns_search {
+        if !valid_dns_search_suffix(suffix) || !search.insert(suffix) {
+            return Err(NetworkPlanError::InvalidField(
+                "interface DNS search suffix",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_dns_search_suffix(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 || value.starts_with('.') || value.ends_with('.') {
+        return false;
+    }
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
 }
 
 fn validate_bridge(value: &NetworkBridge) -> Result<(), NetworkPlanError> {
@@ -1022,6 +1054,9 @@ mod tests {
             }],
             mtu: Some(1500),
             mac_override: None,
+            peerdns: true,
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
         })
     }
 
@@ -1135,6 +1170,33 @@ mod tests {
         assert_eq!(
             validate_network_object(&invalid_route),
             Err(NetworkPlanError::InvalidField("route address family"))
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_interface_dns_overrides() {
+        let mut invalid = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dns_servers = vec![Ipv4Addr::UNSPECIFIED.into()];
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField("interface DNS server"))
+        );
+
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dns_servers.clear();
+            value.dns_search = vec!["bad suffix".into()];
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField(
+                "interface DNS search suffix"
+            ))
         );
     }
 

@@ -298,7 +298,7 @@ fn decode_section(section: &UciSection, ownership: ObjectOwnership) -> Option<Ne
 
 fn valid_cardinality(section: &UciSection) -> bool {
     let list_options: &[&str] = match section.section_type.as_str() {
-        "interface" => &["ipaddr", "ip6addr"],
+        "interface" => &["ipaddr", "ip6addr", "dns", "dns_search"],
         "device" => &["ports"],
         _ => &[],
     };
@@ -317,9 +317,6 @@ fn has_unsupported_semantics(section: &UciSection) -> bool {
             "ip6class",
             "delegate",
             "metric",
-            "peerdns",
-            "dns",
-            "dns_search",
             "type",
             "defaultroute",
             "force_link",
@@ -412,6 +409,13 @@ fn decode_interface(
         addresses,
         mtu: optional_u32(section, "mtu").ok()?,
         mac_override: optional(section, "macaddr").map(str::to_owned),
+        peerdns: optional_bool(section, "peerdns").ok()?.unwrap_or(true),
+        dns_servers: section
+            .values("dns")
+            .iter()
+            .map(|raw| raw.parse().ok())
+            .collect::<Option<Vec<IpAddr>>>()?,
+        dns_search: section.values("dns_search").to_vec(),
     })
 }
 
@@ -771,6 +775,7 @@ fn render_interface(
     if let Some(mac) = &value.mac_override {
         options.push(("macaddr", mac.clone()));
     }
+    options.push(("peerdns", boolean(value.peerdns)));
     let ipv4 = value
         .addresses
         .iter()
@@ -786,7 +791,15 @@ fn render_interface(
     Ok(RenderedNetworkObject {
         section_type: "interface",
         options,
-        lists: vec![("ipaddr", ipv4), ("ip6addr", ipv6)],
+        lists: vec![
+            ("ipaddr", ipv4),
+            ("ip6addr", ipv6),
+            (
+                "dns",
+                value.dns_servers.iter().map(ToString::to_string).collect(),
+            ),
+            ("dns_search", value.dns_search.clone()),
+        ],
     })
 }
 
@@ -952,6 +965,9 @@ fn supported_options(kind: &str) -> &'static [&'static str] {
             "ip6addr",
             "mtu",
             "macaddr",
+            "peerdns",
+            "dns",
+            "dns_search",
         ],
         "bridge" => &[
             "mbed_managed",
@@ -1247,6 +1263,9 @@ network.lan.device='br-lan'\n\
 network.lan.ipaddr='192.168.1.1'\n\
 network.lan.netmask='255.255.255.0'\n\
 network.lan.mtu='1500'\n\
+network.lan.peerdns='0'\n\
+network.lan.dns='1.1.1.1' '2606:4700:4700::1111'\n\
+network.lan.dns_search='example.com'\n\
 network.lan.vendor_keep='yes'\n\
 network.@device[0]=device\n\
 network.@device[0].name='br-lan'\n\
@@ -1286,6 +1305,12 @@ network.@rule[0].lookup='100'\n";
             }],
             mtu: Some(1500),
             mac_override: None,
+            peerdns: false,
+            dns_servers: vec![
+                "9.9.9.9".parse().expect("DNS server"),
+                "2620:fe::fe".parse().expect("DNS server"),
+            ],
+            dns_search: vec!["guest.example".into()],
         })
     }
 
@@ -1347,6 +1372,9 @@ network.@rule[0].lookup='100'\n";
         assert_eq!(interface.id, "lan");
         assert_eq!(interface.ownership, ObjectOwnership::PlatformNative);
         assert_eq!(interface.addresses[0].prefix_len, 24);
+        assert!(!interface.peerdns);
+        assert_eq!(interface.dns_servers.len(), 2);
+        assert_eq!(interface.dns_search, ["example.com"]);
 
         let rule = snapshot
             .inventory()
@@ -1403,6 +1431,17 @@ network.@rule[0].lookup='100'\n";
             stage
                 .uci_batch
                 .contains("add_list network.guest.ipaddr='192.0.2.1/24'")
+        );
+        assert!(stage.uci_batch.contains("network.guest.peerdns='0'"));
+        assert!(
+            stage
+                .uci_batch
+                .contains("add_list network.guest.dns='9.9.9.9'")
+        );
+        assert!(
+            stage
+                .uci_batch
+                .contains("add_list network.guest.dns_search='guest.example'")
         );
         assert!(stage.uci_batch.ends_with("commit network\n"));
         assert_eq!(stage.validations, [OpenWrtNetworkValidation::UciExport]);

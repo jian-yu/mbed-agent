@@ -112,7 +112,8 @@ configuration execution is available through the bounded ChangeSet path on
 supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
 is implemented. OpenWrt 21+ has fresh UCI network inventory and confirmed writes
-for the initial interface/Bridge/VLAN/route/policy-rule subset. Generic Linux
+for the interface/Bridge/VLAN/route/policy-rule subset, including interface-level
+`peerdns`, explicit resolver addresses, and DNS search suffixes. Generic Linux
 with iproute2 has fresh interface/route/policy-rule inventory and confirmed
 writes for enabled Agent-owned volatile routes and reserved-priority policy
 rules. Routes use numeric protocol 186 and policy rules use preference range
@@ -176,6 +177,9 @@ Generic Linux route daemon admission and confirmed commit are recorded in
 Generic Linux Agent-owned policy-rule admission and reserved-priority
 transaction support are recorded in
 [ADR 0059](docs/adr/0059-generic-linux-policy-rules.md).
+OpenWrt interface resolver overrides and their UCI transaction boundary are
+recorded in
+[ADR 0060](docs/adr/0060-openwrt-interface-dns-overrides.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in
@@ -472,9 +476,12 @@ and require confirmation. OpenWrt arms an independent `/etc/config/network`
 rollback helper. Generic Linux accepts enabled Agent-owned routes and policy
 rules only: routes carry protocol 186 and policy rules use preference range
 32000-32063. Both store canonical ownership only in bounded `/tmp` SQLite and
-arm an independent reverse `ip -force -batch` helper. Interfaces, addresses,
-ordinary platform routes, and persistent generic Linux network-manager files
-remain read-only.
+arm an independent reverse `ip -force -batch` helper. Interface resolver
+overrides are currently OpenWrt-only (`peerdns`, `dns`, and `dns_search`) and
+use the same transaction; generic Linux resolver files and unknown
+network-manager state remain read-only. Interfaces, addresses, ordinary
+platform routes, and persistent generic Linux network-manager files remain
+read-only.
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart
