@@ -1175,7 +1175,9 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 尚未开放。企业微信智能机器人首个 WSS 文本切片已完成：CLI 通过 Secret stdin
 原子写入 Bot ID/Secret，daemon 重启自动 `aibot_subscribe`、心跳、文本回调、流式回复、
 去重、ACK 观测和有界退避；所有 Channel 的结构化 `/elevate` 已接通并按 actor 绑定；
-媒体、事件、mTLS 与签名 envelope 尚未开放。
+媒体、事件、mTLS 与签名 envelope 尚未开放。所有 Channel 的 `/deauth` 也已接通，
+只撤销当前 actor 的内存 capability，不写 SQLite 或 Flash；本地 CLI 提供同等的
+`mbed-agent auth deauth`。
 
 **退出标准**：100+ 仿真设备弱网长稳；消息重复不会重复执行副作用。
 

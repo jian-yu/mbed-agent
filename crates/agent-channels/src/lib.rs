@@ -45,6 +45,8 @@ pub enum ChannelCommand {
     Elevate {
         password: ChannelSecret,
     },
+    /// Revoke this channel actor's in-memory device-admin capability.
+    Deauth,
     Diagnose {
         target: DiagnosticTarget,
     },
@@ -130,6 +132,10 @@ pub fn command_from_text(mut text: String) -> ChannelCommand {
                 password: ChannelSecret::new(password),
             };
         }
+    }
+    if text.trim() == "/deauth" {
+        text.zeroize();
+        return ChannelCommand::Deauth;
     }
     if let Some(rest) = text.strip_prefix("/firewall-inventory") {
         if rest.trim().is_empty() {
@@ -385,6 +391,7 @@ pub fn decode_request(
         }
         ChannelCommand::Ping
         | ChannelCommand::Status
+        | ChannelCommand::Deauth
         | ChannelCommand::Diagnose { .. }
         | ChannelCommand::FirewallInventory
         | ChannelCommand::NetworkInventory
@@ -403,8 +410,8 @@ fn validate_command_shape(command: Option<&Value>) -> Result<(), ChannelMessageE
         .and_then(Value::as_str)
         .ok_or(ChannelMessageError::InvalidJson)?;
     let expected = match kind {
-        "ping" | "status" | "firewall_inventory" | "network_inventory" | "action_list"
-        | "action_reload" => ["type"].as_slice(),
+        "ping" | "status" | "deauth" | "firewall_inventory" | "network_inventory"
+        | "action_list" | "action_reload" => ["type"].as_slice(),
         "ask" => ["text", "type"].as_slice(),
         "elevate" => ["password", "type"].as_slice(),
         "diagnose" => ["target", "type"].as_slice(),
@@ -552,6 +559,14 @@ mod tests {
 
         assert!(matches!(
             command_from_text("/elevateX not-a-command".into()),
+            ChannelCommand::Ask { .. }
+        ));
+        assert_eq!(
+            command_from_text(" /deauth ".into()),
+            ChannelCommand::Deauth
+        );
+        assert!(matches!(
+            command_from_text("/deauthx".into()),
             ChannelCommand::Ask { .. }
         ));
     }

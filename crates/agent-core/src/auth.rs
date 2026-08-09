@@ -254,6 +254,19 @@ impl AuthManager {
         }
         Ok(valid)
     }
+
+    /// Revokes one actor's in-memory administrator capability immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actor identity is invalid or the auth state
+    /// lock is unavailable.
+    pub fn deauth(&self, actor_id: &str) -> Result<(), AuthError> {
+        validate_actor_id(actor_id)?;
+        let mut state = self.state.lock().map_err(|_| AuthError::StateUnavailable)?;
+        state.capabilities.remove(actor_id);
+        Ok(())
+    }
 }
 
 fn validate_actor_id(actor_id: &str) -> Result<(), AuthError> {
@@ -372,6 +385,12 @@ mod tests {
             !manager
                 .is_device_admin("channel/mqtt/user-1", 2_000)
                 .expect("state")
+        );
+        manager.deauth("channel/wecom/user-1").expect("deauth");
+        assert!(
+            !manager
+                .is_device_admin("channel/wecom/user-1", 2_000)
+                .expect("state after deauth")
         );
     }
 

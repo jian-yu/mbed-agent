@@ -181,6 +181,13 @@ The official WeChat ClawBot QR binding and atomic credential persistence are
 recorded in [ADR 0053](docs/adr/0053-wechat-clawbot-binding.md).
 The bounded `getupdates`/`sendmessage` text transport is recorded in
 [ADR 0054](docs/adr/0054-wechat-clawbot-long-poll.md).
+The official WeCom smart-bot WSS transport is recorded in
+[ADR 0055](docs/adr/0055-wecom-aibot-websocket.md).
+Typed Channel ChangeSet commands are recorded in
+[ADR 0056](docs/adr/0056-channel-changeset-commands.md), and declarative
+ActionSpec Channel commands in [ADR 0057](docs/adr/0057-channel-actionspec-commands.md).
+Explicit actor-scoped capability revocation is recorded in
+[ADR 0058](docs/adr/0058-explicit-capability-revocation.md).
 
 The implemented and deferred Phase 0 decisions are recorded in
 [ADR 0001](docs/adr/0001-runtime-foundation.md). This distinction is intentional:
@@ -303,7 +310,8 @@ by the administrator password. The password is handled as a redacted typed
 command, checked against the daemon's boot-bound verifier, and immediately
 zeroized; it is never forwarded to the LLM, written to SQLite, or logged. The
 resulting `device-admin` capability is scoped to that channel actor and the
-current boot.
+current boot. Send `/deauth` from that same actor to revoke it immediately; the
+equivalent local command is `mbed-agent auth deauth`.
 
 After elevation, the same channel can use the typed ChangeSet flow without
 shell interpolation:
@@ -401,7 +409,15 @@ The returned capability expires after `auth.capability_ttl_secs` and disappears
 on daemon restart. Failed authentication is rate-limited per actor with
 `auth.max_failures` and `auth.lockout_secs`. The same authenticator is designed
 for verified MQTT, WeCom, and WeChat actors; channel adapters do not bypass local
-policy. Passwords are never accepted as command-line arguments.
+policy. Revoke the local CLI actor without entering a password:
+
+```sh
+cargo run -p mbed-agent -- auth deauth
+```
+
+For a Channel actor, send `/deauth`; revocation is actor-scoped, immediate, and
+stored only in daemon memory. Passwords are never accepted as command-line
+arguments.
 
 Typed firewall mutations can be planned, inspected, approved, executed, and
 confirmed through the same binary. `firewall-plan` reads a JSON array of closed

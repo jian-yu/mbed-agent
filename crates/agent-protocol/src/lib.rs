@@ -50,6 +50,7 @@ pub enum Command {
     Elevate {
         password: SensitiveString,
     },
+    Deauth,
     ChangeGet {
         change_set_id: String,
     },
@@ -192,6 +193,7 @@ pub enum ResponseData {
     ConntrackDiagnostic(Box<ConntrackDiagnosticReport>),
     QdiscDiagnostic(Box<QdiscDiagnosticReport>),
     Elevation(ElevationResponse),
+    Deauthenticated { actor_id: String },
     ChangeSet(ChangeSetResponse),
     ChangeApproval(ChangeApprovalResponse),
     FirewallInventory(FirewallInventoryResponse),
@@ -1717,6 +1719,7 @@ mod tests {
             Command::Elevate {
                 password: SensitiveString::new("secret".into()),
             },
+            Command::Deauth,
             Command::ChangeGet {
                 change_set_id: "change-1".into(),
             },

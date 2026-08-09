@@ -344,10 +344,12 @@ async fn dispatch_channel_request(
         ChannelCommand::Elevate { password } => {
             handle_elevation(internal_id, password.into_inner(), actor_id, state).await
         }
+        ChannelCommand::Deauth => handle_deauth(internal_id, actor_id, state).await,
         ChannelCommand::Ask { text } => match command_from_text(text) {
             ChannelCommand::Elevate { password } => {
                 handle_elevation(internal_id, password.into_inner(), actor_id, state).await
             }
+            ChannelCommand::Deauth => handle_deauth(internal_id, actor_id, state).await,
             ChannelCommand::Ask { text } => handle_completion(internal_id, text, state).await,
             _ => ServerResponse::error(
                 internal_id,
@@ -682,6 +684,9 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
                 state,
             )
             .await;
+        }
+        Command::Deauth => {
+            return handle_deauth(request.id, LOCAL_CLI_ACTOR.into(), state).await;
         }
         Command::ChangeGet { change_set_id } => {
             return handle_change_get(request.id, change_set_id, LOCAL_CLI_ACTOR.into(), state)
@@ -1132,6 +1137,38 @@ async fn handle_elevation(
         }
         Err(error) => {
             error!(%error, "administrator authentication worker failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            )
+        }
+    }
+}
+
+async fn handle_deauth(id: String, actor_id: String, state: &AppState) -> ServerResponse {
+    let auth = Arc::clone(&state.auth);
+    let actor_id_for_auth = actor_id.clone();
+    match tokio::task::spawn_blocking(move || auth.deauth(&actor_id_for_auth)).await {
+        Ok(Ok(())) => {
+            info!(%actor_id, "device administrator capability revoked");
+            ServerResponse::success(id, ResponseData::Deauthenticated { actor_id })
+        }
+        Ok(Err(AuthError::InvalidActor)) => ServerResponse::error(
+            id,
+            ErrorCode::InvalidRequest,
+            "administrator revocation request is invalid",
+        ),
+        Ok(Err(error)) => {
+            error!(%error, "administrator revocation failed");
+            ServerResponse::error(
+                id,
+                ErrorCode::Internal,
+                "administrator authentication is unavailable",
+            )
+        }
+        Err(error) => {
+            error!(%error, "administrator revocation worker failed");
             ServerResponse::error(
                 id,
                 ErrorCode::Internal,
@@ -6388,6 +6425,43 @@ mod tests {
                 .auth
                 .is_device_admin("wecom:user-1", 1)
                 .expect("channel auth state")
+        );
+        let deauth_response = dispatch_channel_request(
+            "wecom",
+            agent_channels::ChannelRequest {
+                schema_version: agent_channels::CHANNEL_MESSAGE_SCHEMA_VERSION,
+                message_id: "wecom-deauth-1".into(),
+                actor_id: "wecom:user-1".into(),
+                conversation_id: "wecom:chat-1".into(),
+                expires_unix_ms: i64::MAX,
+                command: ChannelCommand::Deauth,
+            },
+            &state,
+        )
+        .await;
+        assert!(deauth_response.ok);
+        assert_eq!(
+            deauth_response.result.expect("channel deauth result")["data"]["actor_id"],
+            "wecom:user-1"
+        );
+        assert!(
+            !state
+                .auth
+                .is_device_admin("wecom:user-1", 1)
+                .expect("channel auth state after deauth")
+        );
+        assert!(
+            state
+                .auth
+                .is_device_admin("cli/local", 1)
+                .expect("local auth remains isolated")
+        );
+        handle_deauth("local-deauth".into(), LOCAL_CLI_ACTOR.into(), &state).await;
+        assert!(
+            !state
+                .auth
+                .is_device_admin("cli/local", 1)
+                .expect("local auth state after deauth")
         );
         let database = fs::read(&state.config.storage.path).expect("database bytes");
         assert!(

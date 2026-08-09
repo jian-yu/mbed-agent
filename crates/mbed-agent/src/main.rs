@@ -260,6 +260,11 @@ enum AuthTarget {
         #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
         socket: PathBuf,
     },
+    /// Immediately revoke the local CLI actor's in-memory device-admin capability.
+    Deauth {
+        #[arg(long, default_value = "/tmp/mbed-agent/agent.sock")]
+        socket: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -417,6 +422,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await
         }
+        CliCommand::Auth {
+            target: AuthTarget::Deauth { socket },
+        } => run_client(&socket, Command::Deauth).await,
         CliCommand::Change { target } => run_change_target(target).await,
         CliCommand::RollbackHelper {
             transaction_id,
