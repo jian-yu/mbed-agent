@@ -2777,13 +2777,12 @@ fn run_post_apply_wan_probe(
     platform: &PlatformCapabilities,
     port: &mut impl agent_core::ChangeExecutionPort,
 ) -> Result<(), agent_core::ExecutionPortError> {
-    let report = tokio::runtime::Handle::current()
-        .block_on(tools.diagnose_wan(platform, true))
-        .map_err(|_| agent_core::ExecutionPortError)?;
-    if wan_probe_succeeded(&report.summary) {
-        return Ok(());
+    match tokio::runtime::Handle::current().block_on(tools.diagnose_wan(platform, true)) {
+        Ok(report) if wan_probe_succeeded(&report.summary) => Ok(()),
+        Ok(_) | Err(_) => {
+            rollback_after_post_apply_probe(port).map_err(|_| agent_core::ExecutionPortError)
+        }
     }
-    rollback_after_post_apply_probe(port).map_err(|_| agent_core::ExecutionPortError)
 }
 
 fn wan_probe_succeeded(summary: &agent_protocol::WanSummary) -> bool {
