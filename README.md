@@ -623,11 +623,14 @@ All generated runtime state is placed below `/tmp/mbed-agent` and may be discard
 
 ## OpenWrt integration
 
-The `openwrt/files` tree contains the initial procd service and UCI/config files.
-It targets OpenWrt 21.02 and later and does not assume either fw3 or fw4; runtime
-capability discovery selects the available firewall stack. A feed package
-Makefile and per-architecture `.ipk`/`.apk` artifacts will be added only after
-validation against real OpenWrt SDK images.
+The `openwrt/files` tree contains the procd service and UCI/config files. The
+`openwrt/Makefile` produces a feed package for OpenWrt 21.02 and later when the
+release pipeline supplies `MBED_AGENT_BINARY` for the target architecture. It
+does not assume either fw3 or fw4; runtime capability discovery selects the
+available firewall stack. Configuration files are conffiles, while SQLite,
+logs, rollback artifacts, and channel cursors remain volatile under `/tmp`.
+Per-target `.ipk` artifacts still require validation against the corresponding
+OpenWrt SDK image before release.
 
 ## Generic Linux integration
 
