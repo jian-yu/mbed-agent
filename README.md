@@ -4,6 +4,8 @@ Mbed Agent is a resource-bounded network operations agent for OpenWrt 21.02+
 and small embedded Linux systems. The current implementation contains the
 Phase 0 runtime foundation and an expanding Phase 1 read-only diagnostic set
 described in [the architecture plan](docs/architecture-plan.zh-CN.md).
+The current delivery status and pending RC gates are tracked in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Current scope
 
