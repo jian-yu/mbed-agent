@@ -404,6 +404,30 @@ async fn dispatch_channel_request(
         ChannelCommand::ChangeReject { change_set_id } => {
             handle_change_reject(internal_id, change_set_id, actor_id, state).await
         }
+        ChannelCommand::ActionList => handle_action_list(internal_id, state).await,
+        ChannelCommand::ActionReload => handle_action_reload(internal_id, actor_id, state).await,
+        ChannelCommand::ActionRun {
+            action_id,
+            inputs_json,
+        } => match serde_json::from_str::<serde_json::Value>(&inputs_json) {
+            Ok(inputs) => handle_action_run(internal_id, action_id, inputs, state).await,
+            Err(error) => ServerResponse::error(
+                internal_id,
+                ErrorCode::InvalidRequest,
+                format!("action input JSON is invalid: {error}"),
+            ),
+        },
+        ChannelCommand::ActionPlan {
+            action_id,
+            inputs_json,
+        } => match serde_json::from_str::<serde_json::Value>(&inputs_json) {
+            Ok(inputs) => handle_action_plan(internal_id, action_id, inputs, actor_id, state).await,
+            Err(error) => ServerResponse::error(
+                internal_id,
+                ErrorCode::InvalidRequest,
+                format!("action input JSON is invalid: {error}"),
+            ),
+        },
         ChannelCommand::Diagnose { target } => match target {
             DiagnosticTarget::Wan => handle_wan_diagnosis(internal_id, false, state).await,
             DiagnosticTarget::Dns => handle_dns_diagnosis(internal_id, state).await,
@@ -634,13 +658,20 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
             return handle_channel_status(request.id, state);
         }
         Command::ActionReload => {
-            return handle_action_reload(request.id, state).await;
+            return handle_action_reload(request.id, LOCAL_CLI_ACTOR.into(), state).await;
         }
         Command::ActionRun { action_id, inputs } => {
             return handle_action_run(request.id, action_id, inputs, state).await;
         }
         Command::ActionPlan { action_id, inputs } => {
-            return handle_action_plan(request.id, action_id, inputs, state).await;
+            return handle_action_plan(
+                request.id,
+                action_id,
+                inputs,
+                LOCAL_CLI_ACTOR.into(),
+                state,
+            )
+            .await;
         }
         Command::Status => status_response(state),
         Command::Elevate { password } => {
@@ -859,6 +890,7 @@ async fn handle_action_plan(
     id: String,
     action_id: String,
     inputs: serde_json::Value,
+    actor_id: String,
     state: &AppState,
 ) -> ServerResponse {
     let invocation = {
@@ -884,9 +916,7 @@ async fn handle_action_plan(
     match invocation.domain {
         ActionChangeDomain::Firewall => {
             match serde_json::from_value::<Vec<FirewallMutationRequest>>(invocation.mutations) {
-                Ok(mutations) => {
-                    handle_firewall_plan(id, mutations, LOCAL_CLI_ACTOR.into(), state).await
-                }
+                Ok(mutations) => handle_firewall_plan(id, mutations, actor_id.clone(), state).await,
                 Err(error) => ServerResponse::error(
                     id,
                     ErrorCode::InvalidRequest,
@@ -896,9 +926,7 @@ async fn handle_action_plan(
         }
         ActionChangeDomain::Network => {
             match serde_json::from_value::<Vec<NetworkMutationRequest>>(invocation.mutations) {
-                Ok(mutations) => {
-                    handle_network_plan(id, mutations, LOCAL_CLI_ACTOR.into(), state).await
-                }
+                Ok(mutations) => handle_network_plan(id, mutations, actor_id, state).await,
                 Err(error) => ServerResponse::error(
                     id,
                     ErrorCode::InvalidRequest,
@@ -909,9 +937,9 @@ async fn handle_action_plan(
     }
 }
 
-async fn handle_action_reload(id: String, state: &AppState) -> ServerResponse {
+async fn handle_action_reload(id: String, actor_id: String, state: &AppState) -> ServerResponse {
     let now = process_monotonic_ms(state);
-    match state.auth.is_device_admin(LOCAL_CLI_ACTOR, now) {
+    match state.auth.is_device_admin(&actor_id, now) {
         Ok(true) => {}
         Ok(false) => {
             return ServerResponse::error(

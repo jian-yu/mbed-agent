@@ -320,6 +320,19 @@ shell interpolation:
 Plans are still validated against a fresh firewall/network inventory; approval,
 one-use tokens, rollback and confirmed commit remain mandatory for writes.
 
+Declarative user/vendor actions are available through the same channel boundary:
+
+```text
+/action-list
+/action-run <action-id> {"input":"value"}
+/action-plan <change-action-id> {"input":"value"}
+/action-reload
+```
+
+`action-run` only executes manifests declared read-only. `action-plan` expands a
+trusted change template into the same typed ChangeSet path; `action-reload`
+requires the channel actor's current `device-admin` capability.
+
 ## User and vendor actions
 
 Set `extensions.enabled = true`, then place mode-0600/0644 TOML manifests

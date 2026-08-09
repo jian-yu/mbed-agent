@@ -501,6 +501,11 @@ LLM，而是直接复用 daemon 的 PBKDF2 管理员校验，签发仅绑定当�
 和 RAM TTL 的 `device-admin` capability。密码不进入 SQLite、日志或响应内容，空密码、
 超长密码和控制字符在 Channel 边界拒绝。
 
+声明式用户/厂商 ActionSpec 也可通过 Channel 使用 `/action-list`、`/action-run`、
+`/action-plan` 和 `/action-reload`：run 只接受 manifest 声明的 read-only action，plan
+仍展开为 typed ChangeSet，reload 需要该 actor 的 device-admin capability。ActionSpec
+始终使用固定 argv、空环境、超时和输出上限，不允许把聊天文本变成 shell。
+
 **微信**明确使用腾讯官方 `openclaw-weixin` 所采用的微信 ClawBot/iLink Bot 能力，不再以公众号、客服、小程序作为本项目微信 Channel 的主方案，也不接入个人号逆向、Hook 或模拟客户端协议。设备端不安装 Node.js 或完整 OpenClaw；`channel-wechat-clawbot` crate 依据腾讯官方公开实现的行为和服务条款，以 Rust 实现最小适配层，从而满足嵌入式资源预算。
 
 ClawBot 绑定与运行流程：

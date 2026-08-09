@@ -73,6 +73,16 @@ pub enum ChannelCommand {
     ChangeReject {
         change_set_id: String,
     },
+    ActionList,
+    ActionReload,
+    ActionRun {
+        action_id: String,
+        inputs_json: String,
+    },
+    ActionPlan {
+        action_id: String,
+        inputs_json: String,
+    },
 }
 
 /// A channel-supplied administrator password that is redacted in debug output
@@ -110,6 +120,7 @@ impl Drop for ChannelSecret {
 /// channel command. The bounded inventory/ChangeSet commands and `/elevate` are
 /// intercepted; all other text remains an LLM prompt.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn command_from_text(mut text: String) -> ChannelCommand {
     if let Some(rest) = text.strip_prefix("/elevate") {
         if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
@@ -141,6 +152,40 @@ pub fn command_from_text(mut text: String) -> ChannelCommand {
         if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
             return ChannelCommand::NetworkPlan {
                 mutations_json: rest.trim().to_owned(),
+            };
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/action-list") {
+        if rest.trim().is_empty() {
+            return ChannelCommand::ActionList;
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/action-reload") {
+        if rest.trim().is_empty() {
+            return ChannelCommand::ActionReload;
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/action-run") {
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+            let rest = rest.trim_start();
+            let mut fields = rest.splitn(2, char::is_whitespace);
+            let action_id = fields.next().unwrap_or_default().trim().to_owned();
+            let inputs_json = fields.next().unwrap_or("{}").trim().to_owned();
+            return ChannelCommand::ActionRun {
+                action_id,
+                inputs_json,
+            };
+        }
+    }
+    if let Some(rest) = text.strip_prefix("/action-plan") {
+        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+            let rest = rest.trim_start();
+            let mut fields = rest.splitn(2, char::is_whitespace);
+            let action_id = fields.next().unwrap_or_default().trim().to_owned();
+            let inputs_json = fields.next().unwrap_or("{}").trim().to_owned();
+            return ChannelCommand::ActionPlan {
+                action_id,
+                inputs_json,
             };
         }
     }
@@ -325,11 +370,26 @@ pub fn decode_request(
         | ChannelCommand::ChangeReject { change_set_id } => {
             validate_command_id(change_set_id, "command.change_set_id")?;
         }
+        ChannelCommand::ActionRun {
+            action_id,
+            inputs_json,
+        }
+        | ChannelCommand::ActionPlan {
+            action_id,
+            inputs_json,
+        } => {
+            validate_command_id(action_id, "command.action_id")?;
+            if inputs_json.len() > MAX_CHANNEL_MESSAGE_BYTES {
+                return Err(ChannelMessageError::InvalidField("command.inputs_json"));
+            }
+        }
         ChannelCommand::Ping
         | ChannelCommand::Status
         | ChannelCommand::Diagnose { .. }
         | ChannelCommand::FirewallInventory
-        | ChannelCommand::NetworkInventory => {}
+        | ChannelCommand::NetworkInventory
+        | ChannelCommand::ActionList
+        | ChannelCommand::ActionReload => {}
     }
     Ok(request)
 }
@@ -343,7 +403,8 @@ fn validate_command_shape(command: Option<&Value>) -> Result<(), ChannelMessageE
         .and_then(Value::as_str)
         .ok_or(ChannelMessageError::InvalidJson)?;
     let expected = match kind {
-        "ping" | "status" | "firewall_inventory" | "network_inventory" => ["type"].as_slice(),
+        "ping" | "status" | "firewall_inventory" | "network_inventory" | "action_list"
+        | "action_reload" => ["type"].as_slice(),
         "ask" => ["text", "type"].as_slice(),
         "elevate" => ["password", "type"].as_slice(),
         "diagnose" => ["target", "type"].as_slice(),
@@ -352,6 +413,7 @@ fn validate_command_shape(command: Option<&Value>) -> Result<(), ChannelMessageE
             ["change_set_id", "type"].as_slice()
         }
         "change_apply" => ["approval_id", "approval_token", "change_set_id", "type"].as_slice(),
+        "action_run" | "action_plan" => ["action_id", "inputs_json", "type"].as_slice(),
         _ => return Err(ChannelMessageError::InvalidJson),
     };
     if command.len() != expected.len()
@@ -539,5 +601,19 @@ mod tests {
             command_from_text("/firewall-planx []".into()),
             ChannelCommand::Ask { .. }
         ));
+        assert_eq!(
+            command_from_text("/action-run link-state {\"interface\":\"wan\"}".into()),
+            ChannelCommand::ActionRun {
+                action_id: "link-state".into(),
+                inputs_json: r#"{"interface":"wan"}"#.into(),
+            }
+        );
+        assert_eq!(
+            command_from_text("/action-plan reset {}".into()),
+            ChannelCommand::ActionPlan {
+                action_id: "reset".into(),
+                inputs_json: "{}".into(),
+            }
+        );
     }
 }
