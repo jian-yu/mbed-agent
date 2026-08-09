@@ -113,7 +113,9 @@ supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
 is implemented. OpenWrt 21+ has fresh UCI network inventory and confirmed writes
 for the interface/Bridge/VLAN/route/policy-rule subset, including interface-level
-`peerdns`, explicit resolver addresses, and DNS search suffixes. Generic Linux
+`peerdns`, explicit resolver addresses, DNS search suffixes, and bounded DHCP
+client options (`clientid`, `vendorid`, `hostname`, `reqopts`, `norelease`).
+Generic Linux
 with iproute2 has fresh interface/route/policy-rule inventory and confirmed
 writes for enabled Agent-owned volatile routes and reserved-priority policy
 rules. Routes use numeric protocol 186 and policy rules use preference range
@@ -180,6 +182,9 @@ transaction support are recorded in
 OpenWrt interface resolver overrides and their UCI transaction boundary are
 recorded in
 [ADR 0060](docs/adr/0060-openwrt-interface-dns-overrides.md).
+OpenWrt interface DHCP client controls and their bounded UCI representation are
+recorded in
+[ADR 0061](docs/adr/0061-openwrt-interface-dhcp-client.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in
@@ -477,7 +482,8 @@ rollback helper. Generic Linux accepts enabled Agent-owned routes and policy
 rules only: routes carry protocol 186 and policy rules use preference range
 32000-32063. Both store canonical ownership only in bounded `/tmp` SQLite and
 arm an independent reverse `ip -force -batch` helper. Interface resolver
-overrides are currently OpenWrt-only (`peerdns`, `dns`, and `dns_search`) and
+overrides are currently OpenWrt-only (`peerdns`, `dns`, `dns_search`, and the
+bounded DHCP client options) and
 use the same transaction; generic Linux resolver files and unknown
 network-manager state remain read-only. Interfaces, addresses, ordinary
 platform routes, and persistent generic Linux network-manager files remain

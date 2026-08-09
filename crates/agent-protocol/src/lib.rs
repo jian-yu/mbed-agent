@@ -755,6 +755,21 @@ pub struct NetworkInterfaceConfig {
     /// Bounded DNS search suffixes for the interface.
     #[serde(default)]
     pub dns_search: Vec<String>,
+    /// Optional DHCP client identifier for `OpenWrt` `clientid`.
+    #[serde(default)]
+    pub dhcp_client_id: Option<String>,
+    /// Optional DHCP vendor identifier for `OpenWrt` `vendorid`.
+    #[serde(default)]
+    pub dhcp_vendor_id: Option<String>,
+    /// Optional DHCP hostname sent to the server.
+    #[serde(default)]
+    pub dhcp_hostname: Option<String>,
+    /// Bounded DHCP option codes requested from the server.
+    #[serde(default)]
+    pub dhcp_request_options: Vec<u16>,
+    /// Whether the DHCP client must not send a release on stop.
+    #[serde(default)]
+    pub dhcp_no_release: bool,
 }
 
 const fn default_peerdns() -> bool {
@@ -1839,6 +1854,11 @@ mod tests {
         assert!(interface.peerdns);
         assert!(interface.dns_servers.is_empty());
         assert!(interface.dns_search.is_empty());
+        assert!(interface.dhcp_client_id.is_none());
+        assert!(interface.dhcp_vendor_id.is_none());
+        assert!(interface.dhcp_hostname.is_none());
+        assert!(interface.dhcp_request_options.is_empty());
+        assert!(!interface.dhcp_no_release);
     }
 
     #[test]

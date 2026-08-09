@@ -298,7 +298,7 @@ fn decode_section(section: &UciSection, ownership: ObjectOwnership) -> Option<Ne
 
 fn valid_cardinality(section: &UciSection) -> bool {
     let list_options: &[&str] = match section.section_type.as_str() {
-        "interface" => &["ipaddr", "ip6addr", "dns", "dns_search"],
+        "interface" => &["ipaddr", "ip6addr", "dns", "dns_search", "reqopts"],
         "device" => &["ports"],
         _ => &[],
     };
@@ -324,11 +324,6 @@ fn has_unsupported_semantics(section: &UciSection) -> bool {
             "ip6table",
             "broadcast",
             "ip6prefix",
-            "hostname",
-            "clientid",
-            "vendorid",
-            "reqopts",
-            "norelease",
             "reqaddress",
             "reqprefix",
         ],
@@ -416,6 +411,15 @@ fn decode_interface(
             .map(|raw| raw.parse().ok())
             .collect::<Option<Vec<IpAddr>>>()?,
         dns_search: section.values("dns_search").to_vec(),
+        dhcp_client_id: optional(section, "clientid").map(str::to_owned),
+        dhcp_vendor_id: optional(section, "vendorid").map(str::to_owned),
+        dhcp_hostname: optional(section, "hostname").map(str::to_owned),
+        dhcp_request_options: section
+            .values("reqopts")
+            .iter()
+            .map(|raw| raw.parse().ok())
+            .collect::<Option<Vec<u16>>>()?,
+        dhcp_no_release: optional_bool(section, "norelease").ok()?.unwrap_or(false),
     })
 }
 
@@ -776,6 +780,16 @@ fn render_interface(
         options.push(("macaddr", mac.clone()));
     }
     options.push(("peerdns", boolean(value.peerdns)));
+    if let Some(client_id) = &value.dhcp_client_id {
+        options.push(("clientid", client_id.clone()));
+    }
+    if let Some(vendor_id) = &value.dhcp_vendor_id {
+        options.push(("vendorid", vendor_id.clone()));
+    }
+    if let Some(hostname) = &value.dhcp_hostname {
+        options.push(("hostname", hostname.clone()));
+    }
+    options.push(("norelease", boolean(value.dhcp_no_release)));
     let ipv4 = value
         .addresses
         .iter()
@@ -799,6 +813,14 @@ fn render_interface(
                 value.dns_servers.iter().map(ToString::to_string).collect(),
             ),
             ("dns_search", value.dns_search.clone()),
+            (
+                "reqopts",
+                value
+                    .dhcp_request_options
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
         ],
     })
 }
@@ -968,6 +990,11 @@ fn supported_options(kind: &str) -> &'static [&'static str] {
             "peerdns",
             "dns",
             "dns_search",
+            "clientid",
+            "vendorid",
+            "hostname",
+            "reqopts",
+            "norelease",
         ],
         "bridge" => &[
             "mbed_managed",
@@ -1266,6 +1293,11 @@ network.lan.mtu='1500'\n\
 network.lan.peerdns='0'\n\
 network.lan.dns='1.1.1.1' '2606:4700:4700::1111'\n\
 network.lan.dns_search='example.com'\n\
+network.lan.clientid='01:02:03:04:05:06'\n\
+network.lan.vendorid='mbed-router'\n\
+network.lan.hostname='lan-router'\n\
+network.lan.reqopts='1' '3' '6'\n\
+network.lan.norelease='1'\n\
 network.lan.vendor_keep='yes'\n\
 network.@device[0]=device\n\
 network.@device[0].name='br-lan'\n\
@@ -1311,6 +1343,11 @@ network.@rule[0].lookup='100'\n";
                 "2620:fe::fe".parse().expect("DNS server"),
             ],
             dns_search: vec!["guest.example".into()],
+            dhcp_client_id: Some("mbed-guest-client".into()),
+            dhcp_vendor_id: Some("mbed-agent".into()),
+            dhcp_hostname: Some("guest-router".into()),
+            dhcp_request_options: vec![1, 3, 6],
+            dhcp_no_release: true,
         })
     }
 
@@ -1375,6 +1412,14 @@ network.@rule[0].lookup='100'\n";
         assert!(!interface.peerdns);
         assert_eq!(interface.dns_servers.len(), 2);
         assert_eq!(interface.dns_search, ["example.com"]);
+        assert_eq!(
+            interface.dhcp_client_id.as_deref(),
+            Some("01:02:03:04:05:06")
+        );
+        assert_eq!(interface.dhcp_vendor_id.as_deref(), Some("mbed-router"));
+        assert_eq!(interface.dhcp_hostname.as_deref(), Some("lan-router"));
+        assert_eq!(interface.dhcp_request_options, [1, 3, 6]);
+        assert!(interface.dhcp_no_release);
 
         let rule = snapshot
             .inventory()
@@ -1436,7 +1481,28 @@ network.@rule[0].lookup='100'\n";
         assert!(
             stage
                 .uci_batch
+                .contains("network.guest.clientid='mbed-guest-client'")
+        );
+        assert!(
+            stage
+                .uci_batch
+                .contains("network.guest.vendorid='mbed-agent'")
+        );
+        assert!(
+            stage
+                .uci_batch
+                .contains("network.guest.hostname='guest-router'")
+        );
+        assert!(stage.uci_batch.contains("network.guest.norelease='1'"));
+        assert!(
+            stage
+                .uci_batch
                 .contains("add_list network.guest.dns='9.9.9.9'")
+        );
+        assert!(
+            stage
+                .uci_batch
+                .contains("add_list network.guest.reqopts='1'")
         );
         assert!(
             stage

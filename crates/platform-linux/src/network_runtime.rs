@@ -158,6 +158,11 @@ pub fn inspect_runtime_network_inventory(
             peerdns: true,
             dns_servers: Vec::new(),
             dns_search: Vec::new(),
+            dhcp_client_id: None,
+            dhcp_vendor_id: None,
+            dhcp_hostname: None,
+            dhcp_request_options: Vec::new(),
+            dhcp_no_release: false,
         }));
     }
 

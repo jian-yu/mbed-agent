@@ -555,6 +555,29 @@ fn validate_interface(value: &NetworkInterfaceConfig) -> Result<(), NetworkPlanE
             ));
         }
     }
+    for field in [
+        value.dhcp_client_id.as_deref(),
+        value.dhcp_vendor_id.as_deref(),
+        value.dhcp_hostname.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !valid_dhcp_text(field) {
+            return Err(NetworkPlanError::InvalidField("interface DHCP text"));
+        }
+    }
+    if value.dhcp_request_options.len() > 16 {
+        return Err(NetworkPlanError::Capacity);
+    }
+    let mut request_options = HashSet::new();
+    for option in &value.dhcp_request_options {
+        if *option == 0 || *option > 255 || !request_options.insert(option) {
+            return Err(NetworkPlanError::InvalidField(
+                "interface DHCP request option",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -571,6 +594,14 @@ fn valid_dns_search_suffix(value: &str) -> bool {
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
+}
+
+fn valid_dhcp_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| !byte.is_ascii_control() && !matches!(byte, b'\'' | b'\\'))
 }
 
 fn validate_bridge(value: &NetworkBridge) -> Result<(), NetworkPlanError> {
@@ -1057,6 +1088,11 @@ mod tests {
             peerdns: true,
             dns_servers: Vec::new(),
             dns_search: Vec::new(),
+            dhcp_client_id: None,
+            dhcp_vendor_id: None,
+            dhcp_hostname: None,
+            dhcp_request_options: Vec::new(),
+            dhcp_no_release: false,
         })
     }
 
@@ -1196,6 +1232,45 @@ mod tests {
             validate_network_object(&invalid),
             Err(NetworkPlanError::InvalidField(
                 "interface DNS search suffix"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_interface_dhcp_options() {
+        let mut invalid = interface("wan", Ipv4Addr::new(192, 0, 2, 1));
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dhcp_client_id = Some("bad'client".into());
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField("interface DHCP text"))
+        );
+
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dhcp_client_id = None;
+            value.dhcp_request_options = vec![1, 1];
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField(
+                "interface DHCP request option"
+            ))
+        );
+
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dhcp_request_options = vec![256];
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField(
+                "interface DHCP request option"
             ))
         );
     }
