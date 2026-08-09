@@ -6,25 +6,29 @@ test -f "$matrix"
 
 awk -F '\t' '
 NR == 1 {
-    if ($1 != "release" || $2 != "target" || $3 != "subtarget" || $4 != "arch" || $5 != "firewall") {
+    if ($1 != "release" || $2 != "target" || $3 != "subtarget" || $4 != "arch" || $5 != "rust_target" || $6 != "firewall") {
         print "invalid OpenWrt matrix header" > "/dev/stderr"
         exit 1
     }
     next
 }
-NF != 5 {
-    print "every matrix row must have five tab-separated fields" > "/dev/stderr"
+NF != 6 {
+    print "every matrix row must have six tab-separated fields" > "/dev/stderr"
     exit 1
 }
 $1 !~ /^([0-9]+)\.([0-9]+)\.[0-9]+$/ {
     print "invalid OpenWrt release: " $1 > "/dev/stderr"
     exit 1
 }
-$1 ~ /^21\./ && $5 != "fw3" {
+$5 !~ /^[a-z0-9_]+-unknown-linux-musl(eabihf)?$/ {
+    print "invalid Rust musl target: " $5 > "/dev/stderr"
+    exit 1
+}
+$1 ~ /^21\./ && $6 != "fw3" {
     print "OpenWrt 21.x must use fw3 in the compatibility matrix" > "/dev/stderr"
     exit 1
 }
-$1 !~ /^21\./ && $5 != "fw4" {
+$1 !~ /^21\./ && $6 != "fw4" {
     print "OpenWrt 22.x and newer must use fw4 in the compatibility matrix" > "/dev/stderr"
     exit 1
 }

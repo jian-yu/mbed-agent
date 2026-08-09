@@ -19,3 +19,19 @@ smoke、procd 启动和 CLI ping。
 
 矩阵校验由 `scripts/validate-openwrt-matrix.sh` 执行，CI 会拒绝缺列、重复目标、
 非法防火墙版本或缺少最低版本/架构覆盖的修改。
+
+## SDK package build
+
+在已经完成对应 Rust/musl 交叉编译后，可使用以下入口下载官方固定 release 的
+SDK，读取同目录 `sha256sums` 校验 SDK，调用 OpenWrt package Makefile，并把产物
+和 SDK 摘要写入 `dist/openwrt/`：
+
+```sh
+sh scripts/build-openwrt-sdk-package.sh \
+  23.05.5 x86 64 \
+  target/x86_64-unknown-linux-musl/release/mbed-agent
+```
+
+脚本只接受 `targets.tsv` 中存在的 release/target/subtarget 组合；构建缓存固定在
+`/tmp/mbed-agent-openwrt-sdk-build`，完成后默认删除。设置
+`MBED_AGENT_KEEP_SDK=1` 可保留该明确目录用于排障。

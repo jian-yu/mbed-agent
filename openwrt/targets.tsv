@@ -1,17 +1,17 @@
-release	target	subtarget	arch	firewall
-21.02.7	x86	64	x86_64	fw3
-21.02.7	armvirt	32	armv7	fw3
-21.02.7	armsr	armv8	aarch64	fw3
-21.02.7	ramips	mt7621	mipsel	fw3
-22.03.7	x86	64	x86_64	fw4
-22.03.7	armvirt	32	armv7	fw4
-22.03.7	armsr	armv8	aarch64	fw4
-22.03.7	ramips	mt7621	mipsel	fw4
-23.05.5	x86	64	x86_64	fw4
-23.05.5	armvirt	32	armv7	fw4
-23.05.5	armsr	armv8	aarch64	fw4
-23.05.5	mediatek	filogic	aarch64	fw4
-24.10.1	x86	64	x86_64	fw4
-24.10.1	armvirt	32	armv7	fw4
-24.10.1	armsr	armv8	aarch64	fw4
-24.10.1	mediatek	filogic	aarch64	fw4
+release	target	subtarget	arch	rust_target	firewall
+21.02.7	x86	64	x86_64	x86_64-unknown-linux-musl	fw3
+21.02.7	armvirt	32	armv7	armv7-unknown-linux-musleabihf	fw3
+21.02.7	armsr	armv8	aarch64	aarch64-unknown-linux-musl	fw3
+21.02.7	ramips	mt7621	mipsel	mipsel-unknown-linux-musl	fw3
+22.03.7	x86	64	x86_64	x86_64-unknown-linux-musl	fw4
+22.03.7	armvirt	32	armv7	armv7-unknown-linux-musleabihf	fw4
+22.03.7	armsr	armv8	aarch64	aarch64-unknown-linux-musl	fw4
+22.03.7	ramips	mt7621	mipsel	mipsel-unknown-linux-musl	fw4
+23.05.5	x86	64	x86_64	x86_64-unknown-linux-musl	fw4
+23.05.5	armvirt	32	armv7	armv7-unknown-linux-musleabihf	fw4
+23.05.5	armsr	armv8	aarch64	aarch64-unknown-linux-musl	fw4
+23.05.5	mediatek	filogic	aarch64	aarch64-unknown-linux-musl	fw4
+24.10.1	x86	64	x86_64	x86_64-unknown-linux-musl	fw4
+24.10.1	armvirt	32	armv7	armv7-unknown-linux-musleabihf	fw4
+24.10.1	armsr	armv8	aarch64	aarch64-unknown-linux-musl	fw4
+24.10.1	mediatek	filogic	aarch64	aarch64-unknown-linux-musl	fw4

@@ -27,6 +27,7 @@ jobs:
       - name: Validate OpenWrt package inputs
         run: |
           test -f openwrt/Makefile
+          test -f .github/workflows/openwrt-sdk.yml
           sh scripts/validate-openwrt-matrix.sh
           test -f openwrt/files/etc/config/mbed-agent
           test -f openwrt/files/etc/mbed-agent/config.toml
@@ -37,9 +38,11 @@ jobs:
       - name: Validate integration and footprint helpers
         run: |
           sh -n scripts/run-linux-namespace-smoke.sh
+          sh -n scripts/run-openwrt-qemu-smoke.sh
           sh -n scripts/check-release-footprint.sh
           sh -n scripts/measure-daemon-rss.sh
           sh -n scripts/check-persistent-write-set.sh
+          sh -n scripts/build-openwrt-sdk-package.sh
           sh scripts/run-linux-namespace-smoke.sh
           sh scripts/check-release-footprint.sh target/release/mbed-agent
           sh scripts/measure-daemon-rss.sh target/release/mbed-agent config/mbed-agent.example.toml

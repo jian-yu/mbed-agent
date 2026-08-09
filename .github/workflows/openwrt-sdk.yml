@@ -1,0 +1,44 @@
+name: OpenWrt SDK package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86_64:
+    name: OpenWrt ${{ matrix.release }} x86/64
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: 21.02.7
+            firewall: fw3
+          - release: 22.03.7
+            firewall: fw4
+          - release: 23.05.5
+            firewall: fw4
+          - release: 24.10.1
+            firewall: fw4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Install pinned Rust toolchain and musl target
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup target add x86_64-unknown-linux-musl --toolchain 1.85.1
+      - name: Build x86_64 musl binary
+        run: cargo +1.85.1 build --release --locked --target x86_64-unknown-linux-musl -p mbed-agent
+      - name: Build and verify OpenWrt package
+        run: |
+          sh scripts/build-openwrt-sdk-package.sh \
+            '${{ matrix.release }}' x86 64 \
+            target/x86_64-unknown-linux-musl/release/mbed-agent
+      - name: Upload package and metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: mbed-agent-openwrt-${{ matrix.release }}-x86-64
+          path: dist/openwrt/
