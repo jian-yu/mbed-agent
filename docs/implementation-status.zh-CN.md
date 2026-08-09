@@ -35,5 +35,19 @@
 
 - SQLite、WAL、日志、artifact 和 rollback 均位于 `/tmp/mbed-agent`。
 - 配置和业务配置事务是允许写入持久介质的唯一类别。
-- SQLite 主库已有 `max_page_count` 和 bounded record/payload；WAL checkpoint 水位、
-  Session/Turn/Observation 以及哈希审计链仍在工程化收口阶段。
+- SQLite 主库已有 `max_page_count`、bounded record/payload、WAL checkpoint 水位和
+  启动/运行态维护；Session/Turn/Observation 元数据、日志轮转和 artifact 清理均受
+  配额约束，业务正文与敏感值不写入 SQLite。
+
+## 交付与可靠性验收
+
+- `openwrt/targets.tsv` 覆盖 OpenWrt 21.02 fw3、22.03/23.05/24.10 fw4 的
+  x86/64、armvirt、armsr 及 mediatek/ramips 代表目标，并校验 Rust musl target
+  与防火墙后端的一致性。
+- `scripts/build-openwrt-sdk-package.sh` 使用官方 release SDK 和同目录
+  `sha256sums`，在固定 `/tmp` 缓存中重建目标包；`.github/workflows/openwrt-sdk.yml`
+  提供手动、可复现的 x86/64 矩阵构建。
+- `scripts/run-openwrt-qemu-smoke.sh`、`scripts/run-linux-namespace-smoke.sh` 和
+  `scripts/check-persistent-write-set.sh` 分别提供 OpenWrt 启动、通用 Linux 能力、
+  运行态 Flash 写入快照的有界验收入口。仓库不携带固件镜像，真实 fw3/fw4 事务、
+  namespace 内核能力和 72 小时 Channel 稳定性仍是 v0.2.0 RC 的外部验收门槛。

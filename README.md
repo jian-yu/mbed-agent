@@ -84,6 +84,12 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   OpenWrt and generic Linux. Focused runs execute only their required collectors;
   the WAN run also includes firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
+- Reproducible OpenWrt package delivery inputs: the supported release/target matrix is
+  checked by `scripts/validate-openwrt-matrix.sh`; official SDK package builds are
+  available through `scripts/build-openwrt-sdk-package.sh` and the manual
+  `.github/workflows/openwrt-sdk.yml` workflow. QEMU, namespace, Flash write-set, and
+  binary-footprint helpers provide bounded RC acceptance gates; firmware/device
+  transactions remain external test inputs.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
   redirects, and redacted API-key configuration.
