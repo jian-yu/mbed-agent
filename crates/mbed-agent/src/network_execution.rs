@@ -18,7 +18,10 @@ use platform_linux::firewall_command::{
 use platform_linux::network_openwrt_execute::{
     OpenWrtNetworkTransaction, verify_openwrt_network_plan,
 };
-use platform_linux::network_runtime::reconcile_runtime_network_inventory;
+use platform_linux::network_runtime::{
+    reconcile_runtime_network_inventory, reconcile_runtime_network_inventory_with_links,
+    runtime_canonical_includes_interfaces,
+};
 use platform_linux::network_runtime_execute::GenericRuntimeRouteTransaction;
 
 pub(crate) struct GenericRuntimeRouteExecutionPort {
@@ -388,6 +391,36 @@ impl ChangeExecutionPort for GenericRuntimeRouteExecutionPort {
                 .reinspect()
                 .map_err(|_| ExecutionPortError)
         } else {
+            let interfaces = self.execution.typed.changes.iter().any(|change| {
+                [change.before.as_ref(), change.after.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|object| matches!(object, agent_protocol::NetworkObject::Interface(_)))
+            }) || self
+                .canonical_state
+                .as_deref()
+                .map(runtime_canonical_includes_interfaces)
+                .is_some_and(|result| result.unwrap_or(true));
+            let links = if interfaces {
+                Some(
+                    self.runner
+                        .execute(&FirewallCommand::IpJsonLink, None)
+                        .map_err(|_| ExecutionPortError)?
+                        .stdout,
+                )
+            } else {
+                None
+            };
+            let addresses = if interfaces {
+                Some(
+                    self.runner
+                        .execute(&FirewallCommand::IpJsonAddress, None)
+                        .map_err(|_| ExecutionPortError)?
+                        .stdout,
+                )
+            } else {
+                None
+            };
             let routes = self
                 .runner
                 .execute(&FirewallCommand::IpJsonRoute, None)
@@ -400,13 +433,26 @@ impl ChangeExecutionPort for GenericRuntimeRouteExecutionPort {
                 .map_err(|_| ExecutionPortError)?
                 .stdout;
             let rules = std::str::from_utf8(&rules).map_err(|_| ExecutionPortError)?;
-            let snapshot = reconcile_runtime_network_inventory(
-                routes,
-                rules,
-                self.canonical_state.as_deref(),
-                &self.boot_id,
-            )
-            .map_err(|_| ExecutionPortError)?;
+            let snapshot =
+                if let (Some(links), Some(addresses)) = (links.as_deref(), addresses.as_deref()) {
+                    reconcile_runtime_network_inventory_with_links(
+                        std::str::from_utf8(links).map_err(|_| ExecutionPortError)?,
+                        std::str::from_utf8(addresses).map_err(|_| ExecutionPortError)?,
+                        routes,
+                        rules,
+                        self.canonical_state.as_deref(),
+                        &self.boot_id,
+                    )
+                    .map_err(|_| ExecutionPortError)?
+                } else {
+                    reconcile_runtime_network_inventory(
+                        routes,
+                        rules,
+                        self.canonical_state.as_deref(),
+                        &self.boot_id,
+                    )
+                    .map_err(|_| ExecutionPortError)?
+                };
             verify_network_plan_result(snapshot.inventory(), &self.execution.typed)
                 .map_err(|_| ExecutionPortError)?;
             self.confirmation_verified = true;

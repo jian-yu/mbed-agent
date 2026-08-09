@@ -228,7 +228,7 @@ pub fn create_nftables_runtime_rollback_bundle(
     result
 }
 
-/// Creates a runtime-only generic Linux route rollback bundle.
+/// Creates a runtime-only generic Linux network rollback bundle.
 ///
 /// The reverse `ip` batch and optional prior network canonical state remain below the private
 /// rollback root. The helper executes only a fixed `ip -force -batch <snapshot>` command.

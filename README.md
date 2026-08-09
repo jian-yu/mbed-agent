@@ -123,9 +123,11 @@ code/value pairs rendered as bounded `dhcp_option` list entries and Agent-owned
 IPv4 static leases rendered as marked `host` sections.
 Generic Linux
 with iproute2 has fresh interface/route/policy-rule inventory and confirmed
-writes for enabled Agent-owned volatile routes and reserved-priority policy
-rules. Routes use numeric protocol 186 and policy rules use preference range
-32000-32063; neither writes persistent network-manager configuration. The local
+writes for enabled Agent-owned volatile routes, reserved-priority policy rules,
+and `agent_`-prefixed static-address profiles bound to existing devices. Routes
+use numeric protocol 186 and policy rules use preference range 32000-32063;
+profiles only add/remove static addresses with fixed `ip -batch` and neither
+writes persistent network-manager configuration. The local
 CLI exposes
 actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
 apply, and confirmed commit for supported firewall and network backends. The
@@ -185,6 +187,9 @@ Generic Linux route daemon admission and confirmed commit are recorded in
 Generic Linux Agent-owned policy-rule admission and reserved-priority
 transaction support are recorded in
 [ADR 0059](docs/adr/0059-generic-linux-policy-rules.md).
+Generic Linux Agent-owned static-address profiles and their fixed `ip -batch`
+transaction are recorded in
+[ADR 0066](docs/adr/0066-generic-linux-runtime-address-profiles.md).
 OpenWrt interface resolver overrides and their UCI transaction boundary are
 recorded in
 [ADR 0060](docs/adr/0060-openwrt-interface-dns-overrides.md).
@@ -495,14 +500,16 @@ Network mutations are closed typed objects (interfaces, bridges, VLANs, routes,
 and policy rules in the currently supported backend subset), never raw shell,
 argv, UCI text, or `ip` text. Public network writes are always elevated to R3
 and require confirmation. OpenWrt arms an independent `/etc/config/network`
-rollback helper. Generic Linux accepts enabled Agent-owned routes and policy
-rules only: routes carry protocol 186 and policy rules use preference range
-32000-32063. Both store canonical ownership only in bounded `/tmp` SQLite and
+rollback helper. Generic Linux accepts enabled Agent-owned routes, reserved-
+priority policy rules, and `agent_`-prefixed static-address profiles only:
+routes carry protocol 186, policy rules use preference range 32000-32063, and
+profiles bind to an existing device without taking ownership of the platform-
+native interface. Both store canonical ownership only in bounded `/tmp` SQLite and
 arm an independent reverse `ip -force -batch` helper. Interface resolver
 overrides are currently OpenWrt-only (`peerdns`, `dns`, `dns_search`, and the
 bounded DHCP client/server options) and
 use the same transaction; generic Linux resolver files and unknown
-network-manager state remain read-only. Interfaces, addresses, ordinary
+network-manager state remain read-only. Platform-native interfaces, ordinary
 platform routes, and persistent generic Linux network-manager files remain
 read-only.
 

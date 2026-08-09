@@ -46,8 +46,8 @@ use platform_linux::network_openwrt::{
     OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory_with_dhcp,
 };
 use platform_linux::network_runtime::{
-    inspect_runtime_network_inventory, inspect_runtime_policy_inventory,
-    reconcile_runtime_network_inventory,
+    reconcile_runtime_network_inventory, reconcile_runtime_network_inventory_with_links,
+    runtime_canonical_includes_interfaces,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -1369,14 +1369,16 @@ async fn handle_network_plan(
         return ServerResponse::error(
             id,
             ErrorCode::InvalidRequest,
-            "generic Linux network writes support only enabled Agent-owned runtime routes and reserved policy rules",
+            "generic Linux writes support only Agent-owned runtime routes, reserved policy rules, and static-address profiles",
         );
     }
+    let include_generic_interfaces = requests.iter().any(generic_runtime_interface_request);
     let _configuration_guard = state.configuration_lock.lock().await;
-    let inventory = match inspect_network_for_write(backend, state).await {
-        Ok(inventory) => inventory,
-        Err(error) => return error.with_id(id),
-    };
+    let inventory =
+        match inspect_network_for_write(backend, state, include_generic_interfaces).await {
+            Ok(inventory) => inventory,
+            Err(error) => return error.with_id(id),
+        };
     let mutations = requests
         .into_iter()
         .map(network_mutation)
@@ -1550,34 +1552,13 @@ async fn inspect_network_inventory(
                         PendingResponseError::unavailable("live network inventory is unavailable")
                     })?
                     .stdout;
-                let mut inventory = inspect_runtime_network_inventory(
+                let inventory = reconcile_runtime_network_inventory_with_links(
                     std::str::from_utf8(&links).map_err(|_| {
                         PendingResponseError::conflict("live network inventory is malformed")
                     })?,
                     std::str::from_utf8(&addresses).map_err(|_| {
                         PendingResponseError::conflict("live network inventory is malformed")
                     })?,
-                    std::str::from_utf8(&routes).map_err(|_| {
-                        PendingResponseError::conflict("live network inventory is malformed")
-                    })?,
-                )
-                .map_err(|error| {
-                    warn!(%error, "generic Linux network inventory is not safely representable");
-                    PendingResponseError::conflict(
-                        "live network inventory cannot be safely represented",
-                    )
-                })?;
-                let policy = inspect_runtime_policy_inventory(std::str::from_utf8(&rules).map_err(
-                    |_| PendingResponseError::conflict("live network inventory is malformed"),
-                )?)
-                .map_err(|error| {
-                    warn!(%error, "generic Linux policy rule inventory is not safely representable");
-                    PendingResponseError::conflict(
-                        "live policy rule inventory cannot be safely represented",
-                    )
-                })?;
-                inventory.objects.extend(policy.objects);
-                let owned = reconcile_runtime_network_inventory(
                     std::str::from_utf8(&routes).map_err(|_| {
                         PendingResponseError::conflict("live network inventory is malformed")
                     })?,
@@ -1590,12 +1571,10 @@ async fn inspect_network_inventory(
                 .map_err(|error| {
                     warn!(%error, "generic Linux Agent-owned network objects cannot be reconciled");
                     PendingResponseError::conflict(
-                        "live Agent-owned route inventory cannot be safely represented",
+                        "live Agent-owned network inventory cannot be safely represented",
                     )
                 })?;
-                inventory
-                    .objects
-                    .extend(owned.inventory().objects.iter().cloned());
+                let inventory = inventory.inventory().clone();
                 if inventory.objects.len() > 256 {
                     return Err(PendingResponseError::conflict(
                         "live network inventory exceeds its safe bound",
@@ -1624,7 +1603,7 @@ const fn network_validation_check(backend: WritableNetworkBackend) -> &'static s
             "reinspect live UCI and run native OpenWrt network validation"
         }
         WritableNetworkBackend::GenericRuntimeRoutes => {
-            "reconcile Agent-owned protocol-186 routes/reserved policy rules and validate a fixed ip batch"
+            "reconcile Agent-owned protocol-186 routes, reserved policy rules, static-address profiles, and validate a fixed ip batch"
         }
     }
 }
@@ -1659,10 +1638,12 @@ fn generic_runtime_route_request(request: &NetworkMutationRequest) -> bool {
                     && rule.enabled
                     && (32_000..=32_063).contains(&rule.priority)
             }
+            NetworkObject::Interface(interface) => generic_runtime_interface(interface),
             _ => false,
         },
-        NetworkMutationRequest::Delete { kind, .. } => {
+        NetworkMutationRequest::Delete { kind, id, .. } => {
             matches!(kind.as_str(), "route" | "policy_rule")
+                || (kind == "interface" && id.starts_with("agent_"))
         }
         NetworkMutationRequest::Move { desired, .. } => matches!(
             desired,
@@ -1674,27 +1655,94 @@ fn generic_runtime_route_request(request: &NetworkMutationRequest) -> bool {
     }
 }
 
+fn generic_runtime_interface_request(request: &NetworkMutationRequest) -> bool {
+    match request {
+        NetworkMutationRequest::Create { desired }
+        | NetworkMutationRequest::Update { desired, .. }
+        | NetworkMutationRequest::Move { desired, .. } => {
+            matches!(desired, NetworkObject::Interface(interface) if generic_runtime_interface(interface))
+        }
+        NetworkMutationRequest::Delete { kind, id, .. } => {
+            kind == "interface" && id.starts_with("agent_")
+        }
+    }
+}
+
+fn generic_runtime_interface(interface: &agent_protocol::NetworkInterfaceConfig) -> bool {
+    interface.ownership == ObjectOwnership::AgentOwned
+        && interface.enabled
+        && interface.id.starts_with("agent_")
+        && interface.mtu.is_none()
+        && interface.mac_override.is_none()
+        && interface.peerdns
+        && interface.dns_servers.is_empty()
+        && interface.dns_search.is_empty()
+        && interface.dhcp_client_id.is_none()
+        && interface.dhcp_vendor_id.is_none()
+        && interface.dhcp_hostname.is_none()
+        && interface.dhcp_request_options.is_empty()
+        && !interface.dhcp_no_release
+        && interface.dhcp_server.is_none()
+        && !interface
+            .addresses
+            .iter()
+            .any(|address| address.address.is_unspecified() || address.address.is_multicast())
+}
+
 async fn inspect_network_for_write(
     backend: WritableNetworkBackend,
     state: &AppState,
+    include_generic_interfaces: bool,
 ) -> Result<NetworkInventory, PendingResponseError> {
     match backend {
         WritableNetworkBackend::OpenWrt => inspect_network_for_planning(state)
             .await
             .map(|snapshot| snapshot.inventory().clone()),
-        WritableNetworkBackend::GenericRuntimeRoutes => inspect_generic_runtime_routes(state)
-            .await
-            .map(|snapshot| snapshot.inventory().clone()),
+        WritableNetworkBackend::GenericRuntimeRoutes => {
+            inspect_generic_runtime_routes(state, include_generic_interfaces)
+                .await
+                .map(|snapshot| snapshot.inventory().clone())
+        }
     }
 }
 
 async fn inspect_generic_runtime_routes(
     state: &AppState,
+    include_interfaces: bool,
 ) -> Result<platform_linux::network_runtime::RuntimeRouteSnapshot, PendingResponseError> {
     let canonical = load_generic_network_state(state).await?;
+    let include_interfaces = include_interfaces
+        || canonical
+            .as_deref()
+            .map(runtime_canonical_includes_interfaces)
+            .is_some_and(|result| result.unwrap_or(true));
     let runner = firewall_command_runner(state);
     let boot_id = state.auth.boot_id().to_owned();
     tokio::task::spawn_blocking(move || {
+        let links = if include_interfaces {
+            Some(
+                runner
+                    .execute(&FirewallCommand::IpJsonLink, None)
+                    .map_err(|_| {
+                        PendingResponseError::unavailable("live interface inventory is unavailable")
+                    })?
+                    .stdout,
+            )
+        } else {
+            None
+        };
+        let addresses = if include_interfaces {
+            Some(
+                runner
+                    .execute(&FirewallCommand::IpJsonAddress, None)
+                    .map_err(|_| {
+                        PendingResponseError::unavailable("live address inventory is unavailable")
+                    })?
+                    .stdout,
+            )
+        } else {
+            None
+        };
         let routes = runner
             .execute(&FirewallCommand::IpJsonRoute, None)
             .map_err(|_| PendingResponseError::unavailable("live route inventory is unavailable"))?
@@ -1705,19 +1753,40 @@ async fn inspect_generic_runtime_routes(
                 PendingResponseError::unavailable("live policy rule inventory is unavailable")
             })?
             .stdout;
-        reconcile_runtime_network_inventory(
-            std::str::from_utf8(&routes)
-                .map_err(|_| PendingResponseError::conflict("live route inventory is malformed"))?,
-            std::str::from_utf8(&rules).map_err(|_| {
-                PendingResponseError::conflict("live policy rule inventory is malformed")
-            })?,
-            canonical.as_deref(),
-            &boot_id,
-        )
-        .map_err(|error| {
-            warn!(%error, "generic Linux Agent-owned routes cannot be safely planned");
+        let result =
+            if let (Some(links), Some(addresses)) = (links.as_deref(), addresses.as_deref()) {
+                reconcile_runtime_network_inventory_with_links(
+                    std::str::from_utf8(links).map_err(|_| {
+                        PendingResponseError::conflict("live interface inventory is malformed")
+                    })?,
+                    std::str::from_utf8(addresses).map_err(|_| {
+                        PendingResponseError::conflict("live address inventory is malformed")
+                    })?,
+                    std::str::from_utf8(&routes).map_err(|_| {
+                        PendingResponseError::conflict("live route inventory is malformed")
+                    })?,
+                    std::str::from_utf8(&rules).map_err(|_| {
+                        PendingResponseError::conflict("live policy rule inventory is malformed")
+                    })?,
+                    canonical.as_deref(),
+                    &boot_id,
+                )
+            } else {
+                reconcile_runtime_network_inventory(
+                    std::str::from_utf8(&routes).map_err(|_| {
+                        PendingResponseError::conflict("live route inventory is malformed")
+                    })?,
+                    std::str::from_utf8(&rules).map_err(|_| {
+                        PendingResponseError::conflict("live policy rule inventory is malformed")
+                    })?,
+                    canonical.as_deref(),
+                    &boot_id,
+                )
+            };
+        result.map_err(|error| {
+            warn!(%error, "generic Linux Agent-owned network objects cannot be safely planned");
             PendingResponseError::conflict(
-                "live Agent-owned route inventory cannot be safely modified",
+                "live Agent-owned network inventory cannot be safely modified",
             )
         })
     })

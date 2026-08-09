@@ -1303,8 +1303,9 @@ execution payload 分别由 domain、plan digest 和 boot ID 绑定并原子写�
 SQLite。所有 OpenWrt network apply 均保守提升为 R3，必须经过 device-admin、一次性
 approval、全局串行写、独立 `/etc/config/network` rollback helper、live typed verify
 和显式 confirm；执行失败、daemon/Channel 失联或确认超时都会进入相同恢复协议。
-普通 Linux 的 L2/L3 公共写入口仍保持关闭，需在 netlink 或已识别 network manager
-上实现等价的 fresh inventory、原生 transaction 与独立回滚后再开放。
+普通 Linux 的 L2/L3 公共写入口仅对有明确 ownership 边界的易失对象开放；未知网络管理器
+配置和平台原生对象仍保持只读，只有完成 fresh inventory、原生 transaction 与独立回滚的
+对象才可进入 ChangeSet。
 
 截至 ADR 0045，普通 Linux 已开放只读的 typed runtime inventory：当 iproute2 可用时，
 执行固定且有界的 `ip -j link/address/route/rule`，将可安全表达的接口、路由和
@@ -1312,7 +1313,8 @@ approval、全局串行写、独立 `/etc/config/network` rollback helper、live
 不会伪装成静态期望配置，当前 MAC 也不会被误标为 override；multipath、未知 route
 type、无法闭合的 rule selector、重复 identity、畸形或超限输出均 fail closed。
 由于内核状态不能证明 NetworkManager、systemd-networkd、发行版脚本或厂商 supervisor
-的持久 ownership，普通 Linux 的 plan/apply 仍关闭。
+的持久 ownership，普通 Linux 不写持久配置；明确标记为 Agent-owned 的运行时 profile 才能
+进入 plan/apply。
 
 截至 ADR 0046，普通 Linux 首个可写候选收敛为 Agent-owned 易失路由：只接受 enabled
 typed route，并以 numeric route protocol 186 标记 native ownership；canonical state
@@ -1342,8 +1344,9 @@ first-decision-wins、超时、即时 rollback、durable outcome 与子进程超
 `network-inventory` 将普通 interface/route/policy rule 的只读 platform-native 视图与
 通过 boot-bound canonical 严格对账的 protocol-186 Agent-owned route 合并；`network-plan`
 在该后端接收 enabled Agent-owned typed route，以及保留 `32000..=32063` preference
-范围内的 policy rule，interface、address、普通 route 以及持久 NetworkManager/
-systemd-networkd 文件仍拒绝写入。所有变更强制 R3，经过 device-admin、一次性 approval、
+范围内的 policy rule，并增加绑定既有 device 的 Agent-owned 静态地址 profile；平台原生
+interface、普通 address、普通 route 以及持久 NetworkManager/systemd-networkd 文件仍拒绝写入。
+所有变更强制 R3，经过 device-admin、一次性 approval、
 全局串行执行、fixed `ip -batch` transaction、进程外逆向 batch、live typed verify 和
 显式 confirm。canonical 只进入有界 `/tmp` SQLite，设备重启不恢复、也不回写 Flash。
 
@@ -1351,6 +1354,15 @@ systemd-networkd 文件仍拒绝写入。所有变更强制 R3，经过 device-a
 可表达 selector 经过 family、fwmark/mask、action/table 和 reserved priority 校验；
 保留范围内的未知或漂移规则直接阻断计划。policy priority move、更新和删除均绑定
 fresh digest，反向 batch 与 route 共用独立 helper 和 confirmed-commit。
+
+截至 ADR 0066，普通 Linux 增加了受限的 Agent-owned runtime interface profile。profile
+使用 `agent_` 前缀的独立 typed identity 绑定一个已经存在的 kernel device，只允许静态
+IPv4/IPv6 地址的增删；不接管平台原生 interface，不修改 MTU、MAC、DHCP、resolver 或
+NetworkManager/systemd-networkd 配置。地址命令由固定 `ip -batch` renderer 生成，profile
+与 protocol-186 route、reserved policy rule 一起写入 boot-bound canonical state；设备重启
+后 `/tmp` SQLite 状态不恢复，孤儿地址/设备消失/现场漂移都会 fail closed。新增 profile
+也会检查 device 存在，所有操作继续复用 R3、device-admin、独立 helper、live verify 和
+confirmed-commit。
 
 截至 ADR 0050，用户与厂商扩展命令不再要求修改 Rust：daemon 从受信任、非 group/world
 writable 的 ActionSpec TOML 目录加载有界 registry，manifest 声明绝对 executable、固定

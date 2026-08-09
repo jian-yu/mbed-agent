@@ -13,7 +13,8 @@ use crate::firewall_command::{
 };
 use crate::network_runtime::{
     RuntimeNetworkInventoryError, RuntimeRouteSnapshot, RuntimeRouteStage,
-    reconcile_runtime_network_inventory, render_runtime_route_stage,
+    reconcile_runtime_network_inventory, reconcile_runtime_network_inventory_with_links,
+    render_runtime_route_stage, runtime_canonical_includes_interfaces,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,14 +119,7 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
     /// Returns an error for invalid ordering, inspection, canonical reconciliation, or rendering.
     pub fn reinspect(&mut self) -> Result<(), GenericRuntimeRouteExecutionError> {
         self.require_state(TransactionState::New)?;
-        let routes = self.collect_routes()?;
-        let rules = self.collect_rules()?;
-        let snapshot = reconcile_runtime_network_inventory(
-            &routes,
-            &rules,
-            self.canonical_state.as_deref(),
-            &self.boot_id,
-        )?;
+        let snapshot = self.reconcile_snapshot()?;
         let rendered = render_runtime_route_stage(&snapshot, &self.execution.typed)?;
         self.snapshot = Some(snapshot);
         self.rendered = Some(rendered);
@@ -198,14 +192,7 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
         &mut self,
     ) -> Result<(), GenericRuntimeRouteExecutionError> {
         self.require_state(TransactionState::Validated)?;
-        let fresh = self.collect_routes()?;
-        let fresh_rules = self.collect_rules()?;
-        let snapshot = reconcile_runtime_network_inventory(
-            &fresh,
-            &fresh_rules,
-            self.canonical_state.as_deref(),
-            &self.boot_id,
-        )?;
+        let snapshot = self.reconcile_snapshot()?;
         if self.snapshot.as_ref() != Some(&snapshot) {
             return Err(GenericRuntimeRouteExecutionError::SourceDrift);
         }
@@ -231,14 +218,29 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
             .rendered
             .as_ref()
             .ok_or(GenericRuntimeRouteExecutionError::InvalidState)?;
-        let fresh = self.collect_routes()?;
-        let fresh_rules = self.collect_rules()?;
-        reconcile_runtime_network_inventory(
-            &fresh,
-            &fresh_rules,
-            Some(&rendered.projected_canonical_state),
-            &self.boot_id,
-        )?;
+        if self.execution_requires_full_inventory() {
+            let links = self.collect_links()?;
+            let addresses = self.collect_addresses()?;
+            let routes = self.collect_routes()?;
+            let rules = self.collect_rules()?;
+            reconcile_runtime_network_inventory_with_links(
+                &links,
+                &addresses,
+                &routes,
+                &rules,
+                Some(&rendered.projected_canonical_state),
+                &self.boot_id,
+            )?;
+        } else {
+            let fresh = self.collect_routes()?;
+            let fresh_rules = self.collect_rules()?;
+            reconcile_runtime_network_inventory(
+                &fresh,
+                &fresh_rules,
+                Some(&rendered.projected_canonical_state),
+                &self.boot_id,
+            )?;
+        }
         self.verified_canonical = Some(rendered.projected_canonical_state.clone());
         self.state = TransactionState::Verified;
         Ok(())
@@ -288,6 +290,24 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
         .map_err(|_| GenericRuntimeRouteExecutionError::Inspection)
     }
 
+    fn collect_links(&self) -> Result<String, GenericRuntimeRouteExecutionError> {
+        String::from_utf8(
+            self.runner
+                .execute(&FirewallCommand::IpJsonLink, None)?
+                .stdout,
+        )
+        .map_err(|_| GenericRuntimeRouteExecutionError::Inspection)
+    }
+
+    fn collect_addresses(&self) -> Result<String, GenericRuntimeRouteExecutionError> {
+        String::from_utf8(
+            self.runner
+                .execute(&FirewallCommand::IpJsonAddress, None)?
+                .stdout,
+        )
+        .map_err(|_| GenericRuntimeRouteExecutionError::Inspection)
+    }
+
     fn collect_rules(&self) -> Result<String, GenericRuntimeRouteExecutionError> {
         String::from_utf8(
             self.runner
@@ -295,6 +315,48 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
                 .stdout,
         )
         .map_err(|_| GenericRuntimeRouteExecutionError::Inspection)
+    }
+
+    fn execution_requires_full_inventory(&self) -> bool {
+        let canonical_has_interfaces = self
+            .canonical_state
+            .as_deref()
+            .map(runtime_canonical_includes_interfaces)
+            .is_some_and(|result| result.unwrap_or(true));
+        self.execution.typed.changes.iter().any(|change| {
+            [change.before.as_ref(), change.after.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|object| matches!(object, agent_protocol::NetworkObject::Interface(_)))
+        }) || canonical_has_interfaces
+    }
+
+    fn reconcile_snapshot(
+        &self,
+    ) -> Result<RuntimeRouteSnapshot, GenericRuntimeRouteExecutionError> {
+        if self.execution_requires_full_inventory() {
+            let links = self.collect_links()?;
+            let addresses = self.collect_addresses()?;
+            let routes = self.collect_routes()?;
+            let rules = self.collect_rules()?;
+            Ok(reconcile_runtime_network_inventory_with_links(
+                &links,
+                &addresses,
+                &routes,
+                &rules,
+                self.canonical_state.as_deref(),
+                &self.boot_id,
+            )?)
+        } else {
+            let routes = self.collect_routes()?;
+            let rules = self.collect_rules()?;
+            Ok(reconcile_runtime_network_inventory(
+                &routes,
+                &rules,
+                self.canonical_state.as_deref(),
+                &self.boot_id,
+            )?)
+        }
     }
 
     fn apply_path(&self) -> Result<PathBuf, GenericRuntimeRouteExecutionError> {
