@@ -4,8 +4,9 @@ use std::net::IpAddr;
 use agent_protocol::{
     ChangeDiff, ChangeOperation, ChangePlan, ChangeRiskSignals, ConfigDomain, ConfigObjectRef,
     IpNetwork, NetworkAddressMode, NetworkBond, NetworkBridge, NetworkDhcpServerConfig,
-    NetworkFamily, NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule,
-    NetworkRoute, NetworkRouteType, NetworkVlan, NetworkVrf, ObjectOwnership, RiskLevel,
+    NetworkDhcpStaticLease, NetworkFamily, NetworkInterfaceConfig, NetworkObject,
+    NetworkPolicyAction, NetworkPolicyRule, NetworkRoute, NetworkRouteType, NetworkVlan,
+    NetworkVrf, ObjectOwnership, RiskLevel,
 };
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
@@ -689,19 +690,47 @@ fn validate_dhcp_server(
                 "DHCP static lease duplicate",
             ));
         }
-        if lease
-            .hostname
-            .as_deref()
-            .is_some_and(|hostname| !valid_dhcp_text(hostname))
-        {
-            return Err(NetworkPlanError::InvalidField("DHCP static lease hostname"));
-        }
-        if lease
-            .lease_time
-            .as_deref()
-            .is_some_and(|lease_time| !valid_dhcp_lease_time(lease_time))
-        {
-            return Err(NetworkPlanError::InvalidField("DHCP static lease time"));
+        validate_static_lease_metadata(lease)?;
+    }
+    Ok(())
+}
+
+fn validate_static_lease_metadata(lease: &NetworkDhcpStaticLease) -> Result<(), NetworkPlanError> {
+    if lease
+        .hostname
+        .as_deref()
+        .is_some_and(|hostname| !valid_dhcp_text(hostname))
+    {
+        return Err(NetworkPlanError::InvalidField("DHCP static lease hostname"));
+    }
+    if lease
+        .lease_time
+        .as_deref()
+        .is_some_and(|lease_time| !valid_dhcp_lease_time(lease_time))
+    {
+        return Err(NetworkPlanError::InvalidField("DHCP static lease time"));
+    }
+    if lease
+        .duid
+        .as_deref()
+        .is_some_and(|duid| !valid_dhcp_text(duid))
+    {
+        return Err(NetworkPlanError::InvalidField("DHCP static lease DUID"));
+    }
+    if lease
+        .hostid
+        .as_deref()
+        .is_some_and(|hostid| !valid_dhcp_hostid(hostid))
+    {
+        return Err(NetworkPlanError::InvalidField("DHCP static lease hostid"));
+    }
+    if lease.tags.len() > 8 {
+        return Err(NetworkPlanError::Capacity);
+    }
+    let mut tags = HashSet::new();
+    for tag in &lease.tags {
+        if !valid_dhcp_tag(tag) || !tags.insert(tag) {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease tag"));
         }
     }
     Ok(())
@@ -724,6 +753,18 @@ fn valid_dhcp_lease_time(value: &str) -> bool {
         && bytes.len() <= 16
         && matches!(bytes.last(), Some(b's' | b'm' | b'h' | b'd' | b'w'))
         && bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+}
+
+fn valid_dhcp_hostid(value: &str) -> bool {
+    (1..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_dhcp_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn ipv4_mask(prefix_len: u8) -> u32 {
@@ -1554,6 +1595,9 @@ mod tests {
                     address: "192.168.1.20".parse().expect("lease address"),
                     hostname: Some("nas".into()),
                     lease_time: Some("infinite".into()),
+                    duid: Some("0001000123456789aabbccddeeff".into()),
+                    hostid: Some("abcd".into()),
+                    tags: vec!["trusted".into(), "nas".into()],
                 }],
             });
         } else {

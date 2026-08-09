@@ -552,6 +552,9 @@ fn decode_dhcp_static_lease(section: &UciSection, id: &str) -> Option<NetworkDhc
         address: optional(section, "ip")?.parse().ok()?,
         hostname: optional(section, "name").map(str::to_owned),
         lease_time: optional(section, "leasetime").map(str::to_owned),
+        duid: optional(section, "duid").map(str::to_owned),
+        hostid: optional(section, "hostid").map(str::to_owned),
+        tags: section.values("tag").to_vec(),
     })
 }
 
@@ -559,6 +562,7 @@ fn valid_cardinality(section: &UciSection) -> bool {
     let list_options: &[&str] = match section.section_type.as_str() {
         "interface" => &["ipaddr", "ip6addr", "dns", "dns_search", "reqopts"],
         "device" => &["ports"],
+        "host" => &["tag"],
         _ => &[],
     };
     section.options.iter().all(|(name, values)| {
@@ -1142,6 +1146,18 @@ fn render_dhcp_host(
         writeln!(batch, "set dhcp.{section}.leasetime={}", quote(lease_time)?)
             .map_err(|_| NetworkRenderError::Output)?;
     }
+    if let Some(duid) = &lease.duid {
+        writeln!(batch, "set dhcp.{section}.duid={}", quote(duid)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
+    if let Some(hostid) = &lease.hostid {
+        writeln!(batch, "set dhcp.{section}.hostid={}", quote(hostid)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
+    for tag in &lease.tags {
+        writeln!(batch, "add_list dhcp.{section}.tag={}", quote(tag)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
     Ok(())
 }
 
@@ -1164,7 +1180,17 @@ fn host_section_name(interface_id: &str, lease_id: &str) -> String {
 }
 
 fn supported_dhcp_host_options() -> &'static [&'static str] {
-    &["mbed_managed", "mbed_id", "mac", "ip", "name", "leasetime"]
+    &[
+        "mbed_managed",
+        "mbed_id",
+        "mac",
+        "ip",
+        "name",
+        "leasetime",
+        "duid",
+        "hostid",
+        "tag",
+    ]
 }
 
 fn render_dhcp_options(
@@ -1956,6 +1982,9 @@ dhcp.mbed_lan_host.mac='11:22:33:44:55:66'\n\
 dhcp.mbed_lan_host.ip='192.168.1.20'\n\
 dhcp.mbed_lan_host.name='nas'\n\
 dhcp.mbed_lan_host.leasetime='infinite'\n\
+dhcp.mbed_lan_host.duid='0001000123456789aabbccddeeff'\n\
+dhcp.mbed_lan_host.hostid='abcd'\n\
+dhcp.mbed_lan_host.tag='trusted' 'nas'\n\
 dhcp.lan.vendor_keep='yes'\n";
 
     fn guest_interface(ownership: ObjectOwnership) -> NetworkObject {
@@ -2002,6 +2031,9 @@ dhcp.lan.vendor_keep='yes'\n";
                     address: "192.0.2.20".parse().expect("lease address"),
                     hostname: Some("nas".into()),
                     lease_time: Some("infinite".into()),
+                    duid: None,
+                    hostid: None,
+                    tags: vec![],
                 }],
             }),
         })
@@ -2132,6 +2164,9 @@ dhcp.lan.vendor_keep='yes'\n";
                     address: "192.168.1.20".parse().expect("lease address"),
                     hostname: Some("nas".into()),
                     lease_time: Some("infinite".into()),
+                    duid: Some("0001000123456789aabbccddeeff".into()),
+                    hostid: Some("abcd".into()),
+                    tags: vec!["trusted".into(), "nas".into()],
                 }],
             })
         );
@@ -2292,6 +2327,21 @@ dhcp.nas.ip='192.168.1.20'\n";
             stage
                 .dhcp_uci_batch
                 .contains("set dhcp.mbed_lan_host.name='nas-updated'")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("set dhcp.mbed_lan_host.duid='0001000123456789aabbccddeeff'")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("set dhcp.mbed_lan_host.hostid='abcd'")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("add_list dhcp.mbed_lan_host.tag='trusted'")
         );
         assert!(!stage.dhcp_uci_batch.contains("vendor_keep"));
     }

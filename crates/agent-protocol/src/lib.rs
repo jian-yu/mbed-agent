@@ -831,6 +831,15 @@ pub struct NetworkDhcpStaticLease {
     /// Optional host-specific lease duration such as `infinite` or `7d`.
     #[serde(default)]
     pub lease_time: Option<String>,
+    /// Optional `DHCPv6` client DUID used by dnsmasq/odhcpd host matching.
+    #[serde(default)]
+    pub duid: Option<String>,
+    /// Optional hexadecimal `DHCPv6` host identifier.
+    #[serde(default)]
+    pub hostid: Option<String>,
+    /// Bounded dnsmasq tags attached to this host entry.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
