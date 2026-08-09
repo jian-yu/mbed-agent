@@ -1607,6 +1607,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsafe_dhcp_host_metadata() {
+        let mut object = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut object {
+            value.dhcp_server = Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Server,
+                ndp_mode: NetworkDhcpMode::Hybrid,
+                dhcp_options: vec![],
+                static_leases: vec![NetworkDhcpStaticLease {
+                    id: "nas".into(),
+                    mac: "11:22:33:44:55:66".into(),
+                    address: "192.168.1.20".parse().expect("lease address"),
+                    hostname: None,
+                    lease_time: None,
+                    duid: None,
+                    hostid: Some("not-hex".into()),
+                    tags: vec!["trusted".into(), "trusted".into()],
+                }],
+            });
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&object),
+            Err(NetworkPlanError::InvalidField("DHCP static lease hostid"))
+        );
+        if let NetworkObject::Interface(value) = &mut object {
+            let lease = value
+                .dhcp_server
+                .as_mut()
+                .expect("server")
+                .static_leases
+                .first_mut()
+                .expect("lease");
+            lease.hostid = Some("abcd".into());
+        }
+        assert_eq!(
+            validate_network_object(&object),
+            Err(NetworkPlanError::InvalidField("DHCP static lease tag"))
+        );
+    }
+
+    #[test]
     fn policy_move_changes_only_priority() {
         let existing = policy("guest-policy", 1000);
         let digest = network_object_digest(&existing).expect("digest");
