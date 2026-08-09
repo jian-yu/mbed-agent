@@ -284,6 +284,12 @@ pub struct MqttChannelConfig {
     pub device_id: String,
     pub username: String,
     pub password: SecretString,
+    /// Optional PEM CA bundle used instead of the system trust roots.
+    pub ca_cert_path: Option<PathBuf>,
+    /// Optional PEM client certificate used for mutual TLS.
+    pub client_cert_path: Option<PathBuf>,
+    /// Optional PEM client private key used for mutual TLS.
+    pub client_key_path: Option<PathBuf>,
     pub keep_alive_secs: u64,
     pub reconnect_min_secs: u64,
     pub reconnect_max_secs: u64,
@@ -300,6 +306,9 @@ impl Default for MqttChannelConfig {
             device_id: "device".into(),
             username: String::new(),
             password: SecretString::default(),
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
             keep_alive_secs: 30,
             reconnect_min_secs: 1,
             reconnect_max_secs: 60,
@@ -408,8 +417,32 @@ impl MqttChannelConfig {
         if self.enabled {
             parse_mqtts_broker(&self.broker)?;
         }
+        validate_mqtt_tls_paths(self)?;
         Ok(())
     }
+}
+
+fn validate_mqtt_tls_paths(config: &MqttChannelConfig) -> Result<(), ConfigError> {
+    for (path, field) in [
+        (&config.ca_cert_path, "channels.mqtt.ca_cert_path"),
+        (&config.client_cert_path, "channels.mqtt.client_cert_path"),
+        (&config.client_key_path, "channels.mqtt.client_key_path"),
+    ] {
+        if let Some(path) = path {
+            validate_persistent_path(path, field)?;
+        }
+    }
+    if config.client_cert_path.is_some() != config.client_key_path.is_some() {
+        return Err(ConfigError::Validation(
+            "MQTT client_cert_path and client_key_path must be configured together".into(),
+        ));
+    }
+    if config.client_cert_path.is_some() && config.ca_cert_path.is_none() {
+        return Err(ConfigError::Validation(
+            "MQTT mutual TLS requires ca_cert_path together with client certificate and key".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl WeChatClawBotConfig {
@@ -799,6 +832,23 @@ fn validate_tmp_path(path: &Path, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_persistent_path(path: &Path, field: &str) -> Result<(), ConfigError> {
+    if !path.is_absolute()
+        || path.starts_with("/tmp")
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(ConfigError::Validation(format!(
+            "{field} must be an absolute normalized path outside /tmp"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
@@ -1074,6 +1124,27 @@ mod tests {
         assert!(config.validate().is_ok());
 
         config.channels.mqtt.device_id = "device/+/escape".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn mqtt_mutual_tls_requires_a_complete_persistent_material_set() {
+        let mut config = AgentConfig::default();
+        config.channels.mqtt.enabled = true;
+        config.channels.mqtt.broker = "mqtts://broker.example:8883".into();
+        config.channels.mqtt.client_cert_path = Some(PathBuf::from("/etc/mbed-agent/client.crt"));
+        assert!(config.validate().is_err());
+
+        config.channels.mqtt.client_key_path = Some(PathBuf::from("/etc/mbed-agent/client.key"));
+        assert!(config.validate().is_err());
+
+        config.channels.mqtt.ca_cert_path = Some(PathBuf::from("/tmp/ca.pem"));
+        assert!(config.validate().is_err());
+
+        config.channels.mqtt.ca_cert_path = Some(PathBuf::from("/etc/mbed-agent/ca.pem"));
+        assert!(config.validate().is_ok());
+
+        config.channels.mqtt.client_key_path = Some(PathBuf::from("/etc/mbed-agent/../key"));
         assert!(config.validate().is_err());
     }
 

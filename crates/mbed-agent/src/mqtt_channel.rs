@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +33,8 @@ pub(crate) struct MqttRuntime {
 pub(crate) enum MqttChannelError {
     #[error("MQTT configuration is invalid")]
     InvalidConfig,
+    #[error("MQTT TLS material is unavailable")]
+    TlsMaterial,
 }
 
 pub(crate) fn start(
@@ -47,6 +51,7 @@ pub(crate) fn start(
     let request_topic =
         mqtt_request_topic(&config.device_id).map_err(|_| MqttChannelError::InvalidConfig)?;
     let mut options = MqttOptions::new(&config.client_id, host, port);
+    let transport = mqtt_transport(&config)?;
     options
         .set_keep_alive(Duration::from_secs(config.keep_alive_secs))
         .set_clean_start(false)
@@ -55,7 +60,7 @@ pub(crate) fn start(
         .set_max_packet_size(Some(
             u32::try_from(config.max_packet_bytes).map_err(|_| MqttChannelError::InvalidConfig)?,
         ))
-        .set_transport(Transport::tls_with_default_config());
+        .set_transport(transport);
     if !config.username.is_empty() {
         options.set_credentials(&config.username, config.password.expose());
     }
@@ -78,6 +83,36 @@ pub(crate) fn start(
         inbound: inbound_rx,
         status: status_rx,
     }))
+}
+
+const MAX_TLS_FILE_BYTES: u64 = 512 * 1024;
+
+fn mqtt_transport(config: &MqttChannelConfig) -> Result<Transport, MqttChannelError> {
+    let Some(ca_path) = config.ca_cert_path.as_deref() else {
+        if config.client_cert_path.is_some() || config.client_key_path.is_some() {
+            return Err(MqttChannelError::InvalidConfig);
+        }
+        return Ok(Transport::tls_with_default_config());
+    };
+    let ca = read_tls_file(ca_path)?;
+    let client_auth = match (
+        config.client_cert_path.as_deref(),
+        config.client_key_path.as_deref(),
+    ) {
+        (Some(cert), Some(key)) => Some((read_tls_file(cert)?, read_tls_file(key)?)),
+        (None, None) => None,
+        _ => return Err(MqttChannelError::InvalidConfig),
+    };
+    Ok(Transport::tls(ca, client_auth, None))
+}
+
+fn read_tls_file(path: &Path) -> Result<Vec<u8>, MqttChannelError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| MqttChannelError::TlsMaterial)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > MAX_TLS_FILE_BYTES
+    {
+        return Err(MqttChannelError::TlsMaterial);
+    }
+    fs::read(path).map_err(|_| MqttChannelError::TlsMaterial)
 }
 
 #[allow(clippy::too_many_arguments)]

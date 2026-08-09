@@ -12,7 +12,8 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
 - Strict configuration validation that keeps runtime state below `/tmp/mbed-agent`.
 - A size-capped SQLite store intended only for volatile runtime state.
 - An optional MQTT 5 read-only channel with TLS-only broker configuration,
-  bounded inflight/packet sizes, automatic reconnect, fixed device topics, and
+  optional deployment-provided CA and mutual-TLS client identity, bounded
+  inflight/packet sizes, automatic reconnect, fixed device topics, and
   `/tmp` SQLite request deduplication plus a bounded response outbox.
 - A bounded declarative ActionSpec registry for user and vendor extensions.
   Trusted TOML manifests add read-only commands and typed inputs without a Rust
@@ -50,8 +51,9 @@ described in [the architecture plan](docs/architecture-plan.zh-CN.md).
   both 21.02 fw3 and newer fw4 systems. Existing named/anonymous sections are
   resolved from a fresh local `uci show firewall` snapshot, unknown vendor
   options are preserved, unsafe selectors fail closed, and fixed native
-  fw3 IPv4/IPv6 render checks or `fw4 check` must precede activation. This
-  staging slice does not yet install or reload the live firewall.
+  fw3 IPv4/IPv6 render checks or `fw4 check` must precede activation. The
+  supported backends install and reload the live firewall only through the
+  confirmed ChangeSet transaction.
 - Generic Linux nftables staging now projects only Agent-owned objects into one
   fixed, ownership-marked `inet mbed_agent` table. It renders isolated filter,
   zone/forwarding, network/MAC/port sets, reject/log/rate/state matches, and
@@ -101,8 +103,9 @@ inputs into the existing firewall or network mutation protocol without a Rust
 rebuild. Tool arguments are parsed and validated on-device; model text cannot
 become a shell command or bypass ChangeSet approval.
 
-Provider routing, additional model-facing network tools, and MQTT mutual-TLS
-identity remain deferred. WeChat ClawBot QR binding and the bounded official
+Provider routing and additional model-facing network tools remain deferred.
+MQTT can use system trust roots or configured PEM CA/client identity files.
+WeChat ClawBot QR binding and the bounded official
 text long-poll adapter are implemented. WeCom smart-bot WSS binding and the
 bounded text callback adapter are also implemented; media remains deferred.
 The channels support ping, status, read-only diagnostics, ask, and the bounded

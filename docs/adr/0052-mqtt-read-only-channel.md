@@ -16,9 +16,10 @@ the device. Channel runtime state must remain volatile under `/tmp`.
    closed request/response envelope, diagnostic target enum, hard message/text
    limits, expiration validation, and fixed MQTT topic construction.
 2. Use `rumqttc` MQTT 5 with its bounded asynchronous request channel. Production
-   configuration accepts only `mqtts://host:port`, uses TLS system trust roots,
-   persistent sessions, QoS 1 request/response delivery, bounded packet size,
-   bounded inflight count, keepalive, and capped exponential reconnect backoff.
+   configuration accepts only `mqtts://host:port`, uses TLS system trust roots
+   by default or a configured PEM CA bundle, persistent sessions, QoS 1
+   request/response delivery, bounded packet size, bounded inflight count,
+   keepalive, and capped exponential reconnect backoff.
 3. Subscribe only to `mbed-agent/v1/devices/{device_id}/requests` and publish to
    `mbed-agent/v1/devices/{device_id}/responses/{message_id}`. Device and message
    identifiers cannot inject `/`, `+`, or `#` topic syntax.
@@ -35,9 +36,14 @@ the device. Channel runtime state must remain volatile under `/tmp`.
    during broker failure, and expose `mbed-agent channel status`. Broker
    disconnects enter capped backoff and reconnect without daemon restart.
 7. Username/password authentication is optional but paired. When present, the
-   main configuration must be root-only. Mutual TLS identity and certificate
-   rotation remain a subsequent slice; enabling MQTT without credentials assumes
-   the broker authenticates the device by another deployment-controlled means.
+   main configuration must be root-only. Deployments may instead (or also) set
+   a persistent PEM `ca_cert_path`, `client_cert_path`, and `client_key_path`.
+   Client certificate and key must be configured together, and mTLS requires a
+   CA path. The daemon rejects `/tmp`, relative, parent-traversing, symlinked,
+   missing, empty, or oversized TLS material before connecting; the key is read
+   only into process memory and never enters SQLite or logs. Certificate
+   rotation is performed by replacing the configuration and restarting the
+   daemon, keeping the existing no-Flash runtime-write rule.
 8. Channel actor and conversation identifiers are retained in the normalized
    envelope, but this slice does not grant them authorization. Writable channel
    commands stay closed until actor identity is bound through the full

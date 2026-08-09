@@ -56,6 +56,11 @@ client_id = "mbed-agent-router-1"
 device_id = "router-1"
 username = ""
 password = ""
+# Optional PEM trust bundle and mutual-TLS identity. These paths must be
+# persistent, normalized, non-symlink files; the client cert/key are paired.
+# ca_cert_path = "/etc/ssl/certs/ca-certificates.crt"
+# client_cert_path = "/etc/mbed-agent/mqtt/client.crt"
+# client_key_path = "/etc/mbed-agent/mqtt/client.key"
 keep_alive_secs = 30
 reconnect_min_secs = 1
 reconnect_max_secs = 60

@@ -53,6 +53,10 @@ client_id = "mbed-agent-router"
 device_id = "router"
 username = ""
 password = ""
+# Optional persistent PEM CA/client identity (client cert and key are paired).
+# ca_cert_path = "/etc/ssl/certs/ca-certificates.crt"
+# client_cert_path = "/etc/mbed-agent/mqtt/client.crt"
+# client_key_path = "/etc/mbed-agent/mqtt/client.key"
 keep_alive_secs = 30
 reconnect_min_secs = 1
 reconnect_max_secs = 60

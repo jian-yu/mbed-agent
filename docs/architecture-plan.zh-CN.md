@@ -476,8 +476,9 @@ topic、QoS 1、有界 packet/inflight、persistent session 和封顶指数退�
 支持 ping/status/ask/闭集诊断以及 typed ChangeSet plan/get/approve/apply/confirm/reject；
 `message_id` 在 `/tmp` SQLite 原子去重，
 完成响应进入有界易失 outbox 并按过期时间、重试间隔和次数上限重发。用户名/密码可选且必须
-成对配置，配置含凭据时强制 root-only。mTLS、签名 envelope、broker 弱网长稳和证书轮换仍需
-后续切片与真机验证。
+成对配置，配置含凭据时强制 root-only。当前实现支持 system trust roots，或由配置指定的
+PEM CA、客户端证书和私钥；TLS 材料只在启动时读取到内存，仍不写入 SQLite/Flash。签名
+envelope、证书热轮换和更长时间的真机弱网验证仍待后续切片。
 
 ### 10.3 企业微信与微信生态
 
@@ -1066,9 +1067,9 @@ shell，Agent-owned section 出现无法精确表达的漂移会整体失败；s
 section 名覆盖 vendor 配置。普通 Linux 已实现 boot-bound `/tmp` canonical
 inventory，并与 Agent-owned nftables/iptables 原生摘要相互校验。领域无关执行
 协调器现已固定二次检查、staging、native validation、rollback arm、activation、
-verification 和 confirmation 的唯一顺序，并覆盖故障注入。当前仍未开放公共写
-工具，因为具体平台 execution port、受限命令执行、daemon apply/confirm API 与
-apply 后业务探针尚未全部接通。
+verification 和 confirmation 的唯一顺序，并覆盖故障注入。OpenWrt fw3/fw4、普通 Linux
+nftables/iptables，以及普通 Linux Agent-owned runtime network 的公共 typed 写入口均已
+接通；尚未覆盖的配置域仍保持只读，apply 后的主动业务探针也仍在后续切片中补齐。
 
 受限原生命令层已实现 closed enum：只支持 UCI/fw3/fw4、nftables 和双栈
 iptables 的固定检查与加载动作；清空环境并直接启动进程，不使用 shell。stdin、
@@ -1159,14 +1160,16 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 
 ### Phase 4：直连多 Channel（4–6 周）
 
-- MQTT 5 device protocol、mTLS、易失 outbox、去重和证书轮换。
+- MQTT 5 device protocol、配置化 mTLS、易失 outbox 和去重；证书热轮换与签名 envelope
+  作为后续增强。
 - 企业微信官方长连接 adapter、CLI 官方凭据绑定、自动重连。
 - 微信 ClawBot/iLink Bot Rust adapter：QR 状态机、token 落配置、getupdates 长轮询、context token、媒体和自动重连。
 - 所有 Channel 的管理员密码提权、限速、TTL 与敏感消息旁路（首个跨 Channel `/elevate` 切片已完成）。
 - 多 provider 路由、配额和模型健康度。
 - Channel/Provider 协议版本兼容检查；Skill/Runbook 只随外部软件包维护流程更新。
 
-当前进度：MQTT 5 首个只读纵向切片已完成，包含 TLS-only 配置、daemon 启动自动连接、
+当前进度：MQTT 5 首个只读纵向切片已完成，包含 TLS-only 配置（系统信任根或配置化
+PEM CA/客户端证书/私钥）、daemon 启动自动连接、
 固定 topic、QoS 1、消息 TTL、SQLite 去重、有界 outbox、重试/退避和 CLI lifecycle status；
 仅开放 ping/status/ask/诊断。微信 ClawBot 的官方 QR 绑定命令已完成：CLI 轮询官方
 `get_bot_qrcode/get_qrcode_status`，把 `bot_token/base_url` 以 0600 原子配置写入，daemon
