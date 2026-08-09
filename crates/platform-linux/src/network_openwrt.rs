@@ -13,9 +13,9 @@ use agent_core::{
 };
 use agent_protocol::{
     ChangeOperation, IpNetwork, NetworkAddressMode, NetworkBridge, NetworkDhcpMode,
-    NetworkDhcpOption, NetworkDhcpServerConfig, NetworkFamily, NetworkInterfaceConfig,
-    NetworkObject, NetworkPolicyAction, NetworkPolicyRule, NetworkRoute, NetworkRouteType,
-    NetworkVlan, NetworkVlanProtocol, ObjectOwnership,
+    NetworkDhcpOption, NetworkDhcpServerConfig, NetworkDhcpStaticLease, NetworkFamily,
+    NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule, NetworkRoute,
+    NetworkRouteType, NetworkVlan, NetworkVlanProtocol, ObjectOwnership,
 };
 use thiserror::Error;
 
@@ -37,6 +37,14 @@ pub struct OpenWrtNetworkObjectBinding {
     pub dhcp_section: Option<String>,
     pub dhcp_present_options: Vec<String>,
     pub dhcp_agent_owned: bool,
+    pub dhcp_host_bindings: Vec<OpenWrtDhcpHostBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWrtDhcpHostBinding {
+    pub id: String,
+    pub section: String,
+    pub present_options: Vec<String>,
 }
 
 /// One bounded, internally consistent view of the current `OpenWrt` network package.
@@ -221,6 +229,7 @@ pub fn inspect_openwrt_network_inventory_with_dhcp(
             dhcp_section: None,
             dhcp_present_options: Vec::new(),
             dhcp_agent_owned: false,
+            dhcp_host_bindings: Vec::new(),
         });
         objects.push(object);
     }
@@ -240,6 +249,9 @@ pub fn inspect_openwrt_network_inventory_with_dhcp(
                 ));
             }
         };
+        if section.section_type == "host" {
+            continue;
+        }
         if section.section_type != "dhcp" {
             if managed {
                 return Err(NetworkRenderError::UnsupportedManagedSection(
@@ -310,6 +322,82 @@ pub fn inspect_openwrt_network_inventory_with_dhcp(
         binding.dhcp_section = Some(section.selector.clone());
         binding.dhcp_present_options = present_options;
         binding.dhcp_agent_owned = managed;
+    }
+
+    for section in dhcp_sections
+        .iter()
+        .filter(|section| section.section_type == "host")
+    {
+        let marker = section.first("mbed_managed");
+        let reserved = section.selector.starts_with("mbed_");
+        let managed = match marker {
+            None if !reserved => false,
+            Some("1") => true,
+            _ => {
+                return Err(NetworkRenderError::UnsafeOwnershipMarker(
+                    section.selector.clone(),
+                ));
+            }
+        };
+        if !managed {
+            dhcp_read_only_sections.push(section.selector.clone());
+            continue;
+        }
+        let Some(marker) = optional(section, "mbed_id") else {
+            return Err(NetworkRenderError::UnsupportedManagedSection(
+                section.selector.clone(),
+            ));
+        };
+        let Some((interface_id, lease_id)) = marker.split_once('/') else {
+            return Err(NetworkRenderError::UnsupportedManagedSection(
+                section.selector.clone(),
+            ));
+        };
+        if !safe_id(interface_id) || !safe_id(lease_id) {
+            return Err(NetworkRenderError::UnsupportedManagedSection(
+                section.selector.clone(),
+            ));
+        }
+        let Some(index) = objects.iter().position(
+            |object| matches!(object, NetworkObject::Interface(value) if value.id == interface_id),
+        ) else {
+            return Err(NetworkRenderError::UnsupportedManagedSection(
+                section.selector.clone(),
+            ));
+        };
+        let lease = decode_dhcp_static_lease(section, lease_id).ok_or_else(|| {
+            NetworkRenderError::UnsupportedManagedSection(section.selector.clone())
+        })?;
+        let object = objects
+            .get_mut(index)
+            .ok_or(NetworkRenderError::MalformedUci)?;
+        let NetworkObject::Interface(interface) = object else {
+            return Err(NetworkRenderError::MalformedUci);
+        };
+        let Some(server) = interface.dhcp_server.as_mut() else {
+            return Err(NetworkRenderError::UnsupportedManagedSection(
+                section.selector.clone(),
+            ));
+        };
+        server.static_leases.push(lease);
+        if validate_network_object(object).is_err() {
+            return Err(NetworkRenderError::UnsupportedManagedSection(
+                section.selector.clone(),
+            ));
+        }
+        let binding = bindings
+            .get_mut(index)
+            .ok_or(NetworkRenderError::MalformedUci)?;
+        if section.options.len() > MAX_PRESENT_OPTIONS {
+            return Err(NetworkRenderError::Capacity);
+        }
+        let mut present_options: Vec<_> = section.options.keys().cloned().collect();
+        present_options.sort_unstable();
+        binding.dhcp_host_bindings.push(OpenWrtDhcpHostBinding {
+            id: lease_id.to_owned(),
+            section: section.selector.clone(),
+            present_options,
+        });
     }
 
     validate_inventory_topology(&NetworkInventory {
@@ -449,6 +537,21 @@ fn decode_dhcp_server(section: &UciSection) -> Option<NetworkDhcpServerConfig> {
         ra_mode: dhcp_mode(section, "ra", NetworkDhcpMode::Server)?,
         ndp_mode: dhcp_mode(section, "ndp", NetworkDhcpMode::Hybrid)?,
         dhcp_options: parse_dhcp_options(section)?,
+        static_leases: Vec::new(),
+    })
+}
+
+fn decode_dhcp_static_lease(section: &UciSection, id: &str) -> Option<NetworkDhcpStaticLease> {
+    let mac = section.values("mac");
+    if mac.len() != 1 {
+        return None;
+    }
+    Some(NetworkDhcpStaticLease {
+        id: id.to_owned(),
+        mac: mac[0].clone(),
+        address: optional(section, "ip")?.parse().ok()?,
+        hostname: optional(section, "name").map(str::to_owned),
+        lease_time: optional(section, "leasetime").map(str::to_owned),
     })
 }
 
@@ -801,6 +904,16 @@ fn validate_bindings(
                 .present_options
                 .iter()
                 .all(|option| safe_uci_identifier(option))
+            || binding.dhcp_host_bindings.len() > 32
+            || !binding.dhcp_host_bindings.iter().all(|host| {
+                safe_id(&host.id)
+                    && valid_section(&host.section, "host")
+                    && host.present_options.len() <= MAX_PRESENT_OPTIONS
+                    && host
+                        .present_options
+                        .iter()
+                        .all(|option| safe_uci_identifier(option))
+            })
         {
             return Err(NetworkRenderError::UnsafeBinding);
         }
@@ -812,6 +925,12 @@ fn validate_bindings(
         }
         if !sections.insert(binding.section.as_str()) {
             return Err(NetworkRenderError::DuplicateSection);
+        }
+        let mut host_ids = HashSet::new();
+        for host in &binding.dhcp_host_bindings {
+            if !sections.insert(host.section.as_str()) || !host_ids.insert(host.id.as_str()) {
+                return Err(NetworkRenderError::DuplicateSection);
+            }
         }
     }
     Ok(indexed)
@@ -849,7 +968,8 @@ fn render_dhcp_create(
         return Err(NetworkRenderError::DuplicateSection);
     }
     writeln!(batch, "set dhcp.{section}=dhcp").map_err(|_| NetworkRenderError::Output)?;
-    render_dhcp_options(batch, &section, value, server, true)
+    render_dhcp_options(batch, &section, value, server, true)?;
+    render_dhcp_hosts_create(batch, reserved, value, server)
 }
 
 fn render_dhcp_update(
@@ -862,6 +982,10 @@ fn render_dhcp_update(
         return Ok(());
     };
     let Some(server) = &value.dhcp_server else {
+        for host in &binding.dhcp_host_bindings {
+            writeln!(batch, "delete dhcp.{}", host.section)
+                .map_err(|_| NetworkRenderError::Output)?;
+        }
         if binding.dhcp_section.is_some() && !binding.dhcp_agent_owned {
             return Err(NetworkRenderError::UnsupportedField(
                 "native OpenWrt DHCP server removal",
@@ -901,7 +1025,8 @@ fn render_dhcp_update(
         value,
         server,
         value.ownership == ObjectOwnership::AgentOwned,
-    )
+    )?;
+    render_dhcp_hosts_update(batch, reserved, binding, value, server)
 }
 
 fn render_dhcp_delete(
@@ -920,7 +1045,126 @@ fn render_dhcp_delete(
         }
         writeln!(batch, "delete dhcp.{section}").map_err(|_| NetworkRenderError::Output)?;
     }
+    for host in &binding.dhcp_host_bindings {
+        writeln!(batch, "delete dhcp.{}", host.section).map_err(|_| NetworkRenderError::Output)?;
+    }
     Ok(())
+}
+
+fn render_dhcp_hosts_create(
+    batch: &mut String,
+    reserved: &mut HashSet<String>,
+    interface: &NetworkInterfaceConfig,
+    server: &NetworkDhcpServerConfig,
+) -> Result<(), NetworkRenderError> {
+    for lease in &server.static_leases {
+        let section = host_section_name(&interface.id, &lease.id);
+        if !reserved.insert(section.clone()) {
+            return Err(NetworkRenderError::DuplicateSection);
+        }
+        render_dhcp_host(batch, &section, interface, lease, false)?;
+    }
+    Ok(())
+}
+
+fn render_dhcp_hosts_update(
+    batch: &mut String,
+    reserved: &mut HashSet<String>,
+    binding: &OpenWrtNetworkObjectBinding,
+    interface: &NetworkInterfaceConfig,
+    server: &NetworkDhcpServerConfig,
+) -> Result<(), NetworkRenderError> {
+    for host in &binding.dhcp_host_bindings {
+        let Some(lease) = server
+            .static_leases
+            .iter()
+            .find(|lease| lease.id == host.id)
+        else {
+            writeln!(batch, "delete dhcp.{}", host.section)
+                .map_err(|_| NetworkRenderError::Output)?;
+            continue;
+        };
+        for option in &host.present_options {
+            if supported_dhcp_host_options().contains(&option.as_str()) {
+                writeln!(batch, "delete dhcp.{}.{}", host.section, option)
+                    .map_err(|_| NetworkRenderError::Output)?;
+            }
+        }
+        render_dhcp_host(batch, &host.section, interface, lease, true)?;
+    }
+    for lease in &server.static_leases {
+        if binding
+            .dhcp_host_bindings
+            .iter()
+            .any(|host| host.id == lease.id)
+        {
+            continue;
+        }
+        let section = host_section_name(&interface.id, &lease.id);
+        if !reserved.insert(section.clone()) {
+            return Err(NetworkRenderError::DuplicateSection);
+        }
+        render_dhcp_host(batch, &section, interface, lease, false)?;
+    }
+    Ok(())
+}
+
+fn render_dhcp_host(
+    batch: &mut String,
+    section: &str,
+    interface: &NetworkInterfaceConfig,
+    lease: &agent_protocol::NetworkDhcpStaticLease,
+    existing: bool,
+) -> Result<(), NetworkRenderError> {
+    if !existing {
+        writeln!(batch, "set dhcp.{section}=host").map_err(|_| NetworkRenderError::Output)?;
+    }
+    writeln!(batch, "set dhcp.{section}.mbed_managed='1'")
+        .map_err(|_| NetworkRenderError::Output)?;
+    writeln!(
+        batch,
+        "set dhcp.{section}.mbed_id={}",
+        quote(&format!("{}/{}", interface.id, lease.id))?
+    )
+    .map_err(|_| NetworkRenderError::Output)?;
+    for (name, value) in [
+        ("mac", lease.mac.clone()),
+        ("ip", lease.address.to_string()),
+    ] {
+        writeln!(batch, "set dhcp.{section}.{name}={}", quote(&value)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
+    if let Some(hostname) = &lease.hostname {
+        writeln!(batch, "set dhcp.{section}.name={}", quote(hostname)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
+    if let Some(lease_time) = &lease.lease_time {
+        writeln!(batch, "set dhcp.{section}.leasetime={}", quote(lease_time)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
+    Ok(())
+}
+
+fn host_section_name(interface_id: &str, lease_id: &str) -> String {
+    let mut section = String::from("mbed_host_");
+    for value in [interface_id, lease_id] {
+        if section.len() > "mbed_host_".len() {
+            section.push('_');
+        }
+        section.extend(value.bytes().map(|byte| {
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+                byte as char
+            } else {
+                '_'
+            }
+        }));
+    }
+    section.truncate(120);
+    section
+}
+
+fn supported_dhcp_host_options() -> &'static [&'static str] {
+    &["mbed_managed", "mbed_id", "mac", "ip", "name", "leasetime"]
 }
 
 fn render_dhcp_options(
@@ -1651,7 +1895,9 @@ mod tests {
     use agent_core::{
         NetworkMutation, NetworkRiskContext, network_object_digest, plan_network_mutations,
     };
-    use agent_protocol::{NetworkBond, NetworkBondMode, NetworkDhcpServerConfig};
+    use agent_protocol::{
+        NetworkBond, NetworkBondMode, NetworkDhcpServerConfig, NetworkDhcpStaticLease,
+    };
     use std::net::Ipv4Addr;
 
     const NETWORK_FIXTURE: &str = "network.lan=interface\n\
@@ -1703,6 +1949,13 @@ dhcp.lan.dhcpv6='server'\n\
 dhcp.lan.ra='hybrid'\n\
 dhcp.lan.ndp='relay'\n\
 dhcp.lan.dhcp_option='6,192.168.1.1' '15,example.com'\n\
+dhcp.mbed_lan_host=host\n\
+dhcp.mbed_lan_host.mbed_managed='1'\n\
+dhcp.mbed_lan_host.mbed_id='lan/nas'\n\
+dhcp.mbed_lan_host.mac='11:22:33:44:55:66'\n\
+dhcp.mbed_lan_host.ip='192.168.1.20'\n\
+dhcp.mbed_lan_host.name='nas'\n\
+dhcp.mbed_lan_host.leasetime='infinite'\n\
 dhcp.lan.vendor_keep='yes'\n";
 
     fn guest_interface(ownership: ObjectOwnership) -> NetworkObject {
@@ -1742,6 +1995,13 @@ dhcp.lan.vendor_keep='yes'\n";
                 dhcp_options: vec![NetworkDhcpOption {
                     code: 6,
                     value: "192.0.2.53".into(),
+                }],
+                static_leases: vec![NetworkDhcpStaticLease {
+                    id: "nas".into(),
+                    mac: "11:22:33:44:55:66".into(),
+                    address: "192.0.2.20".parse().expect("lease address"),
+                    hostname: Some("nas".into()),
+                    lease_time: Some("infinite".into()),
                 }],
             }),
         })
@@ -1834,7 +2094,7 @@ dhcp.lan.vendor_keep='yes'\n";
     fn reconstructs_and_binds_openwrt_dhcp_server_subset() {
         let snapshot = inspect_openwrt_network_inventory_with_dhcp(NETWORK_FIXTURE, DHCP_FIXTURE)
             .expect("inventory");
-        assert_eq!(snapshot.dhcp_occupied_sections(), ["lan"]);
+        assert_eq!(snapshot.dhcp_occupied_sections(), ["lan", "mbed_lan_host"]);
         assert!(snapshot.dhcp_read_only_sections().is_empty());
         let interface = snapshot
             .inventory()
@@ -1866,6 +2126,13 @@ dhcp.lan.vendor_keep='yes'\n";
                         value: "example.com".into(),
                     },
                 ],
+                static_leases: vec![NetworkDhcpStaticLease {
+                    id: "nas".into(),
+                    mac: "11:22:33:44:55:66".into(),
+                    address: "192.168.1.20".parse().expect("lease address"),
+                    hostname: Some("nas".into()),
+                    lease_time: Some("infinite".into()),
+                }],
             })
         );
         let binding = snapshot
@@ -1881,6 +2148,9 @@ dhcp.lan.vendor_keep='yes'\n";
                 .iter()
                 .any(|option| option == "vendor_keep")
         );
+        assert_eq!(binding.dhcp_host_bindings.len(), 1);
+        assert_eq!(binding.dhcp_host_bindings[0].id, "nas");
+        assert_eq!(binding.dhcp_host_bindings[0].section, "mbed_lan_host");
     }
 
     #[test]
@@ -1939,6 +2209,91 @@ dhcp.mbed_lan.dhcp_option='6,1.1.1.1,8.8.8.8'\n";
                 "mbed_lan".into()
             ))
         );
+    }
+
+    #[test]
+    fn keeps_native_static_hosts_read_only() {
+        let dhcp = "dhcp.lan=dhcp\n\
+dhcp.lan.interface='lan'\n\
+dhcp.lan.start='100'\n\
+dhcp.lan.limit='100'\n\
+dhcp.nas=host\n\
+dhcp.nas.mac='11:22:33:44:55:66'\n\
+dhcp.nas.ip='192.168.1.20'\n";
+        let snapshot = inspect_openwrt_network_inventory_with_dhcp(NETWORK_FIXTURE, dhcp)
+            .expect("native host is read-only");
+        assert_eq!(snapshot.dhcp_read_only_sections(), ["nas"]);
+        let interface = snapshot
+            .inventory()
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                NetworkObject::Interface(value) if value.id == "lan" => Some(value),
+                _ => None,
+            })
+            .expect("lan interface");
+        assert!(
+            interface
+                .dhcp_server
+                .as_ref()
+                .unwrap()
+                .static_leases
+                .is_empty()
+        );
+        assert!(
+            snapshot
+                .bindings()
+                .iter()
+                .find(|binding| binding.id == "lan")
+                .unwrap()
+                .dhcp_host_bindings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn updates_agent_owned_static_lease_without_touching_native_options() {
+        let snapshot = inspect_openwrt_network_inventory_with_dhcp(NETWORK_FIXTURE, DHCP_FIXTURE)
+            .expect("inventory");
+        let before = snapshot
+            .inventory()
+            .objects
+            .iter()
+            .find(|object| object.kind() == "interface" && object.id() == "lan")
+            .expect("lan interface")
+            .clone();
+        let digest = network_object_digest(&before).expect("digest");
+        let mut desired = before;
+        let NetworkObject::Interface(interface) = &mut desired else {
+            unreachable!();
+        };
+        interface
+            .dhcp_server
+            .as_mut()
+            .expect("DHCP server")
+            .static_leases[0]
+            .hostname = Some("nas-updated".into());
+        let plan = plan_network_mutations(
+            snapshot.inventory(),
+            &[NetworkMutation::Update {
+                expected_digest: digest,
+                desired,
+            }],
+            &NetworkRiskContext::default(),
+        )
+        .expect("plan");
+        let stage = render_openwrt_network_stage_from_snapshot(&plan, &snapshot).expect("stage");
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("delete dhcp.mbed_lan_host.name")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("set dhcp.mbed_lan_host.name='nas-updated'")
+        );
+        assert!(!stage.dhcp_uci_batch.contains("vendor_keep"));
     }
 
     #[test]
@@ -2036,6 +2391,21 @@ dhcp.mbed_lan.dhcp_option='6,1.1.1.1,8.8.8.8'\n";
             stage
                 .dhcp_uci_batch
                 .contains("add_list dhcp.guest.dhcp_option='6,192.0.2.53'")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("set dhcp.mbed_host_guest_nas=host")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("dhcp.mbed_host_guest_nas.mbed_id='guest/nas'")
+        );
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("dhcp.mbed_host_guest_nas.ip='192.0.2.20'")
         );
         assert!(stage.dhcp_uci_batch.ends_with("commit dhcp\n"));
         assert!(stage.uci_batch.ends_with("commit network\n"));

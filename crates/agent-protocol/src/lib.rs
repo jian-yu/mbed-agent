@@ -684,6 +684,7 @@ pub struct FirewallLog {
 /// advertise which variants and fields they can safely persist or apply at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "spec", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum NetworkObject {
     Interface(NetworkInterfaceConfig),
     Bridge(NetworkBridge),
@@ -803,6 +804,9 @@ pub struct NetworkDhcpServerConfig {
     /// Bounded DHCP option code/value pairs emitted as `OpenWrt` `dhcp_option` list values.
     #[serde(default)]
     pub dhcp_options: Vec<NetworkDhcpOption>,
+    /// Agent-owned IPv4 static leases represented by bounded `OpenWrt` `host` sections.
+    #[serde(default)]
+    pub static_leases: Vec<NetworkDhcpStaticLease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -811,6 +815,22 @@ pub struct NetworkDhcpOption {
     pub code: u16,
     /// One bounded value for the option; the platform adapter encodes the UCI comma form.
     pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkDhcpStaticLease {
+    /// Stable typed identifier used in the Agent ownership marker.
+    pub id: String,
+    /// Exact lowercase colon-separated client MAC address.
+    pub mac: String,
+    /// IPv4 address reserved for the client.
+    pub address: IpAddr,
+    /// Optional hostname advertised by the static host entry.
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Optional host-specific lease duration such as `infinite` or `7d`.
+    #[serde(default)]
+    pub lease_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1936,6 +1956,7 @@ mod tests {
         assert_eq!(server.ra_mode, NetworkDhcpMode::Server);
         assert_eq!(server.ndp_mode, NetworkDhcpMode::Hybrid);
         assert!(server.dhcp_options.is_empty());
+        assert!(server.static_leases.is_empty());
     }
 
     #[test]

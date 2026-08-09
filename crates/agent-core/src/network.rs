@@ -625,16 +625,7 @@ fn validate_dhcp_server(
     {
         return Err(NetworkPlanError::InvalidField("interface DHCP pool"));
     }
-    let lease_valid = if value.lease_time == "infinite" {
-        true
-    } else {
-        let bytes = value.lease_time.as_bytes();
-        bytes.len() >= 2
-            && bytes.len() <= 16
-            && matches!(bytes.last(), Some(b's' | b'm' | b'h' | b'd' | b'w'))
-            && bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
-    };
-    if !lease_valid {
+    if !valid_dhcp_lease_time(&value.lease_time) {
         return Err(NetworkPlanError::InvalidField("interface DHCP lease time"));
     }
     if value.dhcp_options.len() > 16 {
@@ -649,6 +640,70 @@ fn validate_dhcp_server(
             return Err(NetworkPlanError::InvalidField("interface DHCP option"));
         }
     }
+    if value.static_leases.len() > 32 {
+        return Err(NetworkPlanError::Capacity);
+    }
+    let interface_addresses: Vec<_> = interface
+        .addresses
+        .iter()
+        .filter_map(|address| match address.address {
+            IpAddr::V4(value) => Some((address, value)),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    let mut lease_ids = HashSet::new();
+    let mut lease_macs = HashSet::new();
+    let mut lease_addresses = HashSet::new();
+    for lease in &value.static_leases {
+        validate_identifier(&lease.id, "DHCP static lease id")?;
+        validate_mac(&lease.mac)?;
+        let IpAddr::V4(address) = lease.address else {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease address"));
+        };
+        let matching_networks: Vec<_> = interface_addresses
+            .iter()
+            .filter(|(network, _)| ipv4_in_network(network, address))
+            .collect();
+        if matching_networks.len() != 1 {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease address"));
+        }
+        let (network, _) = matching_networks[0];
+        let offset = ipv4_host_offset(network, address);
+        let host_count = (!ipv4_mask(network.prefix_len)).saturating_sub(1);
+        if offset == 0 || (network.prefix_len < 31 && offset == host_count) {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease address"));
+        }
+        if u32::from(value.start) <= offset
+            && offset < u32::from(value.start).saturating_add(u32::from(value.limit))
+        {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease pool"));
+        }
+        if !lease_ids.insert(&lease.id)
+            || !lease_macs.insert(&lease.mac)
+            || !lease_addresses.insert(address)
+            || interface_addresses
+                .iter()
+                .any(|(_, current)| *current == address)
+        {
+            return Err(NetworkPlanError::InvalidField(
+                "DHCP static lease duplicate",
+            ));
+        }
+        if lease
+            .hostname
+            .as_deref()
+            .is_some_and(|hostname| !valid_dhcp_text(hostname))
+        {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease hostname"));
+        }
+        if lease
+            .lease_time
+            .as_deref()
+            .is_some_and(|lease_time| !valid_dhcp_lease_time(lease_time))
+        {
+            return Err(NetworkPlanError::InvalidField("DHCP static lease time"));
+        }
+    }
     Ok(())
 }
 
@@ -658,6 +713,42 @@ fn valid_dhcp_option_value(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| !byte.is_ascii_control() && !matches!(byte, b'\'' | b'\\' | b','))
+}
+
+fn valid_dhcp_lease_time(value: &str) -> bool {
+    if value == "infinite" {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    bytes.len() >= 2
+        && bytes.len() <= 16
+        && matches!(bytes.last(), Some(b's' | b'm' | b'h' | b'd' | b'w'))
+        && bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+}
+
+fn ipv4_mask(prefix_len: u8) -> u32 {
+    if prefix_len == 0 {
+        0
+    } else if prefix_len <= 32 {
+        u32::MAX << (32 - prefix_len)
+    } else {
+        0
+    }
+}
+
+fn ipv4_in_network(network: &IpNetwork, address: std::net::Ipv4Addr) -> bool {
+    let IpAddr::V4(network_address) = network.address else {
+        return false;
+    };
+    let mask = ipv4_mask(network.prefix_len);
+    (u32::from(network_address) & mask) == (u32::from(address) & mask)
+}
+
+fn ipv4_host_offset(network: &IpNetwork, address: std::net::Ipv4Addr) -> u32 {
+    let IpAddr::V4(network_address) = network.address else {
+        return u32::MAX;
+    };
+    u32::from(address).saturating_sub(u32::from(network_address) & ipv4_mask(network.prefix_len))
 }
 
 fn validate_bridge(value: &NetworkBridge) -> Result<(), NetworkPlanError> {
@@ -1125,8 +1216,8 @@ pub enum NetworkPlanError {
 mod tests {
     use super::*;
     use agent_protocol::{
-        CHANGE_PLAN_SCHEMA_VERSION, NetworkDhcpMode, NetworkDhcpOption, NetworkPolicyAction,
-        NetworkVlanProtocol,
+        CHANGE_PLAN_SCHEMA_VERSION, NetworkDhcpMode, NetworkDhcpOption, NetworkDhcpStaticLease,
+        NetworkPolicyAction, NetworkVlanProtocol,
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1351,6 +1442,7 @@ mod tests {
                 ra_mode: NetworkDhcpMode::Server,
                 ndp_mode: NetworkDhcpMode::Hybrid,
                 dhcp_options: vec![],
+                static_leases: vec![],
             });
         } else {
             unreachable!();
@@ -1372,6 +1464,7 @@ mod tests {
                 ra_mode: NetworkDhcpMode::Server,
                 ndp_mode: NetworkDhcpMode::Hybrid,
                 dhcp_options: vec![],
+                static_leases: vec![],
             });
         } else {
             unreachable!();
@@ -1399,6 +1492,7 @@ mod tests {
                     code: 6,
                     value: "1.1.1.1,8.8.8.8".into(),
                 }],
+                static_leases: vec![],
             });
         } else {
             unreachable!();
@@ -1429,6 +1523,7 @@ mod tests {
                         value: "1.1.1.1".into(),
                     },
                 ],
+                static_leases: vec![],
             });
         } else {
             unreachable!();
@@ -1437,6 +1532,34 @@ mod tests {
             validate_network_object(&invalid),
             Err(NetworkPlanError::InvalidField("interface DHCP option"))
         );
+    }
+
+    #[test]
+    fn accepts_dhcp_static_lease_outside_dynamic_pool() {
+        let mut object = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut object {
+            value.dhcp_server = Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Server,
+                ndp_mode: NetworkDhcpMode::Hybrid,
+                dhcp_options: vec![],
+                static_leases: vec![NetworkDhcpStaticLease {
+                    id: "nas".into(),
+                    mac: "11:22:33:44:55:66".into(),
+                    address: "192.168.1.20".parse().expect("lease address"),
+                    hostname: Some("nas".into()),
+                    lease_time: Some("infinite".into()),
+                }],
+            });
+        } else {
+            unreachable!();
+        }
+        assert!(validate_network_object(&object).is_ok());
     }
 
     #[test]

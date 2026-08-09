@@ -119,7 +119,8 @@ an OpenWrt DHCPv4 server pool subset (`start`, `limit`, `leasetime`, `force`).
 The same typed OpenWrt DHCP section supports bounded DHCPv6, Router
 Advertisement, and Neighbor Discovery Proxy modes (`disabled`, `server`,
 `relay`, `hybrid`) with backwards-compatible defaults, plus typed DHCP option
-code/value pairs rendered as bounded `dhcp_option` list entries.
+code/value pairs rendered as bounded `dhcp_option` list entries and Agent-owned
+IPv4 static leases rendered as marked `host` sections.
 Generic Linux
 with iproute2 has fresh interface/route/policy-rule inventory and confirmed
 writes for enabled Agent-owned volatile routes and reserved-priority policy
@@ -198,6 +199,9 @@ recorded in
 [ADR 0063](docs/adr/0063-openwrt-dhcpv6-ra-ndp-modes.md).
 Typed DHCP option code/value rendering and fail-closed parsing are recorded in
 [ADR 0064](docs/adr/0064-openwrt-dhcp-options.md).
+Agent-owned OpenWrt IPv4 static lease bindings and native-host read-only
+handling are recorded in
+[ADR 0065](docs/adr/0065-openwrt-dhcp-static-leases.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in
