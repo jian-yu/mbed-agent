@@ -229,6 +229,11 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
         tokio::time::interval(Duration::from_secs(state.budget.cleanup_interval_secs()));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     cleanup_interval.tick().await;
+    let mut wal_checkpoint_interval = tokio::time::interval(Duration::from_secs(
+        state.config.storage.wal_checkpoint_interval_secs,
+    ));
+    wal_checkpoint_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    wal_checkpoint_interval.tick().await;
     info!(
         socket = %state.config.server.socket_path.display(),
         platform = state.platform.kind.as_str(),
@@ -257,6 +262,9 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn Error>> {
             }
             _ = cleanup_interval.tick() => {
                 run_artifact_cleanup(&state).await;
+            }
+            _ = wal_checkpoint_interval.tick() => {
+                run_wal_checkpoint(&state).await;
             }
         }
     }
@@ -556,6 +564,41 @@ async fn run_artifact_cleanup(state: &AppState) {
     }
 }
 
+async fn run_wal_checkpoint(state: &AppState) {
+    let wal_bytes = state.store.wal_bytes();
+    let database_bytes = state.store.database_bytes();
+    let soft_limit = state
+        .config
+        .storage
+        .max_database_bytes
+        .saturating_mul(u64::from(state.config.storage.database_soft_limit_percent))
+        / 100;
+    if wal_bytes == 0 && database_bytes < soft_limit {
+        return;
+    }
+    let truncate = wal_bytes >= state.config.storage.wal_max_bytes;
+    let cleanup_batch = state.config.storage.cleanup_batch_records;
+    let store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || {
+        let removed = if database_bytes >= soft_limit {
+            store.prune_history(cleanup_batch)?
+        } else {
+            0
+        };
+        store.checkpoint(truncate)?;
+        Ok::<u64, agent_store::StoreError>(removed)
+    })
+    .await
+    {
+        Ok(Ok(removed)) => info!(
+            wal_bytes,
+            database_bytes, truncate, removed, "SQLite WAL maintenance completed"
+        ),
+        Ok(Err(error)) => warn!(%error, wal_bytes, truncate, "SQLite WAL checkpoint failed"),
+        Err(error) => warn!(%error, wal_bytes, "SQLite WAL checkpoint worker failed"),
+    }
+}
+
 fn init_logging(config: &AgentConfig) -> io::Result<logging::BoundedMakeWriter> {
     let mut filter = config.logging.level.clone();
     if !config.logging.directives.is_empty() {
@@ -645,7 +688,10 @@ async fn handle_request(request: ClientRequest, state: &AppState) -> ServerRespo
         Command::Ping => ResponseData::Pong {
             daemon_version: AGENT_VERSION.into(),
         },
-        Command::Capabilities => match serde_json::to_value(&state.platform) {
+        Command::Capabilities => match serde_json::to_value(serde_json::json!({
+            "platform": &state.platform,
+            "configuration": state.platform.configuration_capabilities(),
+        })) {
             Ok(value) => ResponseData::Capabilities(value),
             Err(error) => {
                 return ServerResponse::error(
@@ -3401,6 +3447,11 @@ fn store_error_response(id: String, error: &StoreError) -> ServerResponse {
 
 fn status_response(state: &AppState) -> ResponseData {
     let database_bytes = state.store.database_bytes();
+    let wal_bytes = state.store.wal_bytes();
+    let database_limit_bytes = state.store.max_database_bytes();
+    let database_soft_limit_bytes = database_limit_bytes
+        .saturating_mul(u64::from(state.config.storage.database_soft_limit_percent))
+        / 100;
     let managed_bytes = state.budget.managed_bytes().unwrap_or(database_bytes);
     let available = state.budget.available_bytes().unwrap_or(0);
     let pressure = state
@@ -3424,7 +3475,9 @@ fn status_response(state: &AppState) -> ResponseData {
         profile: state.config.profile.as_str().into(),
         storage: StorageStatus {
             database_bytes,
-            database_limit_bytes: state.store.max_database_bytes(),
+            wal_bytes,
+            database_limit_bytes,
+            database_soft_limit_bytes,
             managed_bytes,
             total_budget_bytes: state.budget.total_limit_bytes(),
             tmp_available_bytes: available,

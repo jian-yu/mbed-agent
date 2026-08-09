@@ -1747,7 +1747,9 @@ pub struct StatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageStatus {
     pub database_bytes: u64,
+    pub wal_bytes: u64,
     pub database_limit_bytes: u64,
+    pub database_soft_limit_bytes: u64,
     pub managed_bytes: u64,
     pub total_budget_bytes: u64,
     pub tmp_available_bytes: u64,

@@ -148,6 +148,11 @@ approval, validation, bounded snapshot, verification, and confirmed rollback.
 Unknown or unmanaged objects remain read-only; no LLM-controlled raw shell,
 iptables, nft, UCI, or file-edit path is planned.
 This scope and its safety boundary are recorded in
+`docs/implementation-status.zh-CN.md`, `docs/compatibility.zh-CN.md`, and
+`docs/operations.zh-CN.md`. The runtime `capabilities` command returns the
+same platform-derived configuration matrix used by the write dispatcher, so
+unsupported domains are reported explicitly instead of being implied by the
+protocol enum.
 [ADR 0018](docs/adr/0018-maximal-safe-configurability.md).
 The implemented ChangeSet domain boundary is recorded in
 [ADR 0020](docs/adr/0020-changeset-domain-foundation.md).

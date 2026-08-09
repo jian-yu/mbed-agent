@@ -70,6 +70,125 @@ impl PlatformCapabilities {
     pub fn discover() -> Self {
         Discovery::new("/").discover()
     }
+
+    /// Returns the public configuration capability matrix used by the daemon
+    /// and CLI.  The matrix intentionally describes the executable surface,
+    /// rather than the protocol enum alone, so unsupported domains cannot be
+    /// advertised as writable by accident.
+    #[must_use]
+    pub fn configuration_capabilities(&self) -> Vec<ConfigurationCapability> {
+        let firewall_writable =
+            self.release_supported && !matches!(self.firewall.backend, FirewallBackend::Unknown);
+        let network_mode = match self.kind {
+            PlatformKind::OpenWrt if self.release_supported && self.has_uci => {
+                CapabilityMode::WritableConfirmed
+            }
+            PlatformKind::GenericLinux
+                if self
+                    .available_commands
+                    .iter()
+                    .any(|command| command == "ip") =>
+            {
+                CapabilityMode::WritableRuntime
+            }
+            _ => CapabilityMode::ReadOnly,
+        };
+        vec![
+            ConfigurationCapability::new(
+                "firewall",
+                if firewall_writable {
+                    CapabilityMode::WritableConfirmed
+                } else {
+                    CapabilityMode::ReadOnly
+                },
+                &["inspect", "plan", "apply", "verify", "confirm", "rollback"],
+                "fw3/fw4 or Agent-owned nftables/iptables subset",
+            ),
+            ConfigurationCapability::new(
+                "network",
+                network_mode,
+                &["inspect", "plan", "apply", "verify", "confirm", "rollback"],
+                if self.kind == PlatformKind::GenericLinux {
+                    "Agent-owned runtime address, route and policy-rule subset"
+                } else {
+                    "OpenWrt interface/bridge/VLAN/route/policy/DNS/DHCP subset"
+                },
+            ),
+            ConfigurationCapability::new(
+                "dns",
+                CapabilityMode::ReadOnly,
+                &["inspect"],
+                "diagnostic inventory; no standalone DNS planner",
+            ),
+            ConfigurationCapability::new(
+                "dhcp",
+                CapabilityMode::ReadOnly,
+                &["inspect"],
+                "diagnostic inventory; writable fields are nested in supported network objects",
+            ),
+            ConfigurationCapability::new(
+                "wireless",
+                CapabilityMode::ReadOnly,
+                &["inspect"],
+                "passive radio/interface diagnostics only",
+            ),
+            ConfigurationCapability::new(
+                "service",
+                CapabilityMode::Unsupported,
+                &[],
+                "no typed service planner",
+            ),
+            ConfigurationCapability::new(
+                "qos",
+                CapabilityMode::ReadOnly,
+                &["inspect"],
+                "qdisc diagnostics only",
+            ),
+            ConfigurationCapability::new(
+                "wireguard",
+                CapabilityMode::Unsupported,
+                &[],
+                "no typed WireGuard planner",
+            ),
+            ConfigurationCapability::new(
+                "system_network",
+                CapabilityMode::Unsupported,
+                &[],
+                "no persistent system-network backend",
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMode {
+    Unsupported,
+    ReadOnly,
+    WritableRuntime,
+    WritableConfirmed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigurationCapability {
+    pub domain: String,
+    pub mode: CapabilityMode,
+    pub operations: Vec<String>,
+    pub scope: String,
+}
+
+impl ConfigurationCapability {
+    fn new(domain: &str, mode: CapabilityMode, operations: &[&str], scope: &str) -> Self {
+        Self {
+            domain: domain.into(),
+            mode,
+            operations: operations
+                .iter()
+                .map(|operation| (*operation).into())
+                .collect(),
+            scope: scope.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -469,6 +588,31 @@ mod tests {
         busybox_fixture.write("bin/busybox", "");
         let busybox = Discovery::new(&busybox_fixture.root).discover();
         assert_eq!(busybox.init_system, InitSystem::BusyBox);
+    }
+
+    #[test]
+    fn configuration_matrix_reports_real_write_scope() {
+        let fixture = Fixture::new();
+        fixture.write("etc/os-release", "ID=buildroot\n");
+        fixture.write("usr/sbin/nft", "");
+        fixture.write("usr/sbin/ip", "");
+        let capabilities = Discovery::new(&fixture.root).discover();
+        let matrix = capabilities.configuration_capabilities();
+        let firewall = matrix.iter().find(|entry| entry.domain == "firewall");
+        assert_eq!(
+            firewall.map(|entry| entry.mode),
+            Some(CapabilityMode::WritableConfirmed)
+        );
+        let network = matrix.iter().find(|entry| entry.domain == "network");
+        assert_eq!(
+            network.map(|entry| entry.mode),
+            Some(CapabilityMode::WritableRuntime)
+        );
+        let wireguard = matrix.iter().find(|entry| entry.domain == "wireguard");
+        assert_eq!(
+            wireguard.map(|entry| entry.mode),
+            Some(CapabilityMode::Unsupported)
+        );
     }
 
     struct Fixture {

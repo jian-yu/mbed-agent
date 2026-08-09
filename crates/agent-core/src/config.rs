@@ -136,6 +136,7 @@ impl AgentConfig {
                 "storage.cleanup_interval_secs must be greater than zero".into(),
             ));
         }
+        validate_storage_maintenance(&self.storage)?;
 
         if !LOG_LEVELS.contains(&self.logging.level.as_str()) {
             return Err(ConfigError::Validation(format!(
@@ -644,6 +645,20 @@ fn storage_record_limits_valid(storage: &StorageConfig) -> bool {
             <= storage.max_database_bytes / 2
 }
 
+fn validate_storage_maintenance(storage: &StorageConfig) -> Result<(), ConfigError> {
+    if storage.wal_checkpoint_interval_secs == 0
+        || storage.wal_max_bytes == 0
+        || storage.wal_max_bytes > storage.max_database_bytes
+        || !(1..=100).contains(&storage.database_soft_limit_percent)
+        || storage.cleanup_batch_records == 0
+    {
+        return Err(ConfigError::Validation(
+            "storage WAL checkpoint and cleanup limits are inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretString(String);
@@ -922,6 +937,10 @@ pub struct StorageConfig {
     pub min_tmp_free_bytes: u64,
     pub min_tmp_free_percent: u8,
     pub cleanup_interval_secs: u64,
+    pub wal_checkpoint_interval_secs: u64,
+    pub wal_max_bytes: u64,
+    pub database_soft_limit_percent: u8,
+    pub cleanup_batch_records: u32,
     pub max_task_records: u32,
     pub max_diagnostic_records: u32,
     pub max_diagnostic_record_bytes: u64,
@@ -947,6 +966,10 @@ impl Default for StorageConfig {
             min_tmp_free_bytes: 8 * 1024 * 1024,
             min_tmp_free_percent: 10,
             cleanup_interval_secs: 60,
+            wal_checkpoint_interval_secs: 30,
+            wal_max_bytes: 1024 * 1024,
+            database_soft_limit_percent: 80,
+            cleanup_batch_records: 32,
             max_task_records: 256,
             max_diagnostic_records: 128,
             max_diagnostic_record_bytes: 32 * 1024,
@@ -1249,6 +1272,25 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.storage.max_firewall_execution_plan_bytes = config.storage.max_database_bytes + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn sqlite_maintenance_limits_are_bounded() {
+        let mut config = AgentConfig::default();
+        config.storage.wal_checkpoint_interval_secs = 0;
+        assert!(config.validate().is_err());
+
+        config = AgentConfig::default();
+        config.storage.wal_max_bytes = config.storage.max_database_bytes + 1;
+        assert!(config.validate().is_err());
+
+        config = AgentConfig::default();
+        config.storage.database_soft_limit_percent = 0;
+        assert!(config.validate().is_err());
+
+        config = AgentConfig::default();
+        config.storage.cleanup_batch_records = 0;
         assert!(config.validate().is_err());
     }
 

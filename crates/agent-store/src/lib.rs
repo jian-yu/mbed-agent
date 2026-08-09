@@ -1244,15 +1244,71 @@ impl Store {
     }
 
     pub fn database_bytes(&self) -> u64 {
-        file_len(&self.path)
-            .saturating_add(file_len(&PathBuf::from(format!(
-                "{}-wal",
-                self.path.display()
-            ))))
-            .saturating_add(file_len(&PathBuf::from(format!(
-                "{}-shm",
-                self.path.display()
-            ))))
+        file_len(&self.path).saturating_add(self.wal_bytes())
+    }
+
+    /// Returns the current `SQLite` WAL and SHM footprint.
+    #[must_use]
+    pub fn wal_bytes(&self) -> u64 {
+        file_len(&PathBuf::from(format!("{}-wal", self.path.display()))).saturating_add(file_len(
+            &PathBuf::from(format!("{}-shm", self.path.display())),
+        ))
+    }
+
+    /// Performs a bounded checkpoint without exposing raw SQL to callers.
+    ///
+    /// `TRUNCATE` is used only after the caller has observed the configured
+    /// WAL waterline; normal maintenance should use a passive checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection is poisoned or `SQLite` cannot
+    /// execute the checkpoint.
+    pub fn checkpoint(&self, truncate: bool) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let mode = if truncate { "TRUNCATE" } else { "PASSIVE" };
+        let mut statement = connection
+            .prepare(&format!("PRAGMA wal_checkpoint({mode})"))
+            .map_err(StoreError::Sqlite)?;
+        let mut rows = statement.query([]).map_err(StoreError::Sqlite)?;
+        if let Some(row) = rows.next().map_err(StoreError::Sqlite)? {
+            let busy: i64 = row.get(0).map_err(StoreError::Sqlite)?;
+            if busy != 0 {
+                return Err(StoreError::CheckpointBusy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a bounded batch of regenerable historical rows. Active
+    /// `ChangeSets` and approvals are deliberately not touched here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection is poisoned or `SQLite` cannot
+    /// complete the cleanup transaction.
+    pub fn prune_history(&self, batch_records: u32) -> Result<u64, StoreError> {
+        if batch_records == 0 {
+            return Ok(0);
+        }
+        let connection = self.connection()?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(StoreError::Sqlite)?;
+        let batch = i64::from(batch_records);
+        let mut removed = 0_u64;
+        for statement in [
+            "DELETE FROM diagnostic_runs WHERE id IN (SELECT id FROM diagnostic_runs ORDER BY created_at ASC LIMIT ?1)",
+            "DELETE FROM task_runs WHERE id IN (SELECT id FROM task_runs ORDER BY created_at ASC LIMIT ?1)",
+            "DELETE FROM channel_messages WHERE rowid IN (SELECT rowid FROM channel_messages WHERE expires_unix_ms < unixepoch() * 1000 ORDER BY created_at ASC LIMIT ?1)",
+        ] {
+            let count = transaction
+                .execute(statement, [batch])
+                .map_err(StoreError::Sqlite)?;
+            removed = removed.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(removed)
     }
 
     #[must_use]
@@ -1591,6 +1647,8 @@ pub enum StoreError {
     Integrity(String),
     #[error("SQLite connection lock is poisoned")]
     Poisoned,
+    #[error("SQLite WAL checkpoint is busy")]
+    CheckpointBusy,
     #[error("bounded payload is {actual} bytes, exceeding limit {limit}")]
     PayloadTooLarge { actual: usize, limit: usize },
     #[error("bounded field {field} is {actual} bytes, exceeding limit {limit}")]
@@ -1638,6 +1696,8 @@ mod tests {
         store.health_check().expect("healthy store");
         assert_eq!(store.max_database_bytes(), 1024 * 1024);
         assert!(store.database_bytes() > 0);
+        store.checkpoint(false).expect("passive checkpoint");
+        store.checkpoint(true).expect("truncate checkpoint");
         drop(store);
         fs::remove_dir_all(root).expect("remove store test directory");
     }
