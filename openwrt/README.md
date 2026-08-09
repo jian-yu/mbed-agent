@@ -35,6 +35,9 @@ sh scripts/build-openwrt-sdk-package.sh \
 脚本只接受 `targets.tsv` 中存在的 release/target/subtarget 组合；构建缓存固定在
 `/tmp/mbed-agent-openwrt-sdk-build`，完成后默认删除。设置
 `MBED_AGENT_KEEP_SDK=1` 可保留该明确目录用于排障。
+脚本还会校验输入是匹配矩阵架构的 ELF；在 CI/cache 中可设置
+`MBED_AGENT_SDK_ARCHIVE=/path/to/openwrt-sdk.tar.xz` 复用已下载的官方 SDK，仍会
+使用 release 目录的 `sha256sums` 做校验。
 
 ## Release artifacts
 

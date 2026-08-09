@@ -19,6 +19,7 @@ command -v curl >/dev/null 2>&1
 command -v sha256sum >/dev/null 2>&1
 command -v tar >/dev/null 2>&1
 command -v ar >/dev/null 2>&1
+command -v file >/dev/null 2>&1
 command -v make >/dev/null 2>&1
 
 row=$(awk -F '\t' -v release="$release" -v target="$target" -v subtarget="$subtarget" \
@@ -28,7 +29,31 @@ row=$(awk -F '\t' -v release="$release" -v target="$target" -v subtarget="$subta
     exit 1
 }
 rust_target=$(printf '%s\n' "$row" | awk -F '\t' '{print $5}')
+arch=$(printf '%s\n' "$row" | awk -F '\t' '{print $4}')
 firewall=$(printf '%s\n' "$row" | awk -F '\t' '{print $6}')
+
+test -x "$binary" || {
+    echo "binary is not executable: $binary" >&2
+    exit 1
+}
+binary_description=$(file -b "$binary")
+case "$arch" in
+    x86_64) expected_arch='x86-64' ;;
+    armv7) expected_arch='ARM' ;;
+    aarch64) expected_arch='ARM aarch64' ;;
+    mipsel) expected_arch='MIPS' ;;
+    *)
+        echo "unsupported matrix architecture for binary validation: $arch" >&2
+        exit 1
+        ;;
+esac
+case "$binary_description" in
+    ELF*"$expected_arch"*) ;;
+    *)
+        echo "binary architecture mismatch: expected ELF $expected_arch, got $binary_description" >&2
+        exit 1
+        ;;
+esac
 
 work_root=/tmp/mbed-agent-openwrt-sdk-build
 build_root=$work_root/$release/$target/$subtarget
@@ -59,7 +84,12 @@ expected=$(awk -v name="$sdk_name" '$2 == "*" name { print $1; found++ } END { i
     exit 1
 }
 archive=$build_root/$sdk_name
-download "$base_url/$sdk_name" "$archive"
+if [ -n "${MBED_AGENT_SDK_ARCHIVE:-}" ]; then
+    test -f "$MBED_AGENT_SDK_ARCHIVE"
+    cp "$MBED_AGENT_SDK_ARCHIVE" "$archive"
+else
+    download "$base_url/$sdk_name" "$archive"
+fi
 printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -
 
 tar -xJf "$archive" -C "$build_root"
