@@ -467,8 +467,8 @@ mod tests {
         NetworkRiskContext, plan_network_mutations,
     };
     use agent_protocol::{
-        CHANGE_PLAN_SCHEMA_VERSION, ChangePlan, IpNetwork, NetworkObject, NetworkRoute,
-        NetworkRouteType, ObjectOwnership,
+        CHANGE_PLAN_SCHEMA_VERSION, ChangePlan, IpNetwork, NetworkAddressMode,
+        NetworkInterfaceConfig, NetworkObject, NetworkRoute, NetworkRouteType, ObjectOwnership,
     };
 
     use super::*;
@@ -495,6 +495,47 @@ mod tests {
                 } => {
                     let batch = fs::read_to_string(batch_file).map_err(FirewallCommandError::Io)?;
                     if !batch.contains("route add default") || !batch.contains("proto 186") {
+                        return Err(FirewallCommandError::Unsuccessful);
+                    }
+                    self.applied.set(true);
+                    Vec::new()
+                }
+                _ => return Err(FirewallCommandError::UnexpectedInput),
+            };
+            Ok(FirewallCommandOutput {
+                stdout,
+                stderr: vec![],
+                truncated: false,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct MockAddress {
+        applied: Cell<bool>,
+    }
+
+    impl FirewallCommandExecutor for MockAddress {
+        fn execute(
+            &self,
+            operation: &FirewallCommand,
+            _stdin: Option<&[u8]>,
+        ) -> Result<FirewallCommandOutput, FirewallCommandError> {
+            let stdout = match operation {
+                FirewallCommand::IpJsonLink => br#"[{"ifname":"eth0","flags":["UP"]}]"#.to_vec(),
+                FirewallCommand::IpJsonAddress if self.applied.get() => {
+                    br#"[{"ifname":"eth0","addr_info":[{"local":"192.0.2.10","prefixlen":24}]}]"#
+                        .to_vec()
+                }
+                FirewallCommand::IpJsonAddress
+                | FirewallCommand::IpJsonRoute
+                | FirewallCommand::IpJsonRule => b"[]".to_vec(),
+                FirewallCommand::IpBatch {
+                    batch_file,
+                    continue_on_error: false,
+                } => {
+                    let batch = fs::read_to_string(batch_file).map_err(FirewallCommandError::Io)?;
+                    if !batch.contains("address add 192.0.2.10/24 dev eth0") {
                         return Err(FirewallCommandError::Unsuccessful);
                     }
                     self.applied.set(true);
@@ -546,6 +587,43 @@ mod tests {
         );
         drop(transaction);
         assert!(!root.join("staging/change-route-1").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stages_activates_and_verifies_runtime_address_profile() {
+        let root = fixture_root();
+        let mut transaction = GenericRuntimeRouteTransaction::new(
+            MockAddress {
+                applied: Cell::new(false),
+            },
+            root.clone(),
+            "change-address-1",
+            "boot-1",
+            None,
+            address_execution_plan(),
+            false,
+        )
+        .expect("transaction");
+        transaction.reinspect().expect("reinspect");
+        transaction.stage().expect("stage");
+        assert_eq!(
+            transaction.rollback_batch().expect("rollback"),
+            b"address del 192.0.2.10/24 dev eth0\n"
+        );
+        transaction.validate_stage().expect("validate");
+        transaction
+            .activate_after_rollback_armed()
+            .expect("activate");
+        transaction.verify().expect("verify");
+        assert!(
+            !transaction
+                .verified_canonical_state()
+                .expect("canonical")
+                .is_empty()
+        );
+        drop(transaction);
+        assert!(!root.join("staging/change-address-1").exists());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -648,6 +726,83 @@ mod tests {
             changes,
             validation_checks: vec!["typed ip batch".into()],
             verification_checks: vec!["fresh protocol routes".into()],
+            rollback_required: true,
+        };
+        NetworkExecutionPlan {
+            schema_version: NETWORK_EXECUTION_PLAN_SCHEMA_VERSION,
+            preview,
+            typed,
+        }
+    }
+
+    fn address_execution_plan() -> NetworkExecutionPlan {
+        let native = NetworkObject::Interface(NetworkInterfaceConfig {
+            id: "eth0".into(),
+            ownership: ObjectOwnership::PlatformNative,
+            enabled: true,
+            device: "eth0".into(),
+            ipv4_mode: NetworkAddressMode::Disabled,
+            ipv6_mode: NetworkAddressMode::Disabled,
+            addresses: Vec::new(),
+            mtu: Some(1500),
+            mac_override: None,
+            peerdns: true,
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dhcp_client_id: None,
+            dhcp_vendor_id: None,
+            dhcp_hostname: None,
+            dhcp_request_options: Vec::new(),
+            dhcp_no_release: false,
+            dhcp_server: None,
+        });
+        let desired = NetworkObject::Interface(NetworkInterfaceConfig {
+            id: "agent_eth0".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            device: "eth0".into(),
+            ipv4_mode: NetworkAddressMode::Static,
+            ipv6_mode: NetworkAddressMode::Disabled,
+            addresses: vec![IpNetwork {
+                address: "192.0.2.10".parse().expect("address"),
+                prefix_len: 24,
+            }],
+            mtu: None,
+            mac_override: None,
+            peerdns: true,
+            dns_servers: Vec::new(),
+            dns_search: Vec::new(),
+            dhcp_client_id: None,
+            dhcp_vendor_id: None,
+            dhcp_hostname: None,
+            dhcp_request_options: Vec::new(),
+            dhcp_no_release: false,
+            dhcp_server: None,
+        });
+        let typed = plan_network_mutations(
+            &NetworkInventory {
+                objects: vec![native],
+            },
+            &[NetworkMutation::Create(desired)],
+            &NetworkRiskContext::default(),
+        )
+        .expect("plan");
+        let changes = typed
+            .changes
+            .iter()
+            .map(|change| change.diff.clone())
+            .collect();
+        let preview = ChangePlan {
+            schema_version: CHANGE_PLAN_SCHEMA_VERSION,
+            plan_id: "address-plan-1".into(),
+            boot_id: "boot-1".into(),
+            actor_id: "cli/local".into(),
+            created_monotonic_ms: 1,
+            expires_monotonic_ms: 2,
+            risk: typed.risk,
+            changes,
+            validation_checks: vec!["typed ip batch".into()],
+            verification_checks: vec!["fresh interface address".into()],
             rollback_required: true,
         };
         NetworkExecutionPlan {
