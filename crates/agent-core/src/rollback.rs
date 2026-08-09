@@ -21,6 +21,7 @@ const MAX_IPTABLES_SAVE_BYTES: u64 = 256 * 1024;
 pub enum RollbackTarget {
     OpenWrtFirewall,
     OpenWrtNetwork,
+    OpenWrtDhcp,
     LinuxNftablesManaged,
     LinuxNftablesRuntime,
     LinuxFirewallCanonical,
@@ -37,6 +38,7 @@ impl RollbackTarget {
         match self {
             Self::OpenWrtFirewall => Some(Path::new("/etc/config/firewall")),
             Self::OpenWrtNetwork => Some(Path::new("/etc/config/network")),
+            Self::OpenWrtDhcp => Some(Path::new("/etc/config/dhcp")),
             Self::LinuxNftablesManaged => Some(Path::new("/etc/mbed-agent/managed/firewall.nft")),
             Self::LinuxNftablesRuntime
             | Self::LinuxFirewallCanonical
@@ -1356,6 +1358,8 @@ fn targets_match_reload(targets: &HashSet<RollbackTarget>, reload: RollbackReloa
         }
         RollbackReload::OpenWrtNetwork => {
             targets == &HashSet::from([RollbackTarget::OpenWrtNetwork])
+                || targets
+                    == &HashSet::from([RollbackTarget::OpenWrtNetwork, RollbackTarget::OpenWrtDhcp])
         }
         RollbackReload::LinuxNftables => {
             targets == &HashSet::from([RollbackTarget::LinuxNftablesManaged])

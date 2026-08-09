@@ -24,7 +24,14 @@ pub enum FirewallCommand {
     UciShowNetworkAt {
         staging_dir: PathBuf,
     },
+    UciShowDhcp,
+    UciShowDhcpAt {
+        staging_dir: PathBuf,
+    },
     UciExportNetworkAt {
+        staging_dir: PathBuf,
+    },
+    UciExportDhcpAt {
         staging_dir: PathBuf,
     },
     UciBatch {
@@ -221,7 +228,10 @@ impl FirewallCommandRunner {
             operation,
             FirewallCommand::UciShowNetwork
                 | FirewallCommand::UciShowNetworkAt { .. }
+                | FirewallCommand::UciShowDhcp
+                | FirewallCommand::UciShowDhcpAt { .. }
                 | FirewallCommand::UciExportNetworkAt { .. }
+                | FirewallCommand::UciExportDhcpAt { .. }
                 | FirewallCommand::OpenWrtNetworkReload
         ) {
             return self.network_specification(operation);
@@ -331,7 +341,10 @@ impl FirewallCommandRunner {
             ),
             FirewallCommand::UciShowNetwork
             | FirewallCommand::UciShowNetworkAt { .. }
+            | FirewallCommand::UciShowDhcp
+            | FirewallCommand::UciShowDhcpAt { .. }
             | FirewallCommand::UciExportNetworkAt { .. }
+            | FirewallCommand::UciExportDhcpAt { .. }
             | FirewallCommand::OpenWrtNetworkReload => unreachable!("handled above"),
         };
         Ok(spec)
@@ -343,13 +356,28 @@ impl FirewallCommandRunner {
     ) -> Result<CommandSpecification, FirewallCommandError> {
         match operation {
             FirewallCommand::UciShowNetwork => Ok(spec("uci", &["-q", "show", "network"])),
+            FirewallCommand::UciShowDhcp => Ok(spec("uci", &["-q", "show", "dhcp"])),
             FirewallCommand::UciShowNetworkAt { staging_dir }
-            | FirewallCommand::UciExportNetworkAt { staging_dir } => {
+            | FirewallCommand::UciShowDhcpAt { staging_dir }
+            | FirewallCommand::UciExportNetworkAt { staging_dir }
+            | FirewallCommand::UciExportDhcpAt { staging_dir } => {
                 let dir = self.validate_staging_dir(staging_dir)?;
-                let action = if matches!(operation, FirewallCommand::UciShowNetworkAt { .. }) {
+                let action = if matches!(
+                    operation,
+                    FirewallCommand::UciShowNetworkAt { .. }
+                        | FirewallCommand::UciShowDhcpAt { .. }
+                ) {
                     "show"
                 } else {
                     "export"
+                };
+                let package = if matches!(
+                    operation,
+                    FirewallCommand::UciShowDhcpAt { .. } | FirewallCommand::UciExportDhcpAt { .. }
+                ) {
+                    "dhcp"
+                } else {
+                    "network"
                 };
                 Ok(CommandSpecification {
                     program: "uci",
@@ -358,7 +386,7 @@ impl FirewallCommandRunner {
                         dir.as_os_str().into(),
                         "-q".into(),
                         action.into(),
-                        "network".into(),
+                        package.into(),
                     ],
                     uci_config_dir: None,
                 })

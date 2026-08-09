@@ -770,10 +770,27 @@ pub struct NetworkInterfaceConfig {
     /// Whether the DHCP client must not send a release on stop.
     #[serde(default)]
     pub dhcp_no_release: bool,
+    /// Optional IPv4 DHCP server configuration for this interface.
+    #[serde(default)]
+    pub dhcp_server: Option<NetworkDhcpServerConfig>,
 }
 
 const fn default_peerdns() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkDhcpServerConfig {
+    /// Whether dnsmasq should serve leases on this interface.
+    pub enabled: bool,
+    /// IPv4 host offset of the first lease.
+    pub start: u16,
+    /// Maximum number of leases in the pool.
+    pub limit: u16,
+    /// `OpenWrt` lease duration such as `12h` or `1d`.
+    pub lease_time: String,
+    /// Whether the server may start even when no clients are detected.
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1859,6 +1876,7 @@ mod tests {
         assert!(interface.dhcp_hostname.is_none());
         assert!(interface.dhcp_request_options.is_empty());
         assert!(!interface.dhcp_no_release);
+        assert!(interface.dhcp_server.is_none());
     }
 
     #[test]

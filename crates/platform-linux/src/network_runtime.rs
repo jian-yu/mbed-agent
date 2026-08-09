@@ -163,6 +163,7 @@ pub fn inspect_runtime_network_inventory(
             dhcp_hostname: None,
             dhcp_request_options: Vec::new(),
             dhcp_no_release: false,
+            dhcp_server: None,
         }));
     }
 

@@ -114,7 +114,8 @@ L2/L3 typed object, validation, risk, projection, and execution-payload boundary
 is implemented. OpenWrt 21+ has fresh UCI network inventory and confirmed writes
 for the interface/Bridge/VLAN/route/policy-rule subset, including interface-level
 `peerdns`, explicit resolver addresses, DNS search suffixes, and bounded DHCP
-client options (`clientid`, `vendorid`, `hostname`, `reqopts`, `norelease`).
+client options (`clientid`, `vendorid`, `hostname`, `reqopts`, `norelease`), plus
+an OpenWrt DHCPv4 server pool subset (`start`, `limit`, `leasetime`, `force`).
 Generic Linux
 with iproute2 has fresh interface/route/policy-rule inventory and confirmed
 writes for enabled Agent-owned volatile routes and reserved-priority policy
@@ -185,6 +186,9 @@ recorded in
 OpenWrt interface DHCP client controls and their bounded UCI representation are
 recorded in
 [ADR 0061](docs/adr/0061-openwrt-interface-dhcp-client.md).
+OpenWrt DHCPv4 server pool staging and its paired network/dhcp rollback are
+recorded in
+[ADR 0062](docs/adr/0062-openwrt-dhcpv4-server-pool.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in
@@ -483,7 +487,7 @@ rules only: routes carry protocol 186 and policy rules use preference range
 32000-32063. Both store canonical ownership only in bounded `/tmp` SQLite and
 arm an independent reverse `ip -force -batch` helper. Interface resolver
 overrides are currently OpenWrt-only (`peerdns`, `dns`, `dns_search`, and the
-bounded DHCP client options) and
+bounded DHCP client/server options) and
 use the same transaction; generic Linux resolver files and unknown
 network-manager state remain read-only. Interfaces, addresses, ordinary
 platform routes, and persistent generic Linux network-manager files remain

@@ -3,9 +3,9 @@ use std::net::IpAddr;
 
 use agent_protocol::{
     ChangeDiff, ChangeOperation, ChangePlan, ChangeRiskSignals, ConfigDomain, ConfigObjectRef,
-    IpNetwork, NetworkAddressMode, NetworkBond, NetworkBridge, NetworkFamily,
-    NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule, NetworkRoute,
-    NetworkRouteType, NetworkVlan, NetworkVrf, ObjectOwnership, RiskLevel,
+    IpNetwork, NetworkAddressMode, NetworkBond, NetworkBridge, NetworkDhcpServerConfig,
+    NetworkFamily, NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule,
+    NetworkRoute, NetworkRouteType, NetworkVlan, NetworkVrf, ObjectOwnership, RiskLevel,
 };
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
@@ -578,6 +578,9 @@ fn validate_interface(value: &NetworkInterfaceConfig) -> Result<(), NetworkPlanE
             ));
         }
     }
+    if let Some(server) = &value.dhcp_server {
+        validate_dhcp_server(value, server)?;
+    }
     Ok(())
 }
 
@@ -602,6 +605,39 @@ fn valid_dhcp_text(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| !byte.is_ascii_control() && !matches!(byte, b'\'' | b'\\'))
+}
+
+fn validate_dhcp_server(
+    interface: &NetworkInterfaceConfig,
+    value: &NetworkDhcpServerConfig,
+) -> Result<(), NetworkPlanError> {
+    if interface.ipv4_mode != NetworkAddressMode::Static
+        || !interface
+            .addresses
+            .iter()
+            .any(|address| address.address.is_ipv4())
+    {
+        return Err(NetworkPlanError::InvalidField("interface DHCP server mode"));
+    }
+    if !(1..=254).contains(&value.start)
+        || !(1..=254).contains(&value.limit)
+        || u32::from(value.start) + u32::from(value.limit) > 255
+    {
+        return Err(NetworkPlanError::InvalidField("interface DHCP pool"));
+    }
+    let lease_valid = if value.lease_time == "infinite" {
+        true
+    } else {
+        let bytes = value.lease_time.as_bytes();
+        bytes.len() >= 2
+            && bytes.len() <= 16
+            && matches!(bytes.last(), Some(b's' | b'm' | b'h' | b'd' | b'w'))
+            && bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+    };
+    if !lease_valid {
+        return Err(NetworkPlanError::InvalidField("interface DHCP lease time"));
+    }
+    Ok(())
 }
 
 fn validate_bridge(value: &NetworkBridge) -> Result<(), NetworkPlanError> {
@@ -1093,6 +1129,7 @@ mod tests {
             dhcp_hostname: None,
             dhcp_request_options: Vec::new(),
             dhcp_no_release: false,
+            dhcp_server: None,
         })
     }
 
@@ -1272,6 +1309,45 @@ mod tests {
             Err(NetworkPlanError::InvalidField(
                 "interface DHCP request option"
             ))
+        );
+    }
+
+    #[test]
+    fn rejects_dhcp_server_on_dynamic_interface_or_invalid_pool() {
+        let mut invalid = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.ipv4_mode = NetworkAddressMode::Dhcp;
+            value.addresses.clear();
+            value.dhcp_server = Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+            });
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField("interface DHCP server mode"))
+        );
+
+        let mut invalid = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dhcp_server = Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 200,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+            });
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField("interface DHCP pool"))
         );
     }
 

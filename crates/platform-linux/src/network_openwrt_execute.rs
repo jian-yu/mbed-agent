@@ -17,7 +17,7 @@ use crate::firewall_command::{
 use crate::network_openwrt::{
     NetworkRenderError, OpenWrtNetworkInventorySnapshot, OpenWrtNetworkStage,
     OpenWrtNetworkValidation, inspect_openwrt_network_inventory,
-    render_openwrt_network_stage_from_snapshot,
+    inspect_openwrt_network_inventory_with_dhcp, render_openwrt_network_stage_from_snapshot,
 };
 
 const MAX_NETWORK_CONFIG_BYTES: u64 = 256 * 1024;
@@ -37,17 +37,21 @@ pub struct OpenWrtNetworkTransaction<R = FirewallCommandRunner> {
     runner: R,
     runtime_root: PathBuf,
     config_path: PathBuf,
+    dhcp_config_path: PathBuf,
     transaction_id: String,
     execution: NetworkExecutionPlan,
     require_root_owner: bool,
     state: TransactionState,
     source_digest: Option<String>,
     source_uci: Option<Vec<u8>>,
+    source_dhcp_uci: Option<Vec<u8>>,
     source_bytes: Option<Vec<u8>>,
+    source_dhcp_bytes: Option<Vec<u8>>,
     snapshot: Option<OpenWrtNetworkInventorySnapshot>,
     expected: Option<NetworkInventory>,
     stage: Option<OpenWrtNetworkStage>,
     staging_dir: Option<PathBuf>,
+    requires_dhcp: bool,
 }
 
 impl OpenWrtNetworkTransaction<FirewallCommandRunner> {
@@ -96,21 +100,30 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
         if require_root_owner && !safe_system_runtime_root(&runtime_root) {
             return Err(OpenWrtNetworkExecutionError::UnsafeRuntime);
         }
+        let dhcp_config_path = config_path
+            .parent()
+            .ok_or(OpenWrtNetworkExecutionError::UnsafeConfig)?
+            .join("dhcp");
+        let requires_dhcp = execution_requires_dhcp(&execution);
         Ok(Self {
             runner,
             runtime_root,
             config_path,
+            dhcp_config_path,
             transaction_id: transaction_id.into(),
             execution,
             require_root_owner,
             state: TransactionState::New,
             source_digest: None,
             source_uci: None,
+            source_dhcp_uci: None,
             source_bytes: None,
+            source_dhcp_bytes: None,
             snapshot: None,
             expected: None,
             stage: None,
             staging_dir: None,
+            requires_dhcp,
         })
     }
 
@@ -129,16 +142,34 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
             .runner
             .execute(&FirewallCommand::UciShowNetwork, None)?
             .stdout;
-        let snapshot = inspect_openwrt_network_inventory(
-            std::str::from_utf8(&source_uci)
-                .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
-        )?;
+        let (source_dhcp_bytes, source_dhcp_uci, snapshot) = if self.requires_dhcp {
+            let dhcp_bytes = read_safe_config(&self.dhcp_config_path, self.require_root_owner)?;
+            let dhcp_uci = self
+                .runner
+                .execute(&FirewallCommand::UciShowDhcp, None)?
+                .stdout;
+            let snapshot = inspect_openwrt_network_inventory_with_dhcp(
+                std::str::from_utf8(&source_uci)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+                std::str::from_utf8(&dhcp_uci)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            )?;
+            (Some(dhcp_bytes), Some(dhcp_uci), snapshot)
+        } else {
+            let snapshot = inspect_openwrt_network_inventory(
+                std::str::from_utf8(&source_uci)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            )?;
+            (None, None, snapshot)
+        };
         let expected = project_network_inventory(snapshot.inventory(), &self.execution.typed)
             .map_err(|_| OpenWrtNetworkExecutionError::StalePlan)?;
         let stage = render_openwrt_network_stage_from_snapshot(&self.execution.typed, &snapshot)?;
         self.source_bytes = Some(source_bytes);
         self.source_digest = Some(source_digest);
         self.source_uci = Some(source_uci);
+        self.source_dhcp_bytes = source_dhcp_bytes;
+        self.source_dhcp_uci = source_dhcp_uci;
         self.snapshot = Some(snapshot);
         self.expected = Some(expected);
         self.stage = Some(stage);
@@ -166,18 +197,27 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
             .as_deref()
             .ok_or(OpenWrtNetworkExecutionError::InvalidState)?;
         write_new_synced(&staging_dir.join("network"), source, 0o600)?;
+        if self.requires_dhcp {
+            write_new_synced(
+                &staging_dir.join("dhcp"),
+                self.source_dhcp_bytes
+                    .as_deref()
+                    .ok_or(OpenWrtNetworkExecutionError::InvalidState)?,
+                0o600,
+            )?;
+        }
         sync_directory(&staging_dir)?;
-        let batch = self
+        let stage = self
             .stage
             .as_ref()
-            .ok_or(OpenWrtNetworkExecutionError::InvalidState)?
-            .uci_batch
-            .as_bytes();
+            .ok_or(OpenWrtNetworkExecutionError::InvalidState)?;
+        let mut batch = stage.uci_batch.clone();
+        batch.push_str(&stage.dhcp_uci_batch);
         self.runner.execute(
             &FirewallCommand::UciBatch {
                 staging_dir: staging_dir.clone(),
             },
-            Some(batch),
+            Some(batch.as_bytes()),
         )?;
         let staged_uci = self
             .runner
@@ -188,10 +228,28 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
                 None,
             )?
             .stdout;
-        let staged = inspect_openwrt_network_inventory(
-            std::str::from_utf8(&staged_uci)
-                .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
-        )?;
+        let staged = if self.requires_dhcp {
+            let staged_dhcp = self
+                .runner
+                .execute(
+                    &FirewallCommand::UciShowDhcpAt {
+                        staging_dir: staging_dir.clone(),
+                    },
+                    None,
+                )?
+                .stdout;
+            inspect_openwrt_network_inventory_with_dhcp(
+                std::str::from_utf8(&staged_uci)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+                std::str::from_utf8(&staged_dhcp)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            )?
+        } else {
+            inspect_openwrt_network_inventory(
+                std::str::from_utf8(&staged_uci)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            )?
+        };
         if !inventory_equal(
             staged.inventory(),
             self.expected
@@ -230,6 +288,14 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
                         },
                         None,
                     )?;
+                    if self.requires_dhcp {
+                        self.runner.execute(
+                            &FirewallCommand::UciExportDhcpAt {
+                                staging_dir: directory.clone(),
+                            },
+                            None,
+                        )?;
+                    }
                 }
             }
         }
@@ -259,6 +325,19 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
         if self.source_digest.as_deref() != Some(hex_digest(&fresh_source).as_str()) {
             return Err(OpenWrtNetworkExecutionError::SourceDrift);
         }
+        if self.requires_dhcp {
+            let fresh_dhcp_uci = self
+                .runner
+                .execute(&FirewallCommand::UciShowDhcp, None)?
+                .stdout;
+            if self.source_dhcp_uci.as_deref() != Some(fresh_dhcp_uci.as_slice()) {
+                return Err(OpenWrtNetworkExecutionError::SourceDrift);
+            }
+            let fresh_dhcp = read_safe_config(&self.dhcp_config_path, self.require_root_owner)?;
+            if self.source_dhcp_bytes.as_deref() != Some(fresh_dhcp.as_slice()) {
+                return Err(OpenWrtNetworkExecutionError::SourceDrift);
+            }
+        }
         let staged_path = self
             .staging_dir
             .as_ref()
@@ -270,6 +349,19 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
             &self.transaction_id,
             self.require_root_owner,
         )?;
+        if self.requires_dhcp {
+            let staged_dhcp = self
+                .staging_dir
+                .as_ref()
+                .ok_or(OpenWrtNetworkExecutionError::InvalidState)?
+                .join("dhcp");
+            atomic_install(
+                &staged_dhcp,
+                &self.dhcp_config_path,
+                &format!("{}-dhcp", self.transaction_id),
+                self.require_root_owner,
+            )?;
+        }
         self.runner
             .execute(&FirewallCommand::OpenWrtNetworkReload, None)?;
         self.state = TransactionState::Activated;
@@ -287,10 +379,23 @@ impl<R: FirewallCommandExecutor> OpenWrtNetworkTransaction<R> {
             .runner
             .execute(&FirewallCommand::UciShowNetwork, None)?
             .stdout;
-        let snapshot = inspect_openwrt_network_inventory(
-            std::str::from_utf8(&actual)
-                .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
-        )?;
+        let snapshot = if self.requires_dhcp {
+            let actual_dhcp = self
+                .runner
+                .execute(&FirewallCommand::UciShowDhcp, None)?
+                .stdout;
+            inspect_openwrt_network_inventory_with_dhcp(
+                std::str::from_utf8(&actual)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+                std::str::from_utf8(&actual_dhcp)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            )?
+        } else {
+            inspect_openwrt_network_inventory(
+                std::str::from_utf8(&actual)
+                    .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            )?
+        };
         if !inventory_equal(
             snapshot.inventory(),
             self.expected
@@ -336,12 +441,33 @@ pub fn verify_openwrt_network_plan(
     let actual = runner
         .execute(&FirewallCommand::UciShowNetwork, None)?
         .stdout;
-    let snapshot = inspect_openwrt_network_inventory(
-        std::str::from_utf8(&actual)
-            .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
-    )?;
+    let snapshot = if execution_requires_dhcp(execution) {
+        let actual_dhcp = runner.execute(&FirewallCommand::UciShowDhcp, None)?.stdout;
+        inspect_openwrt_network_inventory_with_dhcp(
+            std::str::from_utf8(&actual)
+                .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+            std::str::from_utf8(&actual_dhcp)
+                .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+        )?
+    } else {
+        inspect_openwrt_network_inventory(
+            std::str::from_utf8(&actual)
+                .map_err(|_| OpenWrtNetworkExecutionError::MalformedInspection)?,
+        )?
+    };
     verify_network_plan_result(snapshot.inventory(), &execution.typed)
         .map_err(|_| OpenWrtNetworkExecutionError::VerificationFailed)
+}
+
+fn execution_requires_dhcp(execution: &NetworkExecutionPlan) -> bool {
+    execution.typed.changes.iter().any(|change| {
+        [change.before.as_ref(), change.after.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|object| {
+                matches!(object, agent_protocol::NetworkObject::Interface(value) if value.dhcp_server.is_some())
+            })
+    })
 }
 
 impl<R> Drop for OpenWrtNetworkTransaction<R> {
@@ -715,6 +841,7 @@ mod tests {
                     dhcp_hostname: None,
                     dhcp_request_options: Vec::new(),
                     dhcp_no_release: false,
+                    dhcp_server: None,
                 },
             ))],
             &NetworkRiskContext::default(),

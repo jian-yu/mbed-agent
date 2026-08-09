@@ -43,7 +43,7 @@ use platform_linux::firewall_runtime::{
     inspect_generic_nftables_inventory,
 };
 use platform_linux::network_openwrt::{
-    OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory,
+    OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory_with_dhcp,
 };
 use platform_linux::network_runtime::{
     inspect_runtime_network_inventory, inspect_runtime_policy_inventory,
@@ -1740,17 +1740,26 @@ async fn inspect_network_for_planning(
 ) -> Result<OpenWrtNetworkInventorySnapshot, PendingResponseError> {
     openwrt_network_write_supported(state)?;
     let runner = firewall_command_runner(state);
-    let output =
-        tokio::task::spawn_blocking(move || runner.execute(&FirewallCommand::UciShowNetwork, None))
-            .await
-            .map_err(|_| PendingResponseError::internal("network planner is unavailable"))?
+    let (network_output, dhcp_output) = tokio::task::spawn_blocking(move || {
+        let network = runner
+            .execute(&FirewallCommand::UciShowNetwork, None)
             .map_err(|_| {
                 PendingResponseError::unavailable("live network inventory is unavailable")
             })?
             .stdout;
-    let uci = std::str::from_utf8(&output)
+        let dhcp = runner
+            .execute(&FirewallCommand::UciShowDhcp, None)
+            .map_err(|_| PendingResponseError::unavailable("live DHCP inventory is unavailable"))?
+            .stdout;
+        Ok::<_, PendingResponseError>((network, dhcp))
+    })
+    .await
+    .map_err(|_| PendingResponseError::internal("network planner is unavailable"))??;
+    let network = std::str::from_utf8(&network_output)
         .map_err(|_| PendingResponseError::conflict("live network inventory is malformed"))?;
-    inspect_openwrt_network_inventory(uci).map_err(|error| {
+    let dhcp = std::str::from_utf8(&dhcp_output)
+        .map_err(|_| PendingResponseError::conflict("live DHCP inventory is malformed"))?;
+    inspect_openwrt_network_inventory_with_dhcp(network, dhcp).map_err(|error| {
         warn!(%error, "live network inventory cannot be safely planned");
         PendingResponseError::conflict("live network inventory cannot be safely modified")
     })

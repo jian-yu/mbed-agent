@@ -12,9 +12,9 @@ use agent_core::{
     NetworkInventory, NetworkMutationPlan, network_object_digest, validate_network_object,
 };
 use agent_protocol::{
-    ChangeOperation, IpNetwork, NetworkAddressMode, NetworkBridge, NetworkFamily,
-    NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule, NetworkRoute,
-    NetworkRouteType, NetworkVlan, NetworkVlanProtocol, ObjectOwnership,
+    ChangeOperation, IpNetwork, NetworkAddressMode, NetworkBridge, NetworkDhcpServerConfig,
+    NetworkFamily, NetworkInterfaceConfig, NetworkObject, NetworkPolicyAction, NetworkPolicyRule,
+    NetworkRoute, NetworkRouteType, NetworkVlan, NetworkVlanProtocol, ObjectOwnership,
 };
 use thiserror::Error;
 
@@ -33,6 +33,9 @@ pub struct OpenWrtNetworkObjectBinding {
     pub section_type: String,
     pub section: String,
     pub present_options: Vec<String>,
+    pub dhcp_section: Option<String>,
+    pub dhcp_present_options: Vec<String>,
+    pub dhcp_agent_owned: bool,
 }
 
 /// One bounded, internally consistent view of the current `OpenWrt` network package.
@@ -42,6 +45,8 @@ pub struct OpenWrtNetworkInventorySnapshot {
     bindings: Vec<OpenWrtNetworkObjectBinding>,
     occupied_sections: Vec<String>,
     read_only_sections: Vec<String>,
+    dhcp_occupied_sections: Vec<String>,
+    dhcp_read_only_sections: Vec<String>,
 }
 
 impl OpenWrtNetworkInventorySnapshot {
@@ -64,6 +69,16 @@ impl OpenWrtNetworkInventorySnapshot {
     pub fn read_only_sections(&self) -> &[String] {
         &self.read_only_sections
     }
+
+    #[must_use]
+    pub fn dhcp_occupied_sections(&self) -> &[String] {
+        &self.dhcp_occupied_sections
+    }
+
+    #[must_use]
+    pub fn dhcp_read_only_sections(&self) -> &[String] {
+        &self.dhcp_read_only_sections
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +90,7 @@ pub enum OpenWrtNetworkValidation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenWrtNetworkStage {
     pub uci_batch: String,
+    pub dhcp_uci_batch: String,
     pub validations: Vec<OpenWrtNetworkValidation>,
     pub activation_service: &'static str,
     pub activation_action: &'static str,
@@ -116,7 +132,23 @@ pub fn select_openwrt_network_staging(
 pub fn inspect_openwrt_network_inventory(
     uci_show: &str,
 ) -> Result<OpenWrtNetworkInventorySnapshot, NetworkRenderError> {
+    inspect_openwrt_network_inventory_with_dhcp(uci_show, "")
+}
+
+/// Reconstructs the network package plus the safe DHCP server subset from one fresh pair of UCI
+/// snapshots. The DHCP package is optional so existing network-only callers remain compatible.
+///
+/// # Errors
+///
+/// Returns an error for malformed UCI, unsafe ownership markers, duplicate identities, or an
+/// Agent-owned section that cannot be represented by the bounded typed model.
+#[allow(clippy::too_many_lines)] // Network and DHCP bindings are joined in one atomic snapshot.
+pub fn inspect_openwrt_network_inventory_with_dhcp(
+    uci_show: &str,
+    dhcp_show: &str,
+) -> Result<OpenWrtNetworkInventorySnapshot, NetworkRenderError> {
     let sections = parse_ci(uci_show)?;
+    let dhcp_sections = parse_dhcp(dhcp_show)?;
     let mut objects = Vec::new();
     let mut bindings = Vec::new();
     let mut read_only_sections = Vec::new();
@@ -185,8 +217,98 @@ pub fn inspect_openwrt_network_inventory(
             section_type: section.section_type.clone(),
             section: section.selector.clone(),
             present_options,
+            dhcp_section: None,
+            dhcp_present_options: Vec::new(),
+            dhcp_agent_owned: false,
         });
         objects.push(object);
+    }
+
+    let mut dhcp_occupied_sections = Vec::new();
+    let mut dhcp_read_only_sections = Vec::new();
+    for section in &dhcp_sections {
+        dhcp_occupied_sections.push(section.selector.clone());
+        let marker = section.first("mbed_managed");
+        let reserved = section.selector.starts_with("mbed_");
+        let managed = match marker {
+            None if !reserved => false,
+            Some("1") => true,
+            _ => {
+                return Err(NetworkRenderError::UnsafeOwnershipMarker(
+                    section.selector.clone(),
+                ));
+            }
+        };
+        if section.section_type != "dhcp" {
+            if managed {
+                return Err(NetworkRenderError::UnsupportedManagedSection(
+                    section.selector.clone(),
+                ));
+            }
+            dhcp_read_only_sections.push(section.selector.clone());
+            continue;
+        }
+        let Some(interface_id) = optional(section, "interface") else {
+            if managed {
+                return Err(NetworkRenderError::UnsupportedManagedSection(
+                    section.selector.clone(),
+                ));
+            }
+            dhcp_read_only_sections.push(section.selector.clone());
+            continue;
+        };
+        let Some(index) = objects.iter().position(
+            |object| matches!(object, NetworkObject::Interface(value) if value.id == interface_id),
+        ) else {
+            if managed {
+                return Err(NetworkRenderError::UnsupportedManagedSection(
+                    section.selector.clone(),
+                ));
+            }
+            dhcp_read_only_sections.push(section.selector.clone());
+            continue;
+        };
+        let Some(server) = decode_dhcp_server(section) else {
+            if managed {
+                return Err(NetworkRenderError::UnsupportedManagedSection(
+                    section.selector.clone(),
+                ));
+            }
+            dhcp_read_only_sections.push(section.selector.clone());
+            continue;
+        };
+        let object = objects
+            .get_mut(index)
+            .ok_or(NetworkRenderError::MalformedUci)?;
+        if let NetworkObject::Interface(interface) = object {
+            interface.dhcp_server = Some(server);
+        } else {
+            return Err(NetworkRenderError::MalformedUci);
+        }
+        if validate_network_object(object).is_err() {
+            if managed {
+                return Err(NetworkRenderError::UnsupportedManagedSection(
+                    section.selector.clone(),
+                ));
+            }
+            let NetworkObject::Interface(interface) = object else {
+                return Err(NetworkRenderError::MalformedUci);
+            };
+            interface.dhcp_server = None;
+            dhcp_read_only_sections.push(section.selector.clone());
+            continue;
+        }
+        let binding = bindings
+            .get_mut(index)
+            .ok_or(NetworkRenderError::MalformedUci)?;
+        if section.options.len() > MAX_PRESENT_OPTIONS {
+            return Err(NetworkRenderError::Capacity);
+        }
+        let mut present_options: Vec<_> = section.options.keys().cloned().collect();
+        present_options.sort_unstable();
+        binding.dhcp_section = Some(section.selector.clone());
+        binding.dhcp_present_options = present_options;
+        binding.dhcp_agent_owned = managed;
     }
 
     validate_inventory_topology(&NetworkInventory {
@@ -200,6 +322,8 @@ pub fn inspect_openwrt_network_inventory(
             .map(|section| section.selector.clone())
             .collect(),
         read_only_sections,
+        dhcp_occupied_sections,
+        dhcp_read_only_sections,
     })
 }
 
@@ -229,6 +353,9 @@ pub fn render_openwrt_network_stage_from_snapshot(
     }
 
     let mut batch = String::new();
+    let mut dhcp_batch = String::new();
+    let mut dhcp_reserved: HashSet<String> =
+        snapshot.dhcp_occupied_sections().iter().cloned().collect();
     for change in &plan.changes {
         let object = change
             .after
@@ -248,24 +375,31 @@ pub fn render_openwrt_network_stage_from_snapshot(
                     return Err(NetworkRenderError::DuplicateSection);
                 }
                 render_create(&mut batch, &section, object)?;
+                render_dhcp_create(&mut dhcp_batch, &mut dhcp_reserved, object)?;
             }
             ChangeOperation::Update | ChangeOperation::Move => {
                 let binding = binding_for(&bindings, key)?;
                 render_update(&mut batch, binding, object)?;
+                render_dhcp_update(&mut dhcp_batch, &mut dhcp_reserved, binding, object)?;
             }
             ChangeOperation::Delete => {
                 let binding = binding_for(&bindings, key)?;
                 writeln!(batch, "delete network.{}", binding.section)
                     .map_err(|_| NetworkRenderError::Output)?;
+                render_dhcp_delete(&mut dhcp_batch, binding, object)?;
             }
         }
-        if batch.len() > MAX_BATCH_BYTES {
+        if batch.len().saturating_add(dhcp_batch.len()) > MAX_BATCH_BYTES {
             return Err(NetworkRenderError::Capacity);
         }
     }
     batch.push_str("commit network\n");
+    if !dhcp_batch.is_empty() {
+        dhcp_batch.push_str("commit dhcp\n");
+    }
     Ok(OpenWrtNetworkStage {
         uci_batch: batch,
+        dhcp_uci_batch: dhcp_batch,
         validations: vec![OpenWrtNetworkValidation::UciExport],
         activation_service: "/etc/init.d/network",
         activation_action: "reload",
@@ -274,6 +408,13 @@ pub fn render_openwrt_network_stage_from_snapshot(
 
 fn parse_ci(input: &str) -> Result<Vec<UciSection>, NetworkRenderError> {
     parse_uci_show_package(input, "network").map_err(|error| match error {
+        FirewallRenderError::Capacity => NetworkRenderError::Capacity,
+        _ => NetworkRenderError::MalformedUci,
+    })
+}
+
+fn parse_dhcp(input: &str) -> Result<Vec<UciSection>, NetworkRenderError> {
+    parse_uci_show_package(input, "dhcp").map_err(|error| match error {
         FirewallRenderError::Capacity => NetworkRenderError::Capacity,
         _ => NetworkRenderError::MalformedUci,
     })
@@ -294,6 +435,16 @@ fn decode_section(section: &UciSection, ownership: ObjectOwnership) -> Option<Ne
         "rule" | "rule6" => decode_policy_rule(section, ownership).map(NetworkObject::PolicyRule),
         _ => None,
     }
+}
+
+fn decode_dhcp_server(section: &UciSection) -> Option<NetworkDhcpServerConfig> {
+    Some(NetworkDhcpServerConfig {
+        enabled: !optional_bool(section, "ignore").ok()?.unwrap_or(false),
+        start: optional_u16(section, "start").ok()?.unwrap_or(100),
+        limit: optional_u16(section, "limit").ok()?.unwrap_or(150),
+        lease_time: optional(section, "leasetime").unwrap_or("12h").to_owned(),
+        force: optional_bool(section, "force").ok()?.unwrap_or(false),
+    })
 }
 
 fn valid_cardinality(section: &UciSection) -> bool {
@@ -420,6 +571,7 @@ fn decode_interface(
             .map(|raw| raw.parse().ok())
             .collect::<Option<Vec<u16>>>()?,
         dhcp_no_release: optional_bool(section, "norelease").ok()?.unwrap_or(false),
+        dhcp_server: None,
     })
 }
 
@@ -669,6 +821,145 @@ fn render_create(
     writeln!(batch, "set network.{section}={}", rendered.section_type)
         .map_err(|_| NetworkRenderError::Output)?;
     render_options(batch, section, &rendered)
+}
+
+fn render_dhcp_create(
+    batch: &mut String,
+    reserved: &mut HashSet<String>,
+    object: &NetworkObject,
+) -> Result<(), NetworkRenderError> {
+    let NetworkObject::Interface(value) = object else {
+        return Ok(());
+    };
+    let Some(server) = &value.dhcp_server else {
+        return Ok(());
+    };
+    if !safe_uci_identifier(&value.id) {
+        return Err(NetworkRenderError::UnsupportedField(
+            "OpenWrt DHCP interface identifier",
+        ));
+    }
+    let section = value.id.clone();
+    if !reserved.insert(section.clone()) {
+        return Err(NetworkRenderError::DuplicateSection);
+    }
+    writeln!(batch, "set dhcp.{section}=dhcp").map_err(|_| NetworkRenderError::Output)?;
+    render_dhcp_options(batch, &section, value, server, true)
+}
+
+fn render_dhcp_update(
+    batch: &mut String,
+    reserved: &mut HashSet<String>,
+    binding: &OpenWrtNetworkObjectBinding,
+    object: &NetworkObject,
+) -> Result<(), NetworkRenderError> {
+    let NetworkObject::Interface(value) = object else {
+        return Ok(());
+    };
+    let Some(server) = &value.dhcp_server else {
+        if binding.dhcp_section.is_some() && !binding.dhcp_agent_owned {
+            return Err(NetworkRenderError::UnsupportedField(
+                "native OpenWrt DHCP server removal",
+            ));
+        }
+        if let Some(section) = &binding.dhcp_section {
+            writeln!(batch, "delete dhcp.{section}").map_err(|_| NetworkRenderError::Output)?;
+        }
+        return Ok(());
+    };
+    let section = if let Some(section) = &binding.dhcp_section {
+        section.clone()
+    } else {
+        if !safe_uci_identifier(&value.id) {
+            return Err(NetworkRenderError::UnsupportedField(
+                "OpenWrt DHCP interface identifier",
+            ));
+        }
+        let section = value.id.clone();
+        if !reserved.insert(section.clone()) {
+            return Err(NetworkRenderError::DuplicateSection);
+        }
+        writeln!(batch, "set dhcp.{section}=dhcp").map_err(|_| NetworkRenderError::Output)?;
+        section
+    };
+    if binding.dhcp_section.is_some() {
+        for option in &binding.dhcp_present_options {
+            if supported_dhcp_options().contains(&option.as_str()) {
+                writeln!(batch, "delete dhcp.{section}.{option}")
+                    .map_err(|_| NetworkRenderError::Output)?;
+            }
+        }
+    }
+    render_dhcp_options(
+        batch,
+        &section,
+        value,
+        server,
+        value.ownership == ObjectOwnership::AgentOwned,
+    )
+}
+
+fn render_dhcp_delete(
+    batch: &mut String,
+    binding: &OpenWrtNetworkObjectBinding,
+    object: &NetworkObject,
+) -> Result<(), NetworkRenderError> {
+    if !matches!(object, NetworkObject::Interface(_)) {
+        return Ok(());
+    }
+    if let Some(section) = &binding.dhcp_section {
+        if !binding.dhcp_agent_owned {
+            return Err(NetworkRenderError::UnsupportedField(
+                "native OpenWrt DHCP server removal",
+            ));
+        }
+        writeln!(batch, "delete dhcp.{section}").map_err(|_| NetworkRenderError::Output)?;
+    }
+    Ok(())
+}
+
+fn render_dhcp_options(
+    batch: &mut String,
+    section: &str,
+    interface: &NetworkInterfaceConfig,
+    value: &NetworkDhcpServerConfig,
+    agent_owned: bool,
+) -> Result<(), NetworkRenderError> {
+    if agent_owned {
+        writeln!(batch, "set dhcp.{section}.mbed_managed='1'")
+            .map_err(|_| NetworkRenderError::Output)?;
+        writeln!(
+            batch,
+            "set dhcp.{section}.mbed_id={}",
+            quote(&interface.id)?
+        )
+        .map_err(|_| NetworkRenderError::Output)?;
+    }
+    for (name, value) in [
+        ("interface", interface.id.clone()),
+        ("ignore", boolean(!value.enabled)),
+        ("start", value.start.to_string()),
+        ("limit", value.limit.to_string()),
+        ("leasetime", value.lease_time.clone()),
+        ("force", boolean(value.force)),
+    ] {
+        writeln!(batch, "set dhcp.{section}.{name}={}", quote(&value)?)
+            .map_err(|_| NetworkRenderError::Output)?;
+    }
+    Ok(())
+}
+
+fn supported_dhcp_options() -> &'static [&'static str] {
+    &[
+        "mbed_managed",
+        "mbed_id",
+        "interface",
+        "ignore",
+        "start",
+        "limit",
+        "leasetime",
+        "force",
+    ]
 }
 
 fn render_update(
@@ -1104,6 +1395,13 @@ fn optional_u32(section: &UciSection, name: &str) -> Result<Option<u32>, ()> {
         .map_err(|_| ())
 }
 
+fn optional_u16(section: &UciSection, name: &str) -> Result<Option<u16>, ()> {
+    optional(section, name)
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| ())
+}
+
 fn optional_ip(section: &UciSection, name: &str) -> Result<Option<IpAddr>, ()> {
     optional(section, name)
         .map(str::parse)
@@ -1281,7 +1579,7 @@ mod tests {
     use agent_core::{
         NetworkMutation, NetworkRiskContext, network_object_digest, plan_network_mutations,
     };
-    use agent_protocol::{NetworkBond, NetworkBondMode};
+    use agent_protocol::{NetworkBond, NetworkBondMode, NetworkDhcpServerConfig};
     use std::net::Ipv4Addr;
 
     const NETWORK_FIXTURE: &str = "network.lan=interface\n\
@@ -1323,6 +1621,14 @@ network.@rule[0].src='192.168.1.0/24'\n\
 network.@rule[0].mark='0x1/0xff'\n\
 network.@rule[0].lookup='100'\n";
 
+    const DHCP_FIXTURE: &str = "dhcp.lan=dhcp\n\
+dhcp.lan.interface='lan'\n\
+dhcp.lan.start='100'\n\
+dhcp.lan.limit='100'\n\
+dhcp.lan.leasetime='12h'\n\
+dhcp.lan.force='1'\n\
+dhcp.lan.vendor_keep='yes'\n";
+
     fn guest_interface(ownership: ObjectOwnership) -> NetworkObject {
         NetworkObject::Interface(NetworkInterfaceConfig {
             id: "guest".into(),
@@ -1348,6 +1654,13 @@ network.@rule[0].lookup='100'\n";
             dhcp_hostname: Some("guest-router".into()),
             dhcp_request_options: vec![1, 3, 6],
             dhcp_no_release: true,
+            dhcp_server: Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+            }),
         })
     }
 
@@ -1435,6 +1748,46 @@ network.@rule[0].lookup='100'\n";
     }
 
     #[test]
+    fn reconstructs_and_binds_openwrt_dhcp_server_subset() {
+        let snapshot = inspect_openwrt_network_inventory_with_dhcp(NETWORK_FIXTURE, DHCP_FIXTURE)
+            .expect("inventory");
+        assert_eq!(snapshot.dhcp_occupied_sections(), ["lan"]);
+        assert!(snapshot.dhcp_read_only_sections().is_empty());
+        let interface = snapshot
+            .inventory()
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                NetworkObject::Interface(value) if value.id == "lan" => Some(value),
+                _ => None,
+            })
+            .expect("lan interface");
+        assert_eq!(
+            interface.dhcp_server,
+            Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: true,
+            })
+        );
+        let binding = snapshot
+            .bindings()
+            .iter()
+            .find(|binding| binding.id == "lan")
+            .expect("lan binding");
+        assert_eq!(binding.dhcp_section.as_deref(), Some("lan"));
+        assert!(!binding.dhcp_agent_owned);
+        assert!(
+            binding
+                .dhcp_present_options
+                .iter()
+                .any(|option| option == "vendor_keep")
+        );
+    }
+
+    #[test]
     fn unsupported_native_sections_are_read_only_but_managed_drift_fails_closed() {
         let native =
             "network.wan=interface\nnetwork.wan.proto='pppoe'\nnetwork.wan.device='eth0'\n";
@@ -1509,6 +1862,16 @@ network.@rule[0].lookup='100'\n";
                 .uci_batch
                 .contains("add_list network.guest.dns_search='guest.example'")
         );
+        assert!(stage.dhcp_uci_batch.contains("set dhcp.guest=dhcp"));
+        assert!(
+            stage
+                .dhcp_uci_batch
+                .contains("dhcp.guest.interface='guest'")
+        );
+        assert!(stage.dhcp_uci_batch.contains("dhcp.guest.start='100'"));
+        assert!(stage.dhcp_uci_batch.contains("dhcp.guest.limit='100'"));
+        assert!(stage.dhcp_uci_batch.contains("dhcp.guest.leasetime='12h'"));
+        assert!(stage.dhcp_uci_batch.ends_with("commit dhcp\n"));
         assert!(stage.uci_batch.ends_with("commit network\n"));
         assert_eq!(stage.validations, [OpenWrtNetworkValidation::UciExport]);
     }

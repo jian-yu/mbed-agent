@@ -183,7 +183,11 @@ impl ChangeExecutionPort for OpenWrtNetworkExecutionPort {
         create_rollback_bundle(
             &self.rollback_root(),
             &self.change_set_id,
-            &[RollbackTarget::OpenWrtNetwork],
+            if execution_has_dhcp(&self.execution) {
+                &[RollbackTarget::OpenWrtNetwork, RollbackTarget::OpenWrtDhcp]
+            } else {
+                &[RollbackTarget::OpenWrtNetwork]
+            },
             RollbackReload::OpenWrtNetwork,
             self.rollback_timeout_secs,
             self.max_rollback_bytes,
@@ -270,6 +274,17 @@ impl ChangeExecutionPort for OpenWrtNetworkExecutionPort {
             .map(|_| ())
             .map_err(|_| ExecutionPortError)
     }
+}
+
+fn execution_has_dhcp(execution: &NetworkExecutionPlan) -> bool {
+    execution.typed.changes.iter().any(|change| {
+        [change.before.as_ref(), change.after.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|object| {
+                matches!(object, agent_protocol::NetworkObject::Interface(value) if value.dhcp_server.is_some())
+            })
+    })
 }
 
 impl GenericRuntimeRouteExecutionPort {
