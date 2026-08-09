@@ -800,6 +800,17 @@ pub struct NetworkDhcpServerConfig {
     /// Neighbor Discovery Proxy (`NDP`) mode for the interface.
     #[serde(default = "default_ndp_mode")]
     pub ndp_mode: NetworkDhcpMode,
+    /// Bounded DHCP option code/value pairs emitted as `OpenWrt` `dhcp_option` list values.
+    #[serde(default)]
+    pub dhcp_options: Vec<NetworkDhcpOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkDhcpOption {
+    /// DHCP option number in the inclusive range 1..=255.
+    pub code: u16,
+    /// One bounded value for the option; the platform adapter encodes the UCI comma form.
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1924,6 +1935,7 @@ mod tests {
         assert_eq!(server.dhcpv6_mode, NetworkDhcpMode::Server);
         assert_eq!(server.ra_mode, NetworkDhcpMode::Server);
         assert_eq!(server.ndp_mode, NetworkDhcpMode::Hybrid);
+        assert!(server.dhcp_options.is_empty());
     }
 
     #[test]

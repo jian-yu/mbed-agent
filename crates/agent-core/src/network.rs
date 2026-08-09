@@ -637,7 +637,27 @@ fn validate_dhcp_server(
     if !lease_valid {
         return Err(NetworkPlanError::InvalidField("interface DHCP lease time"));
     }
+    if value.dhcp_options.len() > 16 {
+        return Err(NetworkPlanError::Capacity);
+    }
+    let mut options = HashSet::new();
+    for option in &value.dhcp_options {
+        if !(1..=255).contains(&option.code)
+            || !valid_dhcp_option_value(&option.value)
+            || !options.insert((option.code, &option.value))
+        {
+            return Err(NetworkPlanError::InvalidField("interface DHCP option"));
+        }
+    }
     Ok(())
+}
+
+fn valid_dhcp_option_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| !byte.is_ascii_control() && !matches!(byte, b'\'' | b'\\' | b','))
 }
 
 fn validate_bridge(value: &NetworkBridge) -> Result<(), NetworkPlanError> {
@@ -1105,7 +1125,8 @@ pub enum NetworkPlanError {
 mod tests {
     use super::*;
     use agent_protocol::{
-        CHANGE_PLAN_SCHEMA_VERSION, NetworkDhcpMode, NetworkPolicyAction, NetworkVlanProtocol,
+        CHANGE_PLAN_SCHEMA_VERSION, NetworkDhcpMode, NetworkDhcpOption, NetworkPolicyAction,
+        NetworkVlanProtocol,
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1329,6 +1350,7 @@ mod tests {
                 dhcpv6_mode: NetworkDhcpMode::Server,
                 ra_mode: NetworkDhcpMode::Server,
                 ndp_mode: NetworkDhcpMode::Hybrid,
+                dhcp_options: vec![],
             });
         } else {
             unreachable!();
@@ -1349,6 +1371,7 @@ mod tests {
                 dhcpv6_mode: NetworkDhcpMode::Server,
                 ra_mode: NetworkDhcpMode::Server,
                 ndp_mode: NetworkDhcpMode::Hybrid,
+                dhcp_options: vec![],
             });
         } else {
             unreachable!();
@@ -1356,6 +1379,63 @@ mod tests {
         assert_eq!(
             validate_network_object(&invalid),
             Err(NetworkPlanError::InvalidField("interface DHCP pool"))
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_dhcp_server_options() {
+        let mut invalid = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dhcp_server = Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Server,
+                ndp_mode: NetworkDhcpMode::Hybrid,
+                dhcp_options: vec![NetworkDhcpOption {
+                    code: 6,
+                    value: "1.1.1.1,8.8.8.8".into(),
+                }],
+            });
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField("interface DHCP option"))
+        );
+
+        let mut invalid = interface("lan", Ipv4Addr::new(192, 168, 1, 1));
+        if let NetworkObject::Interface(value) = &mut invalid {
+            value.dhcp_server = Some(NetworkDhcpServerConfig {
+                enabled: true,
+                start: 100,
+                limit: 100,
+                lease_time: "12h".into(),
+                force: false,
+                dhcpv6_mode: NetworkDhcpMode::Server,
+                ra_mode: NetworkDhcpMode::Server,
+                ndp_mode: NetworkDhcpMode::Hybrid,
+                dhcp_options: vec![
+                    NetworkDhcpOption {
+                        code: 6,
+                        value: "1.1.1.1".into(),
+                    },
+                    NetworkDhcpOption {
+                        code: 6,
+                        value: "1.1.1.1".into(),
+                    },
+                ],
+            });
+        } else {
+            unreachable!();
+        }
+        assert_eq!(
+            validate_network_object(&invalid),
+            Err(NetworkPlanError::InvalidField("interface DHCP option"))
         );
     }
 

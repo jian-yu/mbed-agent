@@ -304,7 +304,7 @@ MAC”之类的单一需求增加专用脚本。每个配置对象至少支持 `
 | 防火墙 | zone、默认策略、forwarding、filter rule、MAC/IP/CIDR、协议/端口、接口、address set、DNAT/SNAT/redirect、masquerade、启停、顺序 | `/etc/config/firewall` UCI，统一服务 fw3/iptables 与 fw4/nftables | Agent 专属 nft table/chain/set；无 nft 时使用专属 iptables chain/ipset | 不生成 raw expression；不自动改第三方 chain；涉及管理路径为 R3 |
 | L2/L3 网络 | interface/device、静态/动态地址、MTU、MAC override、接口级 `peerdns`/resolver/search、DHCP clientid/vendorid/hostname/reqopts/norelease、Bridge、VLAN、bond、VRF、默认/静态路由、policy rule | network UCI + netifd/ubus，按 swconfig/DSA capability 裁剪 | netlink 运行态；持久化仅通过识别出的 NetworkManager、systemd-networkd 或厂商受支持 adapter | 修改当前管理接口、默认路由或 LAN 地址为 R3；未知网络管理器只允许运行态或只读 |
 | DNS | 上游 resolver、搜索域、split DNS、缓存参数、静态主机、DNSSEC 开关 | interface `peerdns`/`dns`/`dns_search` 已通过 network UCI 支持；其余由 dhcp UCI + dnsmasq/odhcpd 扩展 | systemd-resolved、NetworkManager 或 Agent 托管 dnsmasq 片段 | 不覆盖未知手工 `/etc/resolv.conf`；凭据型 DoH/DoT 参数按 secret 处理 |
-| DHCP | 地址池、租期、静态租约、option、RA/DHCPv6/NDP 模式 | DHCPv4 `start`/`limit`/`leasetime`/`force` 以及 DHCPv6/RA/NDP 的 `disabled`/`server`/`relay`/`hybrid` 模式已通过 dhcp UCI 与 network ChangeSet 联动；其余由 dnsmasq/odhcpd 扩展 | Agent 托管 dnsmasq/odhcpd adapter | 地址池冲突、网段越界和管理地址冲突必须在 stage 阶段拒绝 |
+| DHCP | 地址池、租期、静态租约、typed option、RA/DHCPv6/NDP 模式 | DHCPv4 `start`/`limit`/`leasetime`/`force`、有界 `dhcp_option` code/value 列表以及 DHCPv6/RA/NDP 的 `disabled`/`server`/`relay`/`hybrid` 模式已通过 dhcp UCI 与 network ChangeSet 联动；其余由 dnsmasq/odhcpd 扩展 | Agent 托管 dnsmasq/odhcpd adapter | option code/value、地址池冲突、网段越界和管理地址冲突必须在 stage 阶段拒绝 |
 | 无线 | radio 启停、国家码、信道/带宽/功率、SSID、模式、加密、密钥、网络绑定、隔离、MAC policy | wireless UCI + netifd/hostapd | 仅在识别并支持 hostapd/wpa_supplicant 管理方式时写 Agent 托管片段 | 扫描与配置分级；改管理 SSID/密钥为 R3；密钥不进 SQLite/日志/LLM |
 | 服务 | reload/restart/start/stop、受支持服务的 enable/disable、有限 typed 参数 | ubus/procd/init script allowlist | systemd/OpenRC/BusyBox init adapter allowlist | 不接受任意 service 名；enable/disable 属于持久配置 |
 | QoS/流控 | qdisc/class/filter、接口限速、DSCP 分类、SQM profile | sqm UCI 或受控 `tc` | Agent 托管 `tc` 对象，必要时使用受支持网络管理器持久化 | 只删除带 Agent ownership 的对象；CPU/带宽预算超限时拒绝 |
@@ -1271,8 +1271,9 @@ inventory 与 `/tmp` staging：支持基础 interface（none/static/dhcp/dhcpv6�
 device Bridge、显式 802.1Q/802.1ad VLAN device、route/route6 和 rule/rule6；interface
 同时支持受界面级 typed 校验约束的 `peerdns`、`dns`、`dns_search` 以及无凭据的
 DHCP client `clientid`、`vendorid`、`hostname`、`reqopts`、`norelease`，以及
-DHCPv4 server pool `start`、`limit`、`leasetime`、`force`，以及 DHCPv6、RA、NDP
-的 `disabled`/`server`/`relay`/`hybrid` 模式。这些字段与网络对象
+DHCPv4 server pool `start`、`limit`、`leasetime`、`force`，有界 DHCP option
+code/value 列表，以及 DHCPv6、RA、NDP 的 `disabled`/`server`/`relay`/`hybrid` 模式。
+这些字段与网络对象
 共用 snapshot digest、R3 审批、原生验证、确认提交和 network/dhcp 双文件回滚；不会把
 普通 Linux 的 `/etc/resolv.conf` 或未知网络管理器误当作可写目标。
 typed object、原生 section selector 与 present options 来自同一个有界快照；更新、

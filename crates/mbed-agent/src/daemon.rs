@@ -6606,6 +6606,7 @@ mod tests {
     fn approval_test_state(root: &Path) -> (Arc<Store>, AppState) {
         let mut config = AgentConfig::default();
         config.storage.path = root.join("agent.db");
+        disable_test_free_space_guard(&mut config);
         config.auth.enabled = true;
         let encoded =
             agent_core::generate_password_hash(b"test administrator password").expect("hash");
