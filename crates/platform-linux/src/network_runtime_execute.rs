@@ -13,7 +13,7 @@ use crate::firewall_command::{
 };
 use crate::network_runtime::{
     RuntimeNetworkInventoryError, RuntimeRouteSnapshot, RuntimeRouteStage,
-    reconcile_runtime_route_inventory, render_runtime_route_stage,
+    reconcile_runtime_network_inventory, render_runtime_route_stage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,8 +119,10 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
     pub fn reinspect(&mut self) -> Result<(), GenericRuntimeRouteExecutionError> {
         self.require_state(TransactionState::New)?;
         let routes = self.collect_routes()?;
-        let snapshot = reconcile_runtime_route_inventory(
+        let rules = self.collect_rules()?;
+        let snapshot = reconcile_runtime_network_inventory(
             &routes,
+            &rules,
             self.canonical_state.as_deref(),
             &self.boot_id,
         )?;
@@ -197,8 +199,10 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
     ) -> Result<(), GenericRuntimeRouteExecutionError> {
         self.require_state(TransactionState::Validated)?;
         let fresh = self.collect_routes()?;
-        let snapshot = reconcile_runtime_route_inventory(
+        let fresh_rules = self.collect_rules()?;
+        let snapshot = reconcile_runtime_network_inventory(
             &fresh,
+            &fresh_rules,
             self.canonical_state.as_deref(),
             &self.boot_id,
         )?;
@@ -228,8 +232,10 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
             .as_ref()
             .ok_or(GenericRuntimeRouteExecutionError::InvalidState)?;
         let fresh = self.collect_routes()?;
-        reconcile_runtime_route_inventory(
+        let fresh_rules = self.collect_rules()?;
+        reconcile_runtime_network_inventory(
             &fresh,
+            &fresh_rules,
             Some(&rendered.projected_canonical_state),
             &self.boot_id,
         )?;
@@ -277,6 +283,15 @@ impl<R: FirewallCommandExecutor> GenericRuntimeRouteTransaction<R> {
         String::from_utf8(
             self.runner
                 .execute(&FirewallCommand::IpJsonRoute, None)?
+                .stdout,
+        )
+        .map_err(|_| GenericRuntimeRouteExecutionError::Inspection)
+    }
+
+    fn collect_rules(&self) -> Result<String, GenericRuntimeRouteExecutionError> {
+        String::from_utf8(
+            self.runner
+                .execute(&FirewallCommand::IpJsonRule, None)?
                 .stdout,
         )
         .map_err(|_| GenericRuntimeRouteExecutionError::Inspection)
@@ -411,7 +426,7 @@ mod tests {
         ) -> Result<FirewallCommandOutput, FirewallCommandError> {
             let stdout = match operation {
                 FirewallCommand::IpJsonRoute if self.applied.get() => APPLIED.as_bytes().to_vec(),
-                FirewallCommand::IpJsonRoute => b"[]".to_vec(),
+                FirewallCommand::IpJsonRoute | FirewallCommand::IpJsonRule => b"[]".to_vec(),
                 FirewallCommand::IpBatch {
                     batch_file,
                     continue_on_error: false,

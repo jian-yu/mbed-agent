@@ -1299,11 +1299,12 @@ approval、全局串行写、独立 `/etc/config/network` rollback helper、live
 上实现等价的 fresh inventory、原生 transaction 与独立回滚后再开放。
 
 截至 ADR 0045，普通 Linux 已开放只读的 typed runtime inventory：当 iproute2 可用时，
-执行固定且有界的 `ip -j link/address/route`，将可安全表达的接口和路由重建为
-platform-native 对象并返回精确摘要。动态租约地址不会伪装成静态期望配置，当前 MAC
-也不会被误标为 override；multipath、未知 route type、重复 identity、畸形或超限输出
-均 fail closed。由于内核状态不能证明 NetworkManager、systemd-networkd、发行版脚本
-或厂商 supervisor 的持久 ownership，普通 Linux 的 plan/apply 仍关闭。
+执行固定且有界的 `ip -j link/address/route/rule`，将可安全表达的接口、路由和
+非 Agent-owned policy rule 重建为 platform-native 对象并返回精确摘要。动态租约地址
+不会伪装成静态期望配置，当前 MAC 也不会被误标为 override；multipath、未知 route
+type、无法闭合的 rule selector、重复 identity、畸形或超限输出均 fail closed。
+由于内核状态不能证明 NetworkManager、systemd-networkd、发行版脚本或厂商 supervisor
+的持久 ownership，普通 Linux 的 plan/apply 仍关闭。
 
 截至 ADR 0046，普通 Linux 首个可写候选收敛为 Agent-owned 易失路由：只接受 enabled
 typed route，并以 numeric route protocol 186 标记 native ownership；canonical state
@@ -1330,13 +1331,18 @@ native rollback 成功后才恢复或清理独立 `network_runtime_state_v1` SQL
 first-decision-wins、超时、即时 rollback、durable outcome 与子进程超时保持不变。
 
 截至 ADR 0049，generic Linux 易失 route 已接入 daemon 公共 ChangeSet 生命周期。
-`network-inventory` 将普通 interface/route 的只读 platform-native 视图与通过 boot-bound
-canonical 严格对账的 protocol-186 Agent-owned route 合并；`network-plan` 在该后端仅接收
-enabled Agent-owned typed route，interface、address、policy rule、普通 route 以及持久
-NetworkManager/systemd-networkd 文件仍拒绝写入。所有变更强制 R3，经过 device-admin、
-一次性 approval、全局串行执行、fixed `ip -batch` transaction、进程外逆向 batch、live
-typed verify 和显式 confirm。canonical 只进入有界 `/tmp` SQLite，设备重启不恢复、也
-不回写 Flash。
+`network-inventory` 将普通 interface/route/policy rule 的只读 platform-native 视图与
+通过 boot-bound canonical 严格对账的 protocol-186 Agent-owned route 合并；`network-plan`
+在该后端接收 enabled Agent-owned typed route，以及保留 `32000..=32063` preference
+范围内的 policy rule，interface、address、普通 route 以及持久 NetworkManager/
+systemd-networkd 文件仍拒绝写入。所有变更强制 R3，经过 device-admin、一次性 approval、
+全局串行执行、fixed `ip -batch` transaction、进程外逆向 batch、live typed verify 和
+显式 confirm。canonical 只进入有界 `/tmp` SQLite，设备重启不恢复、也不回写 Flash。
+
+截至 ADR 0059，policy rule 通过同一 runtime transaction 接入：`ip -j rule show` 的
+可表达 selector 经过 family、fwmark/mask、action/table 和 reserved priority 校验；
+保留范围内的未知或漂移规则直接阻断计划。policy priority move、更新和删除均绑定
+fresh digest，反向 batch 与 route 共用独立 helper 和 confirmed-commit。
 
 截至 ADR 0050，用户与厂商扩展命令不再要求修改 Rust：daemon 从受信任、非 group/world
 writable 的 ActionSpec TOML 目录加载有界 registry，manifest 声明绝对 executable、固定

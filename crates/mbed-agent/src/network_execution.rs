@@ -18,7 +18,7 @@ use platform_linux::firewall_command::{
 use platform_linux::network_openwrt_execute::{
     OpenWrtNetworkTransaction, verify_openwrt_network_plan,
 };
-use platform_linux::network_runtime::reconcile_runtime_route_inventory;
+use platform_linux::network_runtime::reconcile_runtime_network_inventory;
 use platform_linux::network_runtime_execute::GenericRuntimeRouteTransaction;
 
 pub(crate) struct GenericRuntimeRouteExecutionPort {
@@ -379,8 +379,15 @@ impl ChangeExecutionPort for GenericRuntimeRouteExecutionPort {
                 .map_err(|_| ExecutionPortError)?
                 .stdout;
             let routes = std::str::from_utf8(&routes).map_err(|_| ExecutionPortError)?;
-            let snapshot = reconcile_runtime_route_inventory(
+            let rules = self
+                .runner
+                .execute(&FirewallCommand::IpJsonRule, None)
+                .map_err(|_| ExecutionPortError)?
+                .stdout;
+            let rules = std::str::from_utf8(&rules).map_err(|_| ExecutionPortError)?;
+            let snapshot = reconcile_runtime_network_inventory(
                 routes,
+                rules,
                 self.canonical_state.as_deref(),
                 &self.boot_id,
             )

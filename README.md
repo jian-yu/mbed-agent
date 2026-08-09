@@ -113,9 +113,11 @@ supported OpenWrt fw3/fw4 and generic Linux nftables/iptables backends. The
 L2/L3 typed object, validation, risk, projection, and execution-payload boundary
 is implemented. OpenWrt 21+ has fresh UCI network inventory and confirmed writes
 for the initial interface/Bridge/VLAN/route/policy-rule subset. Generic Linux
-with iproute2 has fresh interface/route inventory and confirmed writes for
-enabled Agent-owned volatile routes. Those routes use numeric protocol 186 and
-never write persistent network-manager configuration. The local CLI exposes
+with iproute2 has fresh interface/route/policy-rule inventory and confirmed
+writes for enabled Agent-owned volatile routes and reserved-priority policy
+rules. Routes use numeric protocol 186 and policy rules use preference range
+32000-32063; neither writes persistent network-manager configuration. The local
+CLI exposes
 actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
 apply, and confirmed commit for supported firewall and network backends. The
 configuration roadmap is intentionally broader than a
@@ -171,6 +173,9 @@ Independent generic Linux runtime route recovery is recorded in
 [ADR 0048](docs/adr/0048-generic-linux-runtime-route-rollback.md).
 Generic Linux route daemon admission and confirmed commit are recorded in
 [ADR 0049](docs/adr/0049-daemon-generic-linux-runtime-route-confirmed-commit.md).
+Generic Linux Agent-owned policy-rule admission and reserved-priority
+transaction support are recorded in
+[ADR 0059](docs/adr/0059-generic-linux-policy-rules.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in
@@ -464,11 +469,12 @@ Network mutations are closed typed objects (interfaces, bridges, VLANs, routes,
 and policy rules in the currently supported backend subset), never raw shell,
 argv, UCI text, or `ip` text. Public network writes are always elevated to R3
 and require confirmation. OpenWrt arms an independent `/etc/config/network`
-rollback helper. Generic Linux accepts only enabled Agent-owned routes, marks
-them protocol 186, stores canonical ownership only in bounded `/tmp` SQLite,
-and arms an independent reverse `ip -force -batch` helper. Interfaces,
-addresses, policy rules, ordinary platform routes, and persistent generic Linux
-network-manager files remain read-only.
+rollback helper. Generic Linux accepts enabled Agent-owned routes and policy
+rules only: routes carry protocol 186 and policy rules use preference range
+32000-32063. Both store canonical ownership only in bounded `/tmp` SQLite and
+arm an independent reverse `ip -force -batch` helper. Interfaces, addresses,
+ordinary platform routes, and persistent generic Linux network-manager files
+remain read-only.
 
 To exercise an OpenAI-compatible endpoint, copy the example configuration,
 enable `[llm]`, and set its HTTPS `base_url`, `api_key`, and `model`. Then restart

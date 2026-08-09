@@ -44,6 +44,7 @@ pub enum FirewallCommand {
     IpJsonLink,
     IpJsonAddress,
     IpJsonRoute,
+    IpJsonRule,
     IpBatch {
         batch_file: PathBuf,
         continue_on_error: bool,
@@ -268,6 +269,7 @@ impl FirewallCommandRunner {
             FirewallCommand::IpJsonLink => spec("ip", &["-j", "link", "show"]),
             FirewallCommand::IpJsonAddress => spec("ip", &["-j", "address", "show"]),
             FirewallCommand::IpJsonRoute => spec("ip", &["-j", "route", "show", "table", "all"]),
+            FirewallCommand::IpJsonRule => spec("ip", &["-j", "rule", "show"]),
             FirewallCommand::IpBatch {
                 batch_file,
                 continue_on_error,
@@ -621,6 +623,7 @@ mod tests {
                 FirewallCommand::IpJsonRoute,
                 vec!["-j", "route", "show", "table", "all"],
             ),
+            (FirewallCommand::IpJsonRule, vec!["-j", "rule", "show"]),
         ] {
             let specification = runner.specification(&operation).expect("specification");
             assert_eq!(specification.program, "ip");

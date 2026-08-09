@@ -5,10 +5,11 @@ use std::net::IpAddr;
 
 use agent_core::{
     NetworkInventory, NetworkMutationPlan, network_object_digest, project_network_inventory,
+    validate_network_object,
 };
 use agent_protocol::{
-    IpNetwork, NetworkAddressMode, NetworkInterfaceConfig, NetworkObject, NetworkRoute,
-    NetworkRouteType, ObjectOwnership,
+    IpNetwork, NetworkAddressMode, NetworkFamily, NetworkInterfaceConfig, NetworkObject,
+    NetworkPolicyAction, NetworkPolicyRule, NetworkRoute, NetworkRouteType, ObjectOwnership,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +21,8 @@ const MAX_NAME_BYTES: usize = 64;
 const MAX_CANONICAL_BYTES: usize = 256 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const RUNTIME_ROUTE_PROTOCOL: u64 = 186;
+const RUNTIME_POLICY_PRIORITY_START: u32 = 32_000;
+const RUNTIME_POLICY_PRIORITY_END: u32 = 32_063;
 
 #[derive(Debug, Error)]
 pub enum RuntimeNetworkInventoryError {
@@ -31,7 +34,7 @@ pub enum RuntimeNetworkInventoryError {
     Unsupported,
     #[error("runtime network canonical state is stale or corrupt")]
     StaleState,
-    #[error("Agent-owned runtime route state is orphaned or drifted")]
+    #[error("Agent-owned runtime network state is orphaned or drifted")]
     NativeDrift,
     #[error("network plan contains an unsupported runtime object")]
     InvalidPlan,
@@ -175,6 +178,36 @@ pub fn inspect_runtime_network_inventory(
     Ok(NetworkInventory { objects })
 }
 
+/// Reconstructs representable generic Linux policy rules outside the reserved
+/// Agent-owned preference range.
+///
+/// # Errors
+///
+/// Returns an error for malformed JSON, unsafe reserved rules, or capacity overflow.
+pub fn inspect_runtime_policy_inventory(
+    rules_json: &str,
+) -> Result<NetworkInventory, RuntimeNetworkInventoryError> {
+    let values = json_array(rules_json)?;
+    if values.len() > MAX_OBJECTS {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    let mut objects = Vec::new();
+    let mut seen = HashSet::new();
+    for value in &values {
+        let Some(rule) = policy_rule_object(value)? else {
+            continue;
+        };
+        if rule.ownership == ObjectOwnership::AgentOwned {
+            continue;
+        }
+        if !seen.insert(rule.id.clone()) {
+            return Err(RuntimeNetworkInventoryError::Malformed);
+        }
+        objects.push(NetworkObject::PolicyRule(rule));
+    }
+    Ok(NetworkInventory { objects })
+}
+
 /// Reconciles protocol-186 runtime routes with boot-bound volatile canonical state.
 ///
 /// # Errors
@@ -186,10 +219,27 @@ pub fn reconcile_runtime_route_inventory(
     canonical_state: Option<&[u8]>,
     boot_id: &str,
 ) -> Result<RuntimeRouteSnapshot, RuntimeNetworkInventoryError> {
+    reconcile_runtime_network_inventory(routes_json, "[]", canonical_state, boot_id)
+}
+
+/// Reconciles Agent-owned ephemeral routes and policy rules with boot-bound
+/// volatile canonical state.
+///
+/// # Errors
+///
+/// Returns an error for malformed observations, orphaned owned objects, stale
+/// canonical state, native drift, invalid objects, or capacity overflow.
+pub fn reconcile_runtime_network_inventory(
+    routes_json: &str,
+    rules_json: &str,
+    canonical_state: Option<&[u8]>,
+    boot_id: &str,
+) -> Result<RuntimeRouteSnapshot, RuntimeNetworkInventoryError> {
     if boot_id.is_empty() || boot_id.len() > 128 || boot_id.chars().any(char::is_control) {
         return Err(RuntimeNetworkInventoryError::StaleState);
     }
-    let native = owned_native_routes(routes_json)?;
+    let mut native = owned_native_routes(routes_json)?;
+    native.extend(owned_native_policy_rules(rules_json)?);
     let Some(encoded) = canonical_state else {
         if !native.is_empty() {
             return Err(RuntimeNetworkInventoryError::NativeDrift);
@@ -207,8 +257,8 @@ pub fn reconcile_runtime_route_inventory(
     if canonical.schema_version != 1 || canonical.boot_id != boot_id {
         return Err(RuntimeNetworkInventoryError::StaleState);
     }
-    let expected = canonical_routes(&canonical.inventory)?;
-    if route_semantics(&native)? != route_semantics(&expected)? {
+    let expected = canonical_runtime_objects(&canonical.inventory)?;
+    if runtime_semantics(&native)? != runtime_semantics(&expected)? {
         return Err(RuntimeNetworkInventoryError::NativeDrift);
     }
     Ok(RuntimeRouteSnapshot {
@@ -217,10 +267,10 @@ pub fn reconcile_runtime_route_inventory(
     })
 }
 
-/// Renders an exact typed route plan into closed apply/rollback `ip -batch` artifacts.
+/// Renders an exact typed route/policy-rule plan into closed apply/rollback `ip -batch` artifacts.
 ///
-/// Only Agent-owned routes are accepted. Every installed route carries protocol 186; no caller
-/// text, command, argument, or path enters the artifacts.
+/// Only Agent-owned routes and reserved-priority policy rules are accepted. Every installed route
+/// carries protocol 186; no caller text, command, argument, or path enters the artifacts.
 ///
 /// # Errors
 ///
@@ -232,37 +282,27 @@ pub fn render_runtime_route_stage(
 ) -> Result<RuntimeRouteStage, RuntimeNetworkInventoryError> {
     let projected = project_network_inventory(&snapshot.inventory, plan)
         .map_err(|_| RuntimeNetworkInventoryError::InvalidPlan)?;
-    canonical_routes(&projected)?;
+    canonical_runtime_objects(&projected)?;
     let mut apply = String::new();
     let mut rollback = String::new();
     for change in &plan.changes {
         if let Some(before) = &change.before {
-            let NetworkObject::Route(route) = before else {
-                return Err(RuntimeNetworkInventoryError::InvalidPlan);
-            };
-            require_owned_route(route)?;
-            push_route_command(&mut apply, "del", route)?;
+            require_owned_runtime_object(before)?;
+            push_runtime_command(&mut apply, "del", before)?;
         }
         if let Some(after) = &change.after {
-            let NetworkObject::Route(route) = after else {
-                return Err(RuntimeNetworkInventoryError::InvalidPlan);
-            };
-            require_owned_route(route)?;
-            push_route_command(&mut apply, "add", route)?;
+            require_owned_runtime_object(after)?;
+            push_runtime_command(&mut apply, "add", after)?;
         }
     }
     for change in plan.changes.iter().rev() {
         if let Some(after) = &change.after {
-            let NetworkObject::Route(route) = after else {
-                return Err(RuntimeNetworkInventoryError::InvalidPlan);
-            };
-            push_route_command(&mut rollback, "del", route)?;
+            require_owned_runtime_object(after)?;
+            push_runtime_command(&mut rollback, "del", after)?;
         }
         if let Some(before) = &change.before {
-            let NetworkObject::Route(route) = before else {
-                return Err(RuntimeNetworkInventoryError::InvalidPlan);
-            };
-            push_route_command(&mut rollback, "add", route)?;
+            require_owned_runtime_object(before)?;
+            push_runtime_command(&mut rollback, "add", before)?;
         }
     }
     if apply.is_empty() || apply.len() > MAX_BATCH_BYTES || rollback.len() > MAX_BATCH_BYTES {
@@ -287,7 +327,7 @@ pub fn render_runtime_route_stage(
 
 fn owned_native_routes(
     routes_json: &str,
-) -> Result<Vec<NetworkRoute>, RuntimeNetworkInventoryError> {
+) -> Result<Vec<NetworkObject>, RuntimeNetworkInventoryError> {
     let values = json_array(routes_json)?;
     if values.len() > MAX_OBJECTS {
         return Err(RuntimeNetworkInventoryError::Capacity);
@@ -301,9 +341,28 @@ fn owned_native_routes(
             return Err(RuntimeNetworkInventoryError::Unsupported);
         };
         route.ownership = ObjectOwnership::AgentOwned;
-        routes.push(route);
+        routes.push(NetworkObject::Route(route));
     }
     Ok(routes)
+}
+
+fn owned_native_policy_rules(
+    rules_json: &str,
+) -> Result<Vec<NetworkObject>, RuntimeNetworkInventoryError> {
+    let values = json_array(rules_json)?;
+    if values.len() > MAX_OBJECTS {
+        return Err(RuntimeNetworkInventoryError::Capacity);
+    }
+    let mut rules = Vec::new();
+    for value in &values {
+        let Some(rule) = policy_rule_object(value)? else {
+            continue;
+        };
+        if rule.ownership == ObjectOwnership::AgentOwned {
+            rules.push(NetworkObject::PolicyRule(rule));
+        }
+    }
+    Ok(rules)
 }
 
 fn owned_protocol(value: Option<&Value>) -> bool {
@@ -314,9 +373,9 @@ fn owned_protocol(value: Option<&Value>) -> bool {
     }
 }
 
-fn canonical_routes(
+fn canonical_runtime_objects(
     inventory: &NetworkInventory,
-) -> Result<Vec<NetworkRoute>, RuntimeNetworkInventoryError> {
+) -> Result<Vec<NetworkObject>, RuntimeNetworkInventoryError> {
     if inventory.objects.len() > MAX_OBJECTS {
         return Err(RuntimeNetworkInventoryError::Capacity);
     }
@@ -324,13 +383,20 @@ fn canonical_routes(
         .objects
         .iter()
         .map(|object| {
-            let NetworkObject::Route(route) = object else {
-                return Err(RuntimeNetworkInventoryError::InvalidPlan);
-            };
-            require_owned_route(route)?;
-            Ok(route.clone())
+            require_owned_runtime_object(object)?;
+            Ok(object.clone())
         })
         .collect()
+}
+
+fn require_owned_runtime_object(
+    object: &NetworkObject,
+) -> Result<(), RuntimeNetworkInventoryError> {
+    match object {
+        NetworkObject::Route(route) => require_owned_route(route),
+        NetworkObject::PolicyRule(rule) => require_owned_policy_rule(rule),
+        _ => Err(RuntimeNetworkInventoryError::InvalidPlan),
+    }
 }
 
 fn require_owned_route(route: &NetworkRoute) -> Result<(), RuntimeNetworkInventoryError> {
@@ -342,18 +408,53 @@ fn require_owned_route(route: &NetworkRoute) -> Result<(), RuntimeNetworkInvento
         .map_err(|_| RuntimeNetworkInventoryError::InvalidPlan)
 }
 
-fn route_semantics(routes: &[NetworkRoute]) -> Result<Vec<Vec<u8>>, RuntimeNetworkInventoryError> {
-    let mut values = routes
+fn require_owned_policy_rule(rule: &NetworkPolicyRule) -> Result<(), RuntimeNetworkInventoryError> {
+    if rule.ownership != ObjectOwnership::AgentOwned
+        || !rule.enabled
+        || !reserved_policy_priority(rule.priority)
+    {
+        return Err(RuntimeNetworkInventoryError::InvalidPlan);
+    }
+    network_object_digest(&NetworkObject::PolicyRule(rule.clone()))
+        .map(|_| ())
+        .map_err(|_| RuntimeNetworkInventoryError::InvalidPlan)
+}
+
+fn runtime_semantics(
+    objects: &[NetworkObject],
+) -> Result<Vec<Vec<u8>>, RuntimeNetworkInventoryError> {
+    let mut values = objects
         .iter()
-        .map(|route| {
-            let mut normalized = route.clone();
-            normalized.id.clear();
-            normalized.ownership = ObjectOwnership::AgentOwned;
+        .map(|object| {
+            let mut normalized = object.clone();
+            match &mut normalized {
+                NetworkObject::Route(route) => {
+                    route.id.clear();
+                    route.ownership = ObjectOwnership::AgentOwned;
+                }
+                NetworkObject::PolicyRule(rule) => {
+                    rule.id.clear();
+                    rule.ownership = ObjectOwnership::AgentOwned;
+                }
+                _ => return Err(RuntimeNetworkInventoryError::InvalidPlan),
+            }
             serde_json::to_vec(&normalized).map_err(|_| RuntimeNetworkInventoryError::StaleState)
         })
         .collect::<Result<Vec<_>, _>>()?;
     values.sort_unstable();
     Ok(values)
+}
+
+fn push_runtime_command(
+    output: &mut String,
+    operation: &str,
+    object: &NetworkObject,
+) -> Result<(), RuntimeNetworkInventoryError> {
+    match object {
+        NetworkObject::Route(route) => push_route_command(output, operation, route),
+        NetworkObject::PolicyRule(rule) => push_policy_rule_command(output, operation, rule),
+        _ => Err(RuntimeNetworkInventoryError::InvalidPlan),
+    }
 }
 
 fn push_route_command(
@@ -402,6 +503,61 @@ fn push_route_command(
     .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
     if let Some(metric) = route.metric {
         write!(output, " metric {metric}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    output.push('\n');
+    Ok(())
+}
+
+fn push_policy_rule_command(
+    output: &mut String,
+    operation: &str,
+    rule: &NetworkPolicyRule,
+) -> Result<(), RuntimeNetworkInventoryError> {
+    use std::fmt::Write;
+    let family = match rule.family {
+        NetworkFamily::Ipv4 => "-4",
+        NetworkFamily::Ipv6 => "-6",
+    };
+    write!(
+        output,
+        "{family} rule {operation} priority {}",
+        rule.priority
+    )
+    .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    if let Some(source) = rule.source {
+        write!(output, " from {}/{}", source.address, source.prefix_len)
+            .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(destination) = rule.destination {
+        write!(
+            output,
+            " to {}/{}",
+            destination.address, destination.prefix_len
+        )
+        .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(interface) = &rule.input_interface {
+        write!(output, " iifname {interface}")
+            .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(interface) = &rule.output_interface {
+        write!(output, " oifname {interface}")
+            .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+    }
+    if let Some(mark) = rule.fwmark {
+        write!(output, " fwmark {mark:#x}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+        if let Some(mask) = rule.fwmark_mask {
+            write!(output, "/{mask:#x}").map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+        }
+    }
+    match rule.action {
+        NetworkPolicyAction::Lookup => {
+            write!(output, " table {}", rule.table)
+                .map_err(|_| RuntimeNetworkInventoryError::Capacity)?;
+        }
+        NetworkPolicyAction::Blackhole => output.push_str(" blackhole"),
+        NetworkPolicyAction::Unreachable => output.push_str(" unreachable"),
+        NetworkPolicyAction::Prohibit => output.push_str(" prohibit"),
     }
     output.push('\n');
     Ok(())
@@ -486,6 +642,176 @@ fn route_object(value: &Value) -> Result<Option<NetworkRoute>, RuntimeNetworkInv
         metric,
         route_type,
     }))
+}
+
+fn policy_rule_object(
+    value: &Value,
+) -> Result<Option<NetworkPolicyRule>, RuntimeNetworkInventoryError> {
+    const SUPPORTED: &[&str] = &[
+        "priority", "pref", "src", "from", "dst", "to", "iifname", "oifname", "fwmark", "table",
+        "action", "family",
+    ];
+    let priority = value
+        .get("priority")
+        .or_else(|| value.get("pref"))
+        .and_then(parse_u32)
+        .ok_or(RuntimeNetworkInventoryError::Malformed)?;
+    let reserved = reserved_policy_priority(priority);
+    if value
+        .as_object()
+        .is_none_or(|object| object.keys().any(|key| !SUPPORTED.contains(&key.as_str())))
+    {
+        return if reserved {
+            Err(RuntimeNetworkInventoryError::Unsupported)
+        } else {
+            Ok(None)
+        };
+    }
+    let source = parse_rule_network(value.get("src").or_else(|| value.get("from")))?;
+    let destination = parse_rule_network(value.get("dst").or_else(|| value.get("to")))?;
+    let family = match value.get("family").and_then(Value::as_str) {
+        Some("inet" | "ipv4") => NetworkFamily::Ipv4,
+        Some("inet6" | "ipv6") => NetworkFamily::Ipv6,
+        Some(_) => return Err(RuntimeNetworkInventoryError::Malformed),
+        None if source.is_some_and(|network| network.address.is_ipv6())
+            || destination.is_some_and(|network| network.address.is_ipv6()) =>
+        {
+            NetworkFamily::Ipv6
+        }
+        None if source.is_some() || destination.is_some() => NetworkFamily::Ipv4,
+        None => {
+            return if reserved {
+                Err(RuntimeNetworkInventoryError::Unsupported)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    if source.is_some_and(|network| network.address.is_ipv4() != (family == NetworkFamily::Ipv4))
+        || destination
+            .is_some_and(|network| network.address.is_ipv4() != (family == NetworkFamily::Ipv4))
+    {
+        return Err(RuntimeNetworkInventoryError::Malformed);
+    }
+    let action = match value
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("lookup")
+    {
+        "lookup" | "to_tbl" => NetworkPolicyAction::Lookup,
+        "blackhole" => NetworkPolicyAction::Blackhole,
+        "unreachable" => NetworkPolicyAction::Unreachable,
+        "prohibit" => NetworkPolicyAction::Prohibit,
+        _ => {
+            return if reserved {
+                Err(RuntimeNetworkInventoryError::Unsupported)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let table = parse_rule_table(value.get("table"))?;
+    let (fwmark, fwmark_mask) = parse_fwmark(value.get("fwmark"))?;
+    let input_interface = optional_bounded_rule_string(value, "iifname")?;
+    let output_interface = optional_bounded_rule_string(value, "oifname")?;
+    let mut rule = NetworkPolicyRule {
+        id: "runtime-rule".into(),
+        ownership: if reserved {
+            ObjectOwnership::AgentOwned
+        } else {
+            ObjectOwnership::PlatformNative
+        },
+        enabled: true,
+        family,
+        priority,
+        source,
+        destination,
+        input_interface,
+        output_interface,
+        fwmark,
+        fwmark_mask,
+        table,
+        action,
+    };
+    validate_network_object(&NetworkObject::PolicyRule(rule.clone()))
+        .map_err(|_| RuntimeNetworkInventoryError::Unsupported)?;
+    rule.id.clear();
+    let mut identity = serde_json::to_vec(&NetworkObject::PolicyRule(rule.clone()))
+        .map_err(|_| RuntimeNetworkInventoryError::Unsupported)?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &identity);
+    rule.id = format!("kernel-rule-{}", hex_prefix(digest.as_ref(), 12));
+    identity.fill(0);
+    Ok(Some(rule))
+}
+
+fn parse_rule_network(
+    value: Option<&Value>,
+) -> Result<Option<IpNetwork>, RuntimeNetworkInventoryError> {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if value == "all" {
+        return Ok(None);
+    }
+    parse_network(value)
+        .ok_or(RuntimeNetworkInventoryError::Malformed)
+        .map(Some)
+}
+
+fn parse_u32(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(value) => value.as_u64().and_then(|value| u32::try_from(value).ok()),
+        Value::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_rule_table(value: Option<&Value>) -> Result<u32, RuntimeNetworkInventoryError> {
+    value
+        .map_or(Some(254), parse_u32)
+        .ok_or(RuntimeNetworkInventoryError::Malformed)
+}
+
+fn parse_fwmark(
+    value: Option<&Value>,
+) -> Result<(Option<u32>, Option<u32>), RuntimeNetworkInventoryError> {
+    let Some(value) = value else {
+        return Ok((None, None));
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(RuntimeNetworkInventoryError::Malformed);
+    };
+    let (primary, mask_part) = raw.split_once('/').unwrap_or((raw, ""));
+    let parse = |value: &str| {
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        u32::from_str_radix(value, 16).map_err(|_| RuntimeNetworkInventoryError::Malformed)
+    };
+    Ok((
+        Some(parse(primary)?),
+        (!mask_part.is_empty())
+            .then(|| parse(mask_part))
+            .transpose()?,
+    ))
+}
+
+fn optional_bounded_rule_string(
+    value: &Value,
+    field: &str,
+) -> Result<Option<String>, RuntimeNetworkInventoryError> {
+    let Some(value) = value.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(RuntimeNetworkInventoryError::Malformed);
+    };
+    if value.is_empty() || value.len() > MAX_NAME_BYTES || value.chars().any(char::is_control) {
+        return Err(RuntimeNetworkInventoryError::Malformed);
+    }
+    Ok(Some(value.to_owned()))
+}
+
+const fn reserved_policy_priority(priority: u32) -> bool {
+    priority >= RUNTIME_POLICY_PRIORITY_START && priority <= RUNTIME_POLICY_PRIORITY_END
 }
 
 fn default_network(value: &Value, gateway: Option<IpAddr>) -> IpNetwork {
@@ -667,5 +993,77 @@ mod tests {
             ),
             Err(RuntimeNetworkInventoryError::NativeDrift)
         ));
+    }
+
+    #[test]
+    fn policy_rules_use_reserved_priority_range_and_reversible_batch() {
+        let rules = r#"[
+            {"priority":100,"src":"192.0.2.0/24","table":254,"action":"lookup"},
+            {"priority":32000,"src":"192.0.2.0/24","fwmark":"0x1/0xff","table":100,"action":"lookup"}
+        ]"#;
+        let public = inspect_runtime_policy_inventory(rules).expect("policy inventory");
+        assert_eq!(public.objects.len(), 1);
+        let NetworkObject::PolicyRule(native) = &public.objects[0] else {
+            panic!("policy rule expected");
+        };
+        assert_eq!(native.priority, 100);
+        assert_eq!(native.ownership, ObjectOwnership::PlatformNative);
+
+        let snapshot = reconcile_runtime_network_inventory("[]", "[]", None, "boot-1")
+            .expect("empty snapshot");
+        let rule = NetworkPolicyRule {
+            id: "guest-policy".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            family: NetworkFamily::Ipv4,
+            priority: 32_000,
+            source: Some(IpNetwork {
+                address: "192.0.2.0".parse().expect("source"),
+                prefix_len: 24,
+            }),
+            destination: None,
+            input_interface: None,
+            output_interface: None,
+            fwmark: Some(1),
+            fwmark_mask: Some(255),
+            table: 100,
+            action: NetworkPolicyAction::Lookup,
+        };
+        let plan = plan_network_mutations(
+            snapshot.inventory(),
+            &[NetworkMutation::Create(NetworkObject::PolicyRule(rule))],
+            &NetworkRiskContext::default(),
+        )
+        .expect("plan");
+        let stage = render_runtime_route_stage(&snapshot, &plan).expect("stage");
+        assert_eq!(
+            stage.apply_batch,
+            "-4 rule add priority 32000 from 192.0.2.0/24 fwmark 0x1/0xff table 100\n"
+        );
+        let reconciled = reconcile_runtime_network_inventory(
+            "[]",
+            rules_with_owned_rule(),
+            Some(&stage.projected_canonical_state),
+            "boot-1",
+        )
+        .expect("reconcile");
+        assert_eq!(reconciled.inventory().objects.len(), 1);
+    }
+
+    #[test]
+    fn reserved_policy_rule_without_canonical_state_fails_closed() {
+        assert!(matches!(
+            reconcile_runtime_network_inventory(
+                "[]",
+                r#"[{"priority":32000,"src":"192.0.2.0/24","table":100,"action":"lookup"}]"#,
+                None,
+                "boot-1"
+            ),
+            Err(RuntimeNetworkInventoryError::NativeDrift)
+        ));
+    }
+
+    fn rules_with_owned_rule() -> &'static str {
+        r#"[{"priority":32000,"src":"192.0.2.0/24","fwmark":"0x1/0xff","table":100,"action":"lookup"}]"#
     }
 }

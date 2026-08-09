@@ -46,7 +46,8 @@ use platform_linux::network_openwrt::{
     OpenWrtNetworkInventorySnapshot, inspect_openwrt_network_inventory,
 };
 use platform_linux::network_runtime::{
-    inspect_runtime_network_inventory, reconcile_runtime_route_inventory,
+    inspect_runtime_network_inventory, inspect_runtime_policy_inventory,
+    reconcile_runtime_network_inventory,
 };
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -1368,7 +1369,7 @@ async fn handle_network_plan(
         return ServerResponse::error(
             id,
             ErrorCode::InvalidRequest,
-            "generic Linux network writes support only enabled Agent-owned runtime routes",
+            "generic Linux network writes support only enabled Agent-owned runtime routes and reserved policy rules",
         );
     }
     let _configuration_guard = state.configuration_lock.lock().await;
@@ -1501,6 +1502,7 @@ async fn handle_network_inventory(id: String, state: &AppState) -> ServerRespons
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn inspect_network_inventory(
     state: &AppState,
 ) -> Result<NetworkInventory, PendingResponseError> {
@@ -1542,6 +1544,12 @@ async fn inspect_network_inventory(
                         PendingResponseError::unavailable("live network inventory is unavailable")
                     })?
                     .stdout;
+                let rules = runner
+                    .execute(&FirewallCommand::IpJsonRule, None)
+                    .map_err(|_| {
+                        PendingResponseError::unavailable("live network inventory is unavailable")
+                    })?
+                    .stdout;
                 let mut inventory = inspect_runtime_network_inventory(
                     std::str::from_utf8(&links).map_err(|_| {
                         PendingResponseError::conflict("live network inventory is malformed")
@@ -1559,15 +1567,28 @@ async fn inspect_network_inventory(
                         "live network inventory cannot be safely represented",
                     )
                 })?;
-                let owned = reconcile_runtime_route_inventory(
+                let policy = inspect_runtime_policy_inventory(std::str::from_utf8(&rules).map_err(
+                    |_| PendingResponseError::conflict("live network inventory is malformed"),
+                )?)
+                .map_err(|error| {
+                    warn!(%error, "generic Linux policy rule inventory is not safely representable");
+                    PendingResponseError::conflict(
+                        "live policy rule inventory cannot be safely represented",
+                    )
+                })?;
+                inventory.objects.extend(policy.objects);
+                let owned = reconcile_runtime_network_inventory(
                     std::str::from_utf8(&routes).map_err(|_| {
+                        PendingResponseError::conflict("live network inventory is malformed")
+                    })?,
+                    std::str::from_utf8(&rules).map_err(|_| {
                         PendingResponseError::conflict("live network inventory is malformed")
                     })?,
                     canonical.as_deref(),
                     &boot_id,
                 )
                 .map_err(|error| {
-                    warn!(%error, "generic Linux Agent-owned routes cannot be reconciled");
+                    warn!(%error, "generic Linux Agent-owned network objects cannot be reconciled");
                     PendingResponseError::conflict(
                         "live Agent-owned route inventory cannot be safely represented",
                     )
@@ -1603,7 +1624,7 @@ const fn network_validation_check(backend: WritableNetworkBackend) -> &'static s
             "reinspect live UCI and run native OpenWrt network validation"
         }
         WritableNetworkBackend::GenericRuntimeRoutes => {
-            "reconcile Agent-owned protocol-186 routes and validate a fixed ip batch"
+            "reconcile Agent-owned protocol-186 routes/reserved policy rules and validate a fixed ip batch"
         }
     }
 }
@@ -1629,13 +1650,27 @@ fn network_write_backend(state: &AppState) -> Result<WritableNetworkBackend, Pen
 fn generic_runtime_route_request(request: &NetworkMutationRequest) -> bool {
     match request {
         NetworkMutationRequest::Create { desired }
-        | NetworkMutationRequest::Update { desired, .. } => matches!(
+        | NetworkMutationRequest::Update { desired, .. } => match desired {
+            NetworkObject::Route(route) => {
+                route.ownership == ObjectOwnership::AgentOwned && route.enabled
+            }
+            NetworkObject::PolicyRule(rule) => {
+                rule.ownership == ObjectOwnership::AgentOwned
+                    && rule.enabled
+                    && (32_000..=32_063).contains(&rule.priority)
+            }
+            _ => false,
+        },
+        NetworkMutationRequest::Delete { kind, .. } => {
+            matches!(kind.as_str(), "route" | "policy_rule")
+        }
+        NetworkMutationRequest::Move { desired, .. } => matches!(
             desired,
-            NetworkObject::Route(route)
-                if route.ownership == ObjectOwnership::AgentOwned && route.enabled
+            NetworkObject::PolicyRule(rule)
+                if rule.ownership == ObjectOwnership::AgentOwned
+                    && rule.enabled
+                    && (32_000..=32_063).contains(&rule.priority)
         ),
-        NetworkMutationRequest::Delete { kind, .. } => kind == "route",
-        NetworkMutationRequest::Move { .. } => false,
     }
 }
 
@@ -1664,9 +1699,18 @@ async fn inspect_generic_runtime_routes(
             .execute(&FirewallCommand::IpJsonRoute, None)
             .map_err(|_| PendingResponseError::unavailable("live route inventory is unavailable"))?
             .stdout;
-        reconcile_runtime_route_inventory(
+        let rules = runner
+            .execute(&FirewallCommand::IpJsonRule, None)
+            .map_err(|_| {
+                PendingResponseError::unavailable("live policy rule inventory is unavailable")
+            })?
+            .stdout;
+        reconcile_runtime_network_inventory(
             std::str::from_utf8(&routes)
                 .map_err(|_| PendingResponseError::conflict("live route inventory is malformed"))?,
+            std::str::from_utf8(&rules).map_err(|_| {
+                PendingResponseError::conflict("live policy rule inventory is malformed")
+            })?,
             canonical.as_deref(),
             &boot_id,
         )
@@ -5869,7 +5913,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_network_admission_accepts_only_enabled_owned_routes() {
+    fn generic_network_admission_accepts_only_enabled_owned_runtime_objects() {
         let route = agent_protocol::NetworkRoute {
             id: "agent-default".into(),
             ownership: ObjectOwnership::AgentOwned,
@@ -5925,6 +5969,52 @@ mod tests {
             &NetworkMutationRequest::Move {
                 expected_digest: "a".repeat(64),
                 desired: NetworkObject::Route(route),
+            }
+        ));
+
+        let policy = agent_protocol::NetworkPolicyRule {
+            id: "guest-policy".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            family: agent_protocol::NetworkFamily::Ipv4,
+            priority: 32_000,
+            source: None,
+            destination: None,
+            input_interface: None,
+            output_interface: None,
+            fwmark: Some(1),
+            fwmark_mask: Some(255),
+            table: 100,
+            action: agent_protocol::NetworkPolicyAction::Lookup,
+        };
+        assert!(generic_runtime_route_request(
+            &NetworkMutationRequest::Create {
+                desired: NetworkObject::PolicyRule(policy.clone()),
+            }
+        ));
+        assert!(generic_runtime_route_request(
+            &NetworkMutationRequest::Move {
+                expected_digest: "a".repeat(64),
+                desired: NetworkObject::PolicyRule(policy),
+            }
+        ));
+        assert!(!generic_runtime_route_request(
+            &NetworkMutationRequest::Create {
+                desired: NetworkObject::PolicyRule(agent_protocol::NetworkPolicyRule {
+                    id: "foreign-priority".into(),
+                    ownership: ObjectOwnership::AgentOwned,
+                    enabled: true,
+                    family: agent_protocol::NetworkFamily::Ipv4,
+                    priority: 10_000,
+                    source: None,
+                    destination: None,
+                    input_interface: None,
+                    output_interface: None,
+                    fwmark: None,
+                    fwmark_mask: None,
+                    table: 100,
+                    action: agent_protocol::NetworkPolicyAction::Lookup,
+                }),
             }
         ));
     }
