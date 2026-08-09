@@ -1069,7 +1069,8 @@ inventory，并与 Agent-owned nftables/iptables 原生摘要相互校验。领�
 协调器现已固定二次检查、staging、native validation、rollback arm、activation、
 verification 和 confirmation 的唯一顺序，并覆盖故障注入。OpenWrt fw3/fw4、普通 Linux
 nftables/iptables，以及普通 Linux Agent-owned runtime network 的公共 typed 写入口均已
-接通；尚未覆盖的配置域仍保持只读，apply 后的主动业务探针也仍在后续切片中补齐。
+接通；涉及 WAN 接口或默认路由的 network ChangeSet 在 native verify 后还会运行一次有界
+主动 WAN 探针，失败立即请求同一 rollback-helper。尚未覆盖的配置域仍保持只读。
 
 受限原生命令层已实现 closed enum：只支持 UCI/fw3/fw4、nftables 和双栈
 iptables 的固定检查与加载动作；清空环境并直接启动进程，不使用 shell。stdin、
@@ -1168,10 +1169,11 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 - 多 provider 路由、配额和模型健康度。
 - Channel/Provider 协议版本兼容检查；Skill/Runbook 只随外部软件包维护流程更新。
 
-当前进度：MQTT 5 首个只读纵向切片已完成，包含 TLS-only 配置（系统信任根或配置化
-PEM CA/客户端证书/私钥）、daemon 启动自动连接、
-固定 topic、QoS 1、消息 TTL、SQLite 去重、有界 outbox、重试/退避和 CLI lifecycle status；
-仅开放 ping/status/ask/诊断。微信 ClawBot 的官方 QR 绑定命令已完成：CLI 轮询官方
+当前进度：MQTT 5 首个纵向切片已完成，包含 TLS-only 配置（系统信任根或配置化
+PEM CA/客户端证书/私钥）、daemon 启动自动连接、固定 topic、QoS 1、消息 TTL、SQLite
+去重、有界 outbox、重试/退避和 CLI lifecycle status；Channel 已接入 ping/status/ask、
+闭集诊断以及 typed ChangeSet plan/get/approve/apply/confirm/reject，写操作仍由本地
+device-admin、一次性 token、回滚和确认状态机约束。微信 ClawBot 的官方 QR 绑定命令已完成：CLI 轮询官方
 `get_bot_qrcode/get_qrcode_status`，把 `bot_token/base_url` 以 0600 原子配置写入，daemon
 重启后自动启动官方 `getupdates` 长轮询，接收有界文本并使用原消息 `context_token` 通过
 `sendmessage` 回复；媒体、远程 device-admin、ChangeSet actor 绑定、mTLS 与签名 envelope
@@ -1371,6 +1373,12 @@ confirmed-commit。
 dnsmasq tag 列表。字段通过同一 `mbed_managed`/`mbed_id` host section 绑定，更新只删除
 并重写这些 typed 选项，未知厂商选项仍保留；重复、超限或非法字符在 planner/stage
 阶段 fail closed。旧 JSON 与既有 `/tmp` 状态通过 serde 默认值保持兼容。
+
+截至 ADR 0068，涉及 `wan` 接口或默认路由的 network ChangeSet 在 native typed verify
+之后、confirmation 之前运行一次有界主动 WAN 探针。探针要求地址、默认路由、resolver、
+DNS 解析成功，以及存在 gateway 时的 gateway 探测成功；失败、证据不足或 collector 错误
+都会请求同一独立 rollback-helper。公共 IP 的 ICMP 被阻断时不单独导致回滚。LAN-only、
+非默认路由和 policy-rule 变更不触发无关的 WAN 探针。
 
 截至 ADR 0050，用户与厂商扩展命令不再要求修改 Rust：daemon 从受信任、非 group/world
 writable 的 ActionSpec TOML 目录加载有界 registry，manifest 声明绝对 executable、固定

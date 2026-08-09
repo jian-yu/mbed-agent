@@ -133,6 +133,25 @@ pub fn confirm_awaiting_execution(
     Ok(ExecutionOutcome::Confirmed)
 }
 
+/// Rolls back an awaiting change after a post-apply business probe failed.
+///
+/// The rollback uses the same armed helper and state transitions as native
+/// verification failures. This keeps an active connectivity failure from
+/// being reported as a normal confirmation opportunity.
+///
+/// # Errors
+///
+/// Returns a rollback outcome error; the port has already attempted recovery.
+pub fn rollback_after_post_apply_probe(
+    port: &mut impl ChangeExecutionPort,
+) -> Result<(), ChangeExecutionError> {
+    Err(rollback_after(
+        port,
+        ChangeSetState::AwaitingConfirmation,
+        ExecutionStage::PostApplyProbe,
+    ))
+}
+
 fn transition_or_discard(
     port: &mut impl ChangeExecutionPort,
     expected: ChangeSetState,
@@ -213,6 +232,7 @@ pub enum ExecutionStage {
     Verify,
     RecordAwaitingConfirmation,
     VerifyConfirmation,
+    PostApplyProbe,
     ConfirmRollback,
     RecordConfirmed,
 }
@@ -345,5 +365,21 @@ mod tests {
         );
         assert_eq!(port.calls, ["reinspect", "stage", "discard"]);
         assert_eq!(port.state, ChangeSetState::Approved);
+    }
+
+    #[test]
+    fn failed_post_apply_probe_rolls_back_an_awaiting_change() {
+        let mut port = port(None);
+        assert_eq!(
+            execute_approved_change(&mut port, 1, 10, true),
+            Ok(ExecutionOutcome::AwaitingConfirmation)
+        );
+        assert_eq!(
+            rollback_after_post_apply_probe(&mut port),
+            Err(ChangeExecutionError::RolledBack(
+                ExecutionStage::PostApplyProbe
+            ))
+        );
+        assert_eq!(port.state, ChangeSetState::RolledBack);
     }
 }

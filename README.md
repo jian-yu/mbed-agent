@@ -134,8 +134,11 @@ profiles only add/remove static addresses with fixed `ip -batch` and neither
 writes persistent network-manager configuration. The local
 CLI exposes
 actor/boot/plan-bound ChangeSet inspection, rejection, device-admin approval,
-apply, and confirmed commit for supported firewall and network backends. The
-configuration roadmap is intentionally broader than a
+apply, and confirmed commit for supported firewall and network backends. WAN
+interface and default-route network slices also run one bounded active WAN
+probe after native verification; a failed probe immediately requests the
+armed rollback helper before confirmation. Other network changes use typed
+verification only. The configuration roadmap is intentionally broader than a
 few fixed operations: it targets capability-gated typed CRUD for firewall,
 interfaces/addresses, bridges/VLANs, routes, DNS/DHCP, wireless, controlled
 services, QoS, and WireGuard. OpenWrt will use UCI and its native fw3/fw4/netifd
@@ -213,6 +216,8 @@ handling are recorded in
 [ADR 0065](docs/adr/0065-openwrt-dhcp-static-leases.md).
 OpenWrt DHCP host DUID, hostid, and dnsmasq tag fields are recorded in
 [ADR 0067](docs/adr/0067-openwrt-dhcp-host-identities.md).
+Post-apply WAN/default-route business probes and immediate rollback are recorded
+in [ADR 0068](docs/adr/0068-post-apply-business-probes.md).
 Declarative user/vendor actions and their bounded execution boundary are
 recorded in [ADR 0050](docs/adr/0050-declarative-extension-actions.md).
 Approval-bound change templates are recorded in

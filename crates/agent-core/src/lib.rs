@@ -27,6 +27,7 @@ pub use config::{
 pub use execution::{
     ChangeExecutionError, ChangeExecutionPort, ExecutionOutcome, ExecutionPortError,
     ExecutionStage, confirm_awaiting_execution, execute_approved_change,
+    rollback_after_post_apply_probe,
 };
 pub use firewall::{
     FIREWALL_EXECUTION_PLAN_SCHEMA_VERSION, FirewallExecutionPlan, FirewallExecutionPlanError,

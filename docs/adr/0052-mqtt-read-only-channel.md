@@ -53,5 +53,16 @@ the device. Channel runtime state must remain volatile under `/tmp`.
 
 The agent now has an actual reconnecting MQTT 5 channel suitable for remote
 read-only operations and LLM requests. At-least-once duplicates are bounded and
-do not repeat task execution. Remote configuration remains unavailable rather
-than inheriting the local CLI actor implicitly.
+do not repeat task execution. The initial slice deliberately kept remote
+configuration unavailable rather than inheriting the local CLI actor implicitly;
+the later typed ChangeSet extension preserves that same authorization boundary.
+
+## Follow-up
+
+The initial read-only command boundary was later extended by [ADR
+0056](0056-channel-changeset-commands.md) and [ADR
+0057](0057-channel-actionspec-commands.md). MQTT now carries the same typed
+ChangeSet and ActionSpec command envelopes as the other direct channels, but
+still requires actor-scoped `device-admin`, one-use approval, native
+validation, rollback, and confirmed commit; it never gains a raw shell or
+caller-supplied executable path.

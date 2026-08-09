@@ -16,6 +16,7 @@ use agent_core::{
     NetworkExecutionPlan, NetworkInventory, NetworkMutation, NetworkRiskContext, TmpBudget,
     confirm_awaiting_execution, execute_approved_change, firewall_object_digest,
     network_object_digest, plan_digest, plan_firewall_mutations, plan_network_mutations,
+    rollback_after_post_apply_probe,
 };
 use agent_protocol::{
     ActionDescriptor, ActionReloadResponse, ChangeApprovalResponse, ChangePlan, ChangeSetResponse,
@@ -1422,6 +1423,7 @@ async fn handle_network_plan(
         validation_checks: vec![network_validation_check(backend).into()],
         verification_checks: vec![
             "reconstruct and compare touched live L2/L3 network objects".into(),
+            "when WAN/default-route objects are touched, run one bounded active WAN probe before confirmation".into(),
         ],
         rollback_required: true,
     };
@@ -2719,24 +2721,80 @@ async fn execute_network_change(
     match backend {
         WritableNetworkBackend::OpenWrt => {
             let config = openwrt_network_port_config(record, execution, now, state);
+            let run_probe = network_execution_requires_active_probe(&config.execution);
+            let tools = state.tools.clone();
+            let platform = state.platform.clone();
             tokio::task::spawn_blocking(move || {
                 let mut port = OpenWrtNetworkExecutionPort::apply(config)?;
-                execute_approved_change(&mut port, now, deadline, true)
-                    .map_err(|_| agent_core::ExecutionPortError)
+                let outcome = execute_approved_change(&mut port, now, deadline, true)
+                    .map_err(|_| agent_core::ExecutionPortError)?;
+                if run_probe && outcome == agent_core::ExecutionOutcome::AwaitingConfirmation {
+                    run_post_apply_wan_probe(&tools, &platform, &mut port)?;
+                    return Ok(outcome);
+                }
+                Ok(outcome)
             })
             .await
         }
         WritableNetworkBackend::GenericRuntimeRoutes => {
             let config =
                 generic_runtime_route_port_config(record, execution, canonical_state, now, state);
+            let run_probe = network_execution_requires_active_probe(&config.execution);
+            let tools = state.tools.clone();
+            let platform = state.platform.clone();
             tokio::task::spawn_blocking(move || {
                 let mut port = GenericRuntimeRouteExecutionPort::apply(config)?;
-                execute_approved_change(&mut port, now, deadline, true)
-                    .map_err(|_| agent_core::ExecutionPortError)
+                let outcome = execute_approved_change(&mut port, now, deadline, true)
+                    .map_err(|_| agent_core::ExecutionPortError)?;
+                if run_probe && outcome == agent_core::ExecutionOutcome::AwaitingConfirmation {
+                    run_post_apply_wan_probe(&tools, &platform, &mut port)?;
+                    return Ok(outcome);
+                }
+                Ok(outcome)
             })
             .await
         }
     }
+}
+
+fn network_execution_requires_active_probe(execution: &NetworkExecutionPlan) -> bool {
+    execution.typed.changes.iter().any(|change| {
+        [change.before.as_ref(), change.after.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|object| match object {
+                NetworkObject::Interface(interface) => {
+                    interface.id == "wan" || interface.device == "wan"
+                }
+                NetworkObject::Route(route) => route.destination.prefix_len == 0,
+                _ => false,
+            })
+    })
+}
+
+fn run_post_apply_wan_probe(
+    tools: &ToolRunner,
+    platform: &PlatformCapabilities,
+    port: &mut impl agent_core::ChangeExecutionPort,
+) -> Result<(), agent_core::ExecutionPortError> {
+    let report = tokio::runtime::Handle::current()
+        .block_on(tools.diagnose_wan(platform, true))
+        .map_err(|_| agent_core::ExecutionPortError)?;
+    if wan_probe_succeeded(&report.summary) {
+        return Ok(());
+    }
+    rollback_after_post_apply_probe(port).map_err(|_| agent_core::ExecutionPortError)
+}
+
+fn wan_probe_succeeded(summary: &agent_protocol::WanSummary) -> bool {
+    summary.status_source.is_some()
+        && summary.available != Some(false)
+        && summary.up != Some(false)
+        && !summary.addresses.is_empty()
+        && !summary.default_routes.is_empty()
+        && !summary.dns_servers.is_empty()
+        && summary.dns_reachable == Some(true)
+        && summary.gateway_reachable.is_none_or(|reachable| reachable)
 }
 
 async fn confirm_network_change(
@@ -6095,6 +6153,98 @@ mod tests {
                 }),
             }
         ));
+    }
+
+    #[test]
+    fn active_probe_trigger_is_limited_to_wan_and_default_route_changes() {
+        fn execution(object: NetworkObject) -> NetworkExecutionPlan {
+            NetworkExecutionPlan {
+                schema_version: agent_core::NETWORK_EXECUTION_PLAN_SCHEMA_VERSION,
+                preview: ChangePlan {
+                    schema_version: agent_protocol::CHANGE_PLAN_SCHEMA_VERSION,
+                    plan_id: "plan".into(),
+                    boot_id: "boot".into(),
+                    actor_id: "actor".into(),
+                    created_monotonic_ms: 1,
+                    expires_monotonic_ms: 2,
+                    risk: agent_protocol::RiskLevel::R3,
+                    changes: vec![],
+                    validation_checks: vec![],
+                    verification_checks: vec![],
+                    rollback_required: true,
+                },
+                typed: agent_core::NetworkMutationPlan {
+                    risk: agent_protocol::RiskLevel::R3,
+                    changes: vec![agent_core::NetworkPlannedChange {
+                        before: None,
+                        after: Some(object),
+                        diff: agent_protocol::ChangeDiff {
+                            object: agent_protocol::ConfigObjectRef {
+                                domain: ConfigDomain::Network,
+                                kind: "test".into(),
+                                id: "test".into(),
+                                expected_version: None,
+                                ownership: ObjectOwnership::AgentOwned,
+                            },
+                            operation: agent_protocol::ChangeOperation::Create,
+                            before_digest: None,
+                            after_digest: None,
+                            summary: "test".into(),
+                            sensitive_fields_redacted: false,
+                            risk_signals: agent_protocol::ChangeRiskSignals::default(),
+                        },
+                    }],
+                },
+            }
+        }
+
+        let interface = |id: &str| {
+            NetworkObject::Interface(agent_protocol::NetworkInterfaceConfig {
+                id: id.into(),
+                ownership: ObjectOwnership::AgentOwned,
+                enabled: true,
+                device: id.into(),
+                ipv4_mode: agent_protocol::NetworkAddressMode::Disabled,
+                ipv6_mode: agent_protocol::NetworkAddressMode::Disabled,
+                addresses: vec![],
+                mtu: None,
+                mac_override: None,
+                peerdns: true,
+                dns_servers: vec![],
+                dns_search: vec![],
+                dhcp_client_id: None,
+                dhcp_vendor_id: None,
+                dhcp_hostname: None,
+                dhcp_request_options: vec![],
+                dhcp_no_release: false,
+                dhcp_server: None,
+            })
+        };
+        assert!(network_execution_requires_active_probe(&execution(
+            interface("wan")
+        )));
+        assert!(!network_execution_requires_active_probe(&execution(
+            interface("agent_lan")
+        )));
+
+        let default_route = NetworkObject::Route(agent_protocol::NetworkRoute {
+            id: "agent-default".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            destination: agent_protocol::IpNetwork {
+                address: "0.0.0.0".parse().expect("default address"),
+                prefix_len: 0,
+            },
+            gateway: None,
+            output_interface: Some("eth0".into()),
+            preferred_source: None,
+            table: 254,
+            metric: None,
+            route_type: agent_protocol::NetworkRouteType::Unicast,
+        });
+        assert!(network_execution_requires_active_probe(&execution(
+            default_route
+        )));
     }
 
     #[test]
