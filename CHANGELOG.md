@@ -18,6 +18,8 @@ version.
 - Reproducible official OpenWrt SDK package workflow with SDK checksum validation.
 - OpenWrt 24.10 `.tar.zst` SDK support and a real-device-derived
   `bcm27xx/bcm2711` aarch64 matrix target.
+- Pinned Zig 0.14.1/cargo-zigbuild 0.20.1 CI path for the bcm2711 aarch64 musl
+  binary, plus a fail-closed SSH device read-only smoke runner.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

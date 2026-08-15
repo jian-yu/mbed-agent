@@ -41,6 +41,7 @@ jobs:
         run: |
           sh -n scripts/run-linux-namespace-smoke.sh
           sh -n scripts/run-openwrt-qemu-smoke.sh
+          sh -n scripts/run-openwrt-device-readonly-smoke.sh
           sh -n scripts/check-release-footprint.sh
           sh -n scripts/measure-daemon-rss.sh
           sh -n scripts/check-persistent-write-set.sh

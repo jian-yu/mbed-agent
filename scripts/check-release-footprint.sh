@@ -10,5 +10,7 @@ if [ "$size" -gt "$max_bytes" ]; then
     echo "release binary is ${size} bytes, exceeding ${max_bytes}" >&2
     exit 1
 fi
-"$binary" --version >/dev/null
+if [ "${MBED_AGENT_SKIP_BINARY_EXEC:-0}" != 1 ]; then
+    "$binary" --version >/dev/null
+fi
 echo "PASS: release binary ${size} bytes (limit ${max_bytes})"

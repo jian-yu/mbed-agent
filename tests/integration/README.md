@@ -6,6 +6,17 @@ unit test。
 脱敏后的真机发现和事务结果记录在 `device-evidence.md`；禁止记录私网/公网地址、
 凭据、token、SSID 或客户标识。
 
+已有 aarch64 musl binary 时，可从受信任测试主机执行完整只读真机 smoke：
+
+```sh
+sh scripts/run-openwrt-device-readonly-smoke.sh \
+  root@router target/aarch64-unknown-linux-musl/release/mbed-agent
+```
+
+脚本拒绝覆盖设备上已有的 `/tmp/mbed-agent-device-test` 或 `/tmp/mbed-agent`，执行
+ping/status/capabilities、全部只读诊断、firewall/network inventory，并比较
+`/etc/config` 前后聚合哈希；成功、失败和信号退出都会清理本次创建的临时目录。
+
 ## 通用 Linux namespace
 
 ```sh

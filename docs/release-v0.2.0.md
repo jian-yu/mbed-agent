@@ -28,3 +28,13 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
    Cargo 依赖图（SBOM 输入）和构建元数据；组织级发布服务再将依赖图转换为要求的
    SPDX/CycloneDX SBOM。
 7. 完成 72 小时 Channel 重连/重复消息/低水位测试后，才把 RC 提升为正式版。
+
+## 当前真机证据
+
+- 2026-08-15 在 OpenWrt 24.10.8 `bcm27xx/bcm2711` 上完成静态 aarch64 musl
+  binary、daemon、ping/status/capabilities、全部 13 个被动诊断以及
+  firewall/network inventory smoke。
+- 两次 smoke 均确认 `/etc/config` 前后聚合 SHA-256 一致，且测试使用的进程、
+  SQLite/WAL、socket、日志、binary 和配置副本均从 `/tmp` 清理。
+- 尚未安装 `.ipk`，也未执行需要管理员审批的 firewall/network 写事务；这些仍是
+  v0.2.0 的外部发布门槛。

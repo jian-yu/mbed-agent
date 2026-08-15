@@ -41,6 +41,11 @@ sh scripts/build-openwrt-sdk-package.sh \
 OpenWrt 21/22/23 的 `.tar.xz` SDK 和 24.10 的 `.tar.zst` SDK 均受支持；GNU tar
 解压 `.tar.zst` 时构建主机还需要 `zstd`。
 
+异构 release binary 只做大小检查时使用
+`MBED_AGENT_SKIP_BINARY_EXEC=1 sh scripts/check-release-footprint.sh BINARY`；最终仍必须
+在目标设备执行 `--version` 和 daemon smoke。24.10.8 bcm2711 的 CI 使用固定的
+Zig 0.14.1 与 cargo-zigbuild 0.20.1 构建 aarch64 musl binary。
+
 ## Release artifacts
 
 正式或 RC 构建可用以下入口聚合 binary、依赖图、工具链信息、manifest 和 checksum：
