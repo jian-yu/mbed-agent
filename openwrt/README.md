@@ -36,8 +36,10 @@ sh scripts/build-openwrt-sdk-package.sh \
 `/tmp/mbed-agent-openwrt-sdk-build`，完成后默认删除。设置
 `MBED_AGENT_KEEP_SDK=1` 可保留该明确目录用于排障。
 脚本还会校验输入是匹配矩阵架构的 ELF；在 CI/cache 中可设置
-`MBED_AGENT_SDK_ARCHIVE=/path/to/openwrt-sdk.tar.xz` 复用已下载的官方 SDK，仍会
+`MBED_AGENT_SDK_ARCHIVE=/path/to/openwrt-sdk.tar.*` 复用已下载的官方 SDK，仍会
 使用 release 目录的 `sha256sums` 做校验。
+OpenWrt 21/22/23 的 `.tar.xz` SDK 和 24.10 的 `.tar.zst` SDK 均受支持；GNU tar
+解压 `.tar.zst` 时构建主机还需要 `zstd`。
 
 ## Release artifacts
 

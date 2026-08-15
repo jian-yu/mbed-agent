@@ -3,6 +3,9 @@
 本目录记录需要真实内核、OpenWrt 固件或目标设备的测试，不把它们伪装成 host
 unit test。
 
+脱敏后的真机发现和事务结果记录在 `device-evidence.md`；禁止记录私网/公网地址、
+凭据、token、SSID 或客户标识。
+
 ## 通用 Linux namespace
 
 ```sh

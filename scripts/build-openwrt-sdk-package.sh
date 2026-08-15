@@ -74,7 +74,12 @@ download() {
 }
 download "$base_url/" "$index"
 download "$base_url/sha256sums" "$checksums"
-sdk_name=$(sed -n 's/.*href="\(openwrt-sdk-[^"]*Linux-x86_64\.tar\.xz\)".*/\1/p' "$index" | head -n 1)
+sdk_name=$(awk '
+    match($0, /href="openwrt-sdk-[^"]*Linux-x86_64\.tar\.(xz|zst)"/) {
+        print substr($0, RSTART + 6, RLENGTH - 7)
+        exit
+    }
+' "$index")
 [ -n "$sdk_name" ] || {
     echo "SDK archive was not found in $base_url" >&2
     exit 1
@@ -92,7 +97,14 @@ else
 fi
 printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -
 
-tar -xJf "$archive" -C "$build_root"
+case "$archive" in
+    *.tar.xz) tar -xJf "$archive" -C "$build_root" ;;
+    *.tar.zst) tar --zstd -xf "$archive" -C "$build_root" ;;
+    *)
+        echo "unsupported SDK archive format: $archive" >&2
+        exit 1
+        ;;
+esac
 sdk_dir=$(find "$build_root" -mindepth 1 -maxdepth 1 -type d -name 'openwrt-sdk-*' -print -quit)
 [ -n "$sdk_dir" ] || {
     echo "extracted SDK directory was not found" >&2

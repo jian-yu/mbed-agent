@@ -43,7 +43,8 @@
 
 - `openwrt/targets.tsv` 覆盖 OpenWrt 21.02 fw3、22.03/23.05/24.10 fw4 的
   x86/64、armvirt、armsr 及 mediatek/ramips 代表目标，并校验 Rust musl target
-  与防火墙后端的一致性。
+  与防火墙后端的一致性；24.10.8 还包含真实验证设备使用的
+  `bcm27xx/bcm2711` aarch64 目标。
 - `scripts/build-openwrt-sdk-package.sh` 使用官方 release SDK 和同目录
   `sha256sums`，在固定 `/tmp` 缓存中重建目标包；`.github/workflows/openwrt-sdk.yml`
   提供手动、可复现的 x86/64 矩阵构建。

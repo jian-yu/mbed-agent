@@ -39,8 +39,8 @@ $1 !~ /^21\./ && $6 != "fw4" {
     rows++
 }
 END {
-    if (rows == 0 || !releases["21.02.7"] || !releases["22.03.7"] || !releases["23.05.5"] || !releases["24.10.1"]) {
-        print "matrix must cover 21.02.7, 22.03.7, 23.05.5 and 24.10.1" > "/dev/stderr"
+    if (rows == 0 || !releases["21.02.7"] || !releases["22.03.7"] || !releases["23.05.5"] || !releases["24.10.8"]) {
+        print "matrix must cover 21.02.7, 22.03.7, 23.05.5 and 24.10.8" > "/dev/stderr"
         exit 1
     }
     for (key in seen) if (seen[key] != 1) {

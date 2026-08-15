@@ -22,10 +22,12 @@ jobs:
             firewall: fw4
           - release: 24.10.1
             firewall: fw4
+          - release: 24.10.8
+            firewall: fw4
     steps:
       - uses: actions/checkout@v4
-      - name: Install musl linker
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Install musl linker and SDK decompressor
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools zstd
       - name: Install pinned Rust toolchain and musl target
         run: |
           rustup toolchain install 1.85.1 --profile minimal

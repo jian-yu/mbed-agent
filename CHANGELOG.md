@@ -16,6 +16,8 @@ version.
 - OpenWrt 21.02–24.10 compatibility matrix with fw3/fw4 and Rust musl target
   validation.
 - Reproducible official OpenWrt SDK package workflow with SDK checksum validation.
+- OpenWrt 24.10 `.tar.zst` SDK support and a real-device-derived
+  `bcm27xx/bcm2711` aarch64 matrix target.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.
