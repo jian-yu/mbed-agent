@@ -1,0 +1,55 @@
+[
+  {
+    "operation": "create",
+    "desired": {
+      "kind": "filter_rule",
+      "spec": {
+        "id": "mbed_agent_smoke_impossible",
+        "ownership": "agent_owned",
+        "enabled": true,
+        "direction": "input",
+        "matches": {
+          "family": "ipv4",
+          "source_zones": [],
+          "destination_zones": [],
+          "input_interfaces": [],
+          "output_interfaces": [],
+          "source_networks": [
+            {
+              "address": "192.0.2.123",
+              "prefix_len": 32
+            }
+          ],
+          "destination_networks": [
+            {
+              "address": "198.51.100.123",
+              "prefix_len": 32
+            }
+          ],
+          "source_macs": [
+            "02:00:00:ff:ff:ff"
+          ],
+          "protocols": [
+            "tcp"
+          ],
+          "source_ports": [],
+          "destination_ports": [
+            {
+              "start": 9,
+              "end": 9
+            }
+          ],
+          "icmp_types": [],
+          "conntrack_states": [],
+          "source_sets": [],
+          "destination_sets": []
+        },
+        "verdict": "accept",
+        "reject_with": null,
+        "rate_limit": null,
+        "log": null,
+        "order": 0
+      }
+    }
+  }
+]

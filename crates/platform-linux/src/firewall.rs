@@ -306,6 +306,10 @@ fn render_openwrt_firewall_stage_inner(
                     return Err(FirewallRenderError::DuplicateSection);
                 }
                 render_create(&mut batch, &section, object, backend)?;
+                if let Some(order) = object_order(object) {
+                    writeln!(batch, "reorder firewall.{section}={order}")
+                        .map_err(|_| FirewallRenderError::Output)?;
+                }
             }
             ChangeOperation::Update => {
                 let binding = binding_for(&bindings, key)?;
@@ -704,6 +708,11 @@ fn render_rule_location(
                     "output rule source zone or input interface",
                 ));
             }
+            if matches.destination_zones.is_empty() && matches.output_interfaces.is_empty() {
+                return Err(FirewallRenderError::UnsupportedField(
+                    "output rule requires a destination zone or output interface",
+                ));
+            }
             add_optional(options, "dest", matches.destination_zones.first());
             if let Some(device) = matches.output_interfaces.first() {
                 options.push(("device", device.clone()));
@@ -714,6 +723,11 @@ fn render_rule_location(
             if !matches.input_interfaces.is_empty() || !matches.output_interfaces.is_empty() {
                 return Err(FirewallRenderError::UnsupportedField(
                     "forward rule interface matching",
+                ));
+            }
+            if matches.source_zones.is_empty() || matches.destination_zones.is_empty() {
+                return Err(FirewallRenderError::UnsupportedField(
+                    "forward rule requires source and destination zones",
                 ));
             }
             add_optional(options, "src", matches.source_zones.first());
@@ -1194,6 +1208,8 @@ mod tests {
         assert!(stage.uci_batch.contains(".src_ip='192.168.8.0/24'"));
         assert!(stage.uci_batch.contains(".src_mac='aa:bb:cc:dd:ee:ff'"));
         assert!(stage.uci_batch.contains(".dest_port='443-445'"));
+        assert!(stage.uci_batch.contains("reorder firewall.mbed_r_"));
+        assert!(stage.uci_batch.contains("=20\ncommit firewall\n"));
         assert!(stage.uci_batch.ends_with("commit firewall\n"));
     }
 
@@ -1510,6 +1526,26 @@ firewall.@forwarding[1].dest='wan'
             render_openwrt_firewall_stage(&plan, &[], FirewallBackend::Fw4),
             Err(FirewallRenderError::UnsupportedField(
                 "conntrack state requires an unmanaged raw expression"
+            ))
+        );
+
+        let ambiguous_direction = FirewallObject::FilterRule(FirewallFilterRule {
+            id: "ambiguous-forward".into(),
+            ownership: ObjectOwnership::AgentOwned,
+            enabled: true,
+            direction: FirewallDirection::Forward,
+            matches: FirewallMatch::default(),
+            verdict: FirewallVerdict::Drop,
+            reject_with: None,
+            rate_limit: None,
+            log: None,
+            order: 1,
+        });
+        let plan = create_plan(&base_inventory(), vec![ambiguous_direction]);
+        assert_eq!(
+            render_openwrt_firewall_stage(&plan, &[], FirewallBackend::Fw4),
+            Err(FirewallRenderError::UnsupportedField(
+                "forward rule requires source and destination zones"
             ))
         );
     }

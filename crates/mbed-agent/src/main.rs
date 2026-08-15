@@ -10,8 +10,8 @@ use agent_core::{
     parse_wechat_clawbot_base_url, parse_wecom_ws_url,
 };
 use agent_protocol::{
-    ClientRequest, Command, FirewallMutationRequest, NetworkMutationRequest, PROTOCOL_VERSION,
-    SensitiveString, ServerResponse,
+    ChangeSetState, ClientRequest, Command, FirewallMutationRequest, NetworkMutationRequest,
+    PROTOCOL_VERSION, SensitiveString, ServerResponse,
 };
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
@@ -478,18 +478,86 @@ fn run_rollback_helper_command(
         transaction_id,
         config.storage.max_rollback_bytes,
     )?;
-    agent_core::run_rollback_helper(
+    let helper_result = agent_core::run_rollback_helper(
         &rollback_root,
         transaction_id,
         config.storage.max_rollback_bytes,
-    )?;
-    if matches!(
-        agent_core::rollback_outcome(&rollback_root, transaction_id),
-        Ok(agent_core::RollbackOutcome::RolledBack)
-    ) {
-        restore_runtime_canonical(&config, canonical)?;
+    );
+    let outcome = agent_core::rollback_outcome(&rollback_root, transaction_id);
+    match outcome {
+        Ok(agent_core::RollbackOutcome::RolledBack) => {
+            if let Err(error) = restore_runtime_canonical(&config, canonical) {
+                let _ = record_helper_rollback_state(
+                    &config,
+                    transaction_id,
+                    ChangeSetState::RollbackFailed,
+                );
+                return Err(error);
+            }
+            record_helper_rollback_state(&config, transaction_id, ChangeSetState::RolledBack)?;
+        }
+        Ok(
+            agent_core::RollbackOutcome::RestoreFailed | agent_core::RollbackOutcome::ReloadFailed,
+        ) => {
+            record_helper_rollback_state(&config, transaction_id, ChangeSetState::RollbackFailed)?;
+        }
+        Ok(agent_core::RollbackOutcome::Pending) | Err(_) => {}
     }
+    helper_result?;
     Ok(())
+}
+
+fn record_helper_rollback_state(
+    config: &agent_core::AgentConfig,
+    transaction_id: &str,
+    terminal: ChangeSetState,
+) -> Result<(), Box<dyn Error>> {
+    if !matches!(
+        terminal,
+        ChangeSetState::RolledBack | ChangeSetState::RollbackFailed
+    ) {
+        return Err("rollback helper terminal state is invalid".into());
+    }
+    let store = agent_store::Store::open(&config.storage.path, config.storage.max_database_bytes)?;
+    let mut record = store
+        .change_set(transaction_id)?
+        .ok_or("rollback helper ChangeSet is unavailable")?;
+    let now = record
+        .rollback_deadline_monotonic_ms
+        .unwrap_or(record.expires_monotonic_ms)
+        .saturating_add(1);
+    if matches!(
+        record.state,
+        ChangeSetState::RollbackArmed
+            | ChangeSetState::Applying
+            | ChangeSetState::Verifying
+            | ChangeSetState::AwaitingConfirmation
+    ) {
+        store.transition_change_set(
+            &record.id,
+            record.state,
+            ChangeSetState::RollingBack,
+            &record.plan_digest,
+            &record.boot_id,
+            now,
+        )?;
+        record.state = ChangeSetState::RollingBack;
+    }
+    if record.state == ChangeSetState::RollingBack {
+        store.transition_change_set(
+            &record.id,
+            ChangeSetState::RollingBack,
+            terminal,
+            &record.plan_digest,
+            &record.boot_id,
+            now,
+        )?;
+        return Ok(());
+    }
+    if record.state == terminal {
+        return Ok(());
+    }
+    Err("rollback helper ChangeSet state is not reconcilable".into())
 }
 
 fn restore_runtime_canonical(
@@ -943,7 +1011,8 @@ async fn run_client(socket: &Path, command: Command) -> Result<(), Box<dyn Error
 
 #[cfg(test)]
 mod cli_tests {
-    use agent_protocol::{ChangeApprovalResponse, ResponseData};
+    use agent_protocol::{ChangeApprovalResponse, ResponseData, RiskLevel};
+    use agent_store::ChangeSetRecord;
 
     use super::*;
 
@@ -982,5 +1051,93 @@ mod cli_tests {
         .expect("official response shape");
         assert_eq!(response.status.as_deref(), Some("confirmed"));
         assert_eq!(response.bot_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn rollback_helper_records_terminal_changeset_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-helper-state-{nonce}"));
+        fs::create_dir(&root).expect("runtime root");
+        let mut config = AgentConfig::default();
+        config.storage.path = root.join("agent.db");
+        let store =
+            agent_store::Store::open(&config.storage.path, config.storage.max_database_bytes)
+                .expect("store");
+        let record = ChangeSetRecord {
+            id: "helper-state".into(),
+            plan_digest: "a".repeat(64),
+            plan_payload: br#"{"schema_version":1}"#.to_vec(),
+            state: ChangeSetState::Planned,
+            actor_id: "cli/local".into(),
+            boot_id: "boot-1".into(),
+            risk: RiskLevel::R3,
+            expires_monotonic_ms: 1_000,
+            rollback_deadline_monotonic_ms: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        store
+            .insert_change_set(&record, 4, 4_096, 1)
+            .expect("insert ChangeSet");
+        let mut state = ChangeSetState::Planned;
+        for next in [
+            ChangeSetState::AwaitingApproval,
+            ChangeSetState::Approved,
+            ChangeSetState::Staged,
+            ChangeSetState::Validated,
+        ] {
+            store
+                .transition_change_set(
+                    &record.id,
+                    state,
+                    next,
+                    &record.plan_digest,
+                    &record.boot_id,
+                    2,
+                )
+                .expect("advance ChangeSet");
+            state = next;
+        }
+        store
+            .arm_change_set_rollback(&record.id, &record.plan_digest, &record.boot_id, 2, 100)
+            .expect("arm rollback");
+        state = ChangeSetState::RollbackArmed;
+        for next in [
+            ChangeSetState::Applying,
+            ChangeSetState::Verifying,
+            ChangeSetState::AwaitingConfirmation,
+        ] {
+            store
+                .transition_change_set(
+                    &record.id,
+                    state,
+                    next,
+                    &record.plan_digest,
+                    &record.boot_id,
+                    3,
+                )
+                .expect("advance armed ChangeSet");
+            state = next;
+        }
+        drop(store);
+
+        record_helper_rollback_state(&config, &record.id, ChangeSetState::RolledBack)
+            .expect("record helper outcome");
+        let store =
+            agent_store::Store::open(&config.storage.path, config.storage.max_database_bytes)
+                .expect("reopen store");
+        assert_eq!(
+            store
+                .change_set(&record.id)
+                .expect("read ChangeSet")
+                .expect("ChangeSet")
+                .state,
+            ChangeSetState::RolledBack
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup runtime root");
     }
 }

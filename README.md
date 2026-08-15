@@ -90,8 +90,9 @@ The current delivery status and pending RC gates are tracked in
   checked by `scripts/validate-openwrt-matrix.sh`; official SDK package builds are
   available through `scripts/build-openwrt-sdk-package.sh` and the manual
   `.github/workflows/openwrt-sdk.yml` workflow. QEMU, namespace, Flash write-set, and
-  binary-footprint helpers provide bounded RC acceptance gates; firmware/device
-  transactions remain external test inputs.
+  binary-footprint helpers provide bounded RC acceptance gates. The fail-closed
+  device runners cover read-only diagnostics and an explicitly enabled R3 firewall
+  apply/timeout-rollback transaction; firmware images and SSH targets remain external inputs.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
   redirects, and redacted API-key configuration.

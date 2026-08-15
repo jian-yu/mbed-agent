@@ -23,6 +23,15 @@ use platform_linux::firewall_openwrt_execute::{
 use platform_linux::firewall_runtime::{
     inspect_generic_iptables_inventory, inspect_generic_nftables_inventory,
 };
+use tracing::error;
+
+fn openwrt_execution_error(
+    stage: &'static str,
+    error: impl std::fmt::Display,
+) -> ExecutionPortError {
+    error!(stage, %error, "OpenWrt firewall transaction stage failed");
+    ExecutionPortError
+}
 
 pub(crate) struct OpenWrtExecutionPort {
     transaction: Option<OpenWrtFirewallTransaction>,
@@ -132,7 +141,7 @@ impl OpenWrtExecutionPort {
             config.backend,
             config.execution.clone(),
         )
-        .map_err(|_| ExecutionPortError)?;
+        .map_err(|error| openwrt_execution_error("initialize", error))?;
         Ok(Self {
             transaction: Some(transaction),
             confirmation_runner: config.runner,
@@ -204,23 +213,25 @@ impl ChangeExecutionPort for OpenWrtExecutionPort {
         if self.transaction.is_some() {
             self.transaction()?
                 .reinspect()
-                .map_err(|_| ExecutionPortError)
+                .map_err(|error| openwrt_execution_error("reinspect", error))
         } else {
             verify_openwrt_firewall_plan(&self.confirmation_runner, &self.execution)
-                .map_err(|_| ExecutionPortError)?;
+                .map_err(|error| openwrt_execution_error("confirm_reinspect", error))?;
             self.confirmation_verified = true;
             Ok(())
         }
     }
 
     fn stage(&mut self) -> Result<(), ExecutionPortError> {
-        self.transaction()?.stage().map_err(|_| ExecutionPortError)
+        self.transaction()?
+            .stage()
+            .map_err(|error| openwrt_execution_error("stage", error))
     }
 
     fn validate_stage(&mut self) -> Result<(), ExecutionPortError> {
         self.transaction()?
             .validate_stage()
-            .map_err(|_| ExecutionPortError)
+            .map_err(|error| openwrt_execution_error("validate", error))
     }
 
     fn arm_rollback(&mut self, _deadline_monotonic_ms: u64) -> Result<(), ExecutionPortError> {
@@ -239,12 +250,14 @@ impl ChangeExecutionPort for OpenWrtExecutionPort {
     fn activate(&mut self) -> Result<(), ExecutionPortError> {
         self.transaction()?
             .activate_after_rollback_armed()
-            .map_err(|_| ExecutionPortError)
+            .map_err(|error| openwrt_execution_error("activate", error))
     }
 
     fn verify(&mut self) -> Result<(), ExecutionPortError> {
         if self.transaction.is_some() {
-            self.transaction()?.verify().map_err(|_| ExecutionPortError)
+            self.transaction()?
+                .verify()
+                .map_err(|error| openwrt_execution_error("verify", error))
         } else if self.confirmation_verified {
             Ok(())
         } else {

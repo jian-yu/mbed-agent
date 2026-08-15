@@ -1,5 +1,6 @@
 //! Concrete `OpenWrt` firewall staging, validation, activation, and verification.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -9,6 +10,7 @@ use agent_core::{
     FirewallExecutionPlan, FirewallInventory, project_firewall_inventory,
     verify_firewall_plan_result,
 };
+use agent_protocol::{ChangeOperation, FirewallObject};
 use ring::digest::{SHA256, digest};
 use thiserror::Error;
 
@@ -214,11 +216,16 @@ impl<R: FirewallCommandExecutor> OpenWrtFirewallTransaction<R> {
             std::str::from_utf8(&staged_uci)
                 .map_err(|_| OpenWrtExecutionError::MalformedInspection)?,
         )?;
-        if !inventory_equal(
+        if !staged_inventory_matches(
+            self.snapshot
+                .as_ref()
+                .ok_or(OpenWrtExecutionError::InvalidState)?
+                .inventory(),
             staged.inventory(),
             self.expected
                 .as_ref()
                 .ok_or(OpenWrtExecutionError::InvalidState)?,
+            &self.execution,
         ) {
             return Err(OpenWrtExecutionError::StagedStateMismatch);
         }
@@ -490,6 +497,100 @@ fn inventory_equal(left: &FirewallInventory, right: &FirewallInventory) -> bool 
     left.sort_by(order);
     right.sort_by(order);
     left == right
+}
+
+fn staged_inventory_matches(
+    before: &FirewallInventory,
+    staged: &FirewallInventory,
+    expected: &FirewallInventory,
+    execution: &FirewallExecutionPlan,
+) -> bool {
+    if verify_firewall_plan_result(staged, &execution.typed).is_err()
+        || staged.objects.len() != expected.objects.len()
+    {
+        return false;
+    }
+    let before = inventory_by_identity(before);
+    let staged = inventory_by_identity(staged);
+    let expected = inventory_by_identity(expected);
+    if before.is_none() || staged.is_none() || expected.is_none() {
+        return false;
+    }
+    let before = before.unwrap_or_default();
+    let staged = staged.unwrap_or_default();
+    let expected = expected.unwrap_or_default();
+    if staged.len() != expected.len() {
+        return false;
+    }
+    let touched: HashSet<(&str, &str)> = execution
+        .typed
+        .changes
+        .iter()
+        .filter_map(|change| {
+            change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .map(|object| (object.kind(), object.id()))
+        })
+        .collect();
+    let ordering_changed = execution.typed.changes.iter().any(|change| {
+        change.diff.operation == ChangeOperation::Move
+            || matches!(
+                change.after.as_ref().or(change.before.as_ref()),
+                Some(FirewallObject::FilterRule(_) | FirewallObject::NatRule(_))
+            ) && matches!(
+                change.diff.operation,
+                ChangeOperation::Create | ChangeOperation::Delete
+            )
+    });
+    expected.iter().all(|(key, expected_object)| {
+        let Some(staged_object) = staged.get(key) else {
+            return false;
+        };
+        if touched.contains(key) {
+            return *staged_object == *expected_object;
+        }
+        let Some(before_object) = before.get(key) else {
+            return false;
+        };
+        if ordering_changed {
+            equal_ignoring_order(before_object, staged_object)
+        } else {
+            *before_object == *staged_object
+        }
+    })
+}
+
+fn inventory_by_identity(
+    inventory: &FirewallInventory,
+) -> Option<HashMap<(&str, &str), &FirewallObject>> {
+    let mut indexed = HashMap::with_capacity(inventory.objects.len());
+    for object in &inventory.objects {
+        if indexed
+            .insert((object.kind(), object.id()), object)
+            .is_some()
+        {
+            return None;
+        }
+    }
+    Some(indexed)
+}
+
+fn equal_ignoring_order(left: &FirewallObject, right: &FirewallObject) -> bool {
+    match (left, right) {
+        (FirewallObject::FilterRule(left), FirewallObject::FilterRule(right)) => {
+            let mut right = right.clone();
+            right.order = left.order;
+            left == &right
+        }
+        (FirewallObject::NatRule(left), FirewallObject::NatRule(right)) => {
+            let mut right = right.clone();
+            right.order = left.order;
+            left == &right
+        }
+        _ => left == right,
+    }
 }
 
 fn hex_digest(value: &[u8]) -> String {

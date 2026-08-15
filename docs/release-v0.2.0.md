@@ -36,5 +36,8 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
   firewall/network inventory smoke。
 - 两次 smoke 均确认 `/etc/config` 前后聚合 SHA-256 一致，且测试使用的进程、
   SQLite/WAL、socket、日志、binary 和配置副本均从 `/tmp` 清理。
-- 尚未安装 `.ipk`，也未执行需要管理员审批的 firewall/network 写事务；这些仍是
-  v0.2.0 的外部发布门槛。
+- fw4 防火墙写事务已完成真实的 `device-admin` 提权、R3 plan、一次性审批、原生
+  校验、apply/reload、5 秒 confirmed-commit 超时、独立 helper 回滚和 ChangeSet
+  `rolled_back` 状态同步；回滚后 `/etc/config` 聚合 SHA-256 精确恢复。
+- 尚未安装 `.ipk`，也未执行 fw3 或 network 真机写事务；这些仍是 v0.2.0 的外部
+  发布门槛。
