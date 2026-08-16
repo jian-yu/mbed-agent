@@ -36,6 +36,9 @@ version.
   upstream failures and shares the primary resource budgets.
 - Status responses expose only the configured fallback count, preserving endpoint and
   credential privacy while remaining backward-compatible with older clients.
+- Release-candidate automation now builds and fingerprints the ARM64 musl binary with
+  the pinned Zig/cargo-zigbuild toolchain; foreign binaries can supply their validated
+  Cargo version to the artifact manifest without executing on the runner.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

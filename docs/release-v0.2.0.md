@@ -47,6 +47,9 @@ firewall/network、MQTT、微信 ClawBot、企业微信文本 Channel 和多 LLM
   `scripts/check-release-footprint.sh` 已在本地通过；此前 aarch64 musl 交叉二进制及
   当前验证产物均低于 8 MiB 门槛。原生 daemon idle RSS 实测 9,856 KiB，低于 64 MiB
   门槛。
+- `.github/workflows/release-candidate.yml` 现已增加独立 ARM64 musl job，固定 Zig
+  0.14.1/cargo-zigbuild 0.20.1，并使用 `MBED_AGENT_VERSION` 生成 foreign binary 的
+  checksum/manifest；该 job 仍需在 CI 实际运行后替换下方基线摘要。
 - `scripts/run-linux-firewall-namespace-smoke.sh` 已在 Docker Alpine Linux
   特权 namespace 中通过 nftables 及 iptables/ip6tables 原生 check、apply、cleanup
   和前后快照一致性验证。

@@ -44,3 +44,44 @@ jobs:
         with:
           name: mbed-agent-release-candidate
           path: dist/release/
+
+  aarch64:
+    name: ARM64 musl release candidate
+    runs-on: ubuntu-latest
+    env:
+      MBED_AGENT_METADATA_PLATFORM: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig prerequisites
+        run: sudo apt-get update && sudo apt-get install --yes python3-venv
+      - name: Install pinned Rust toolchain and target
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal
+          rustup target add aarch64-unknown-linux-musl --toolchain 1.85.1
+      - name: Install pinned cross-build tools
+        run: |
+          python3 -m venv /tmp/mbed-agent-zig-venv
+          /tmp/mbed-agent-zig-venv/bin/pip install ziglang==0.14.1
+          cargo install cargo-zigbuild --version 0.20.1 --locked
+          zig_path=$(/tmp/mbed-agent-zig-venv/bin/python -c \
+            'import pathlib, ziglang; print(pathlib.Path(ziglang.__file__).parent / "zig")')
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$zig_path" >> "$GITHUB_ENV"
+      - name: Build ARM64 musl binary
+        run: cargo +1.85.1 zigbuild --release --locked --target aarch64-unknown-linux-musl -p mbed-agent
+      - name: Validate ARM64 binary footprint
+        run: |
+          file target/aarch64-unknown-linux-musl/release/mbed-agent | grep -F 'ARM aarch64'
+          MBED_AGENT_SKIP_BINARY_EXEC=1 sh scripts/check-release-footprint.sh \
+            target/aarch64-unknown-linux-musl/release/mbed-agent
+      - name: Prepare ARM64 release artifacts
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | \
+            python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "mbed-agent"))')
+          MBED_AGENT_VERSION="$version" \
+            sh scripts/prepare-release-artifacts.sh \
+            target/aarch64-unknown-linux-musl/release/mbed-agent dist/release-aarch64/
+      - name: Upload ARM64 release candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mbed-agent-release-candidate-aarch64
+          path: dist/release-aarch64/

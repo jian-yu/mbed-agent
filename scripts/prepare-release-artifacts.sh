@@ -14,7 +14,12 @@ command -v sha256sum >/dev/null 2>&1
 command -v cargo >/dev/null 2>&1
 command -v rustc >/dev/null 2>&1
 
-version=$($binary --version | awk 'NR == 1 { print $2; exit }')
+# Foreign target binaries cannot be executed on the release runner. In that
+# case the workflow supplies the already validated Cargo package version.
+version=${MBED_AGENT_VERSION:-}
+if [ -z "$version" ]; then
+    version=$($binary --version | awk 'NR == 1 { print $2; exit }')
+fi
 case "$version" in
     [0-9]*.[0-9]*.[0-9]*) ;;
     *)

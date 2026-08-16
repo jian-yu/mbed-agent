@@ -57,4 +57,6 @@ sh scripts/prepare-release-artifacts.sh target/release/mbed-agent
 输出目录默认为 `dist/release/`；`sbom.cargo.json` 是设备构建不依赖额外工具的原始
 依赖清单，发布服务应在上传前转换为组织要求的 SPDX/CycloneDX SBOM。交叉构建时
 可设置 `MBED_AGENT_METADATA_PLATFORM`，使 Cargo 依赖图只解析目标平台。
+对于不能在构建 runner 上执行的 foreign binary，设置已由 Cargo 元数据校验过的
+`MBED_AGENT_VERSION`，脚本会跳过 `--version` 执行并继续生成 checksum/manifest。
 校验聚合产物时在输出目录执行 `sha256sum -c checksums.sha256`。
