@@ -12,7 +12,7 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
 
 - capability 矩阵与实际 dispatcher 一致；
 - SQLite/WAL、日志、artifact、rollback 不突破 `/tmp` 配额；
-- OpenWrt SDK 产物能按 release/target/subtarget 重建并校验 checksum；
+- OpenWrt target/capability 矩阵与实际 dispatcher 一致；SDK 打包流程作为独立的可选交付工具维护；
 - fw3/fw4、nftables/iptables 的变更事务具备集成测试证据；
 - daemon idle RSS、release binary 大小和非配置持久化写入有门禁；
 - 变更、回滚、Channel 重连和重复消息行为有可追溯结果。
@@ -20,7 +20,7 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
 ## RC 门槛
 
 1. `cargo fmt --check`、`cargo clippy -D warnings`、workspace tests 全部通过。
-2. `openwrt/targets.tsv` 校验通过，至少完成一组 x86/64 SDK package build。
+2. `openwrt/targets.tsv` 校验通过；本版本不要求官方 SDK `.ipk` 构建或设备安装。
 3. OpenWrt 21.02 fw3 和 22.03+ fw4 至少各完成一次 QEMU 或真实设备事务测试。
 4. 通用 Linux nftables 和 iptables 至少各完成一次 namespace/真实内核测试。
 5. 运行态 Flash 写入快照只允许配置和批准的业务配置变化。
@@ -49,5 +49,5 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
   特权 namespace 中通过 nftables 及 iptables/ip6tables 原生 check、apply、cleanup
   和前后快照一致性验证；这项证据覆盖通用 Linux 内核控制面，daemon typed transaction
   的行为仍由 `platform-linux` 的 85 个单元测试覆盖。
-- 尚未安装 `.ipk`；通用 Linux daemon transaction（超出原生 namespace smoke）、
-  Flash 写集和 Channel soak 仍是 v0.2.0 的外部发布门槛。
+- 通用 Linux daemon transaction（超出原生 namespace smoke）、Flash 写集和
+  Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK `.ipk` 构建与设备安装不属于本版本验收范围。

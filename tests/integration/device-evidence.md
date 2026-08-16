@@ -40,8 +40,9 @@ LAN addresses, credentials, tokens, SSIDs, public addresses, or customer identif
 The same target also passed the real-device firewall confirmed-commit smoke: the
 Agent-owned typed rule reached `awaiting_confirmation`, the independent helper rolled it
 back after the bounded deadline, the `rolled_back` ChangeSet state was observed, and the
-aggregate `/etc/config` SHA-256 returned to its pre-test value. No package was installed;
-package installation and approved Flash write-set evidence remain pending.
+aggregate `/etc/config` SHA-256 returned to its pre-test value. No package was installed
+by design; this evidence does not cover optional SDK packaging. Approved Flash write-set
+evidence remains pending.
 
 ## 2026-08-16 — OpenWrt 21.02.0 fw3 transactions
 

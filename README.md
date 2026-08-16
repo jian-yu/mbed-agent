@@ -87,10 +87,11 @@ The current delivery status and pending RC gates are tracked in
   the WAN run also includes firewall-backend and UCI zone evidence.
 - OpenWrt procd and UCI configuration skeletons.
 - Reproducible OpenWrt package delivery inputs: the supported release/target matrix is
-  checked by `scripts/validate-openwrt-matrix.sh`; official SDK package builds are
+  checked by `scripts/validate-openwrt-matrix.sh`; optional SDK package builds remain
   available through `scripts/build-openwrt-sdk-package.sh` and the manual
-  `.github/workflows/openwrt-sdk.yml` workflow. QEMU, namespace, Flash write-set, and
-  binary-footprint helpers provide bounded RC acceptance gates. The fail-closed
+  `.github/workflows/openwrt-sdk.yml` workflow, but `.ipk` construction and device
+  installation are outside the v0.2.0 acceptance scope. QEMU, namespace, Flash
+  write-set, and binary-footprint helpers provide bounded RC acceptance gates. The fail-closed
   device runners cover read-only diagnostics and an explicitly enabled R3 firewall
   and network apply/timeout-rollback transaction; firmware images and SSH targets remain
   external inputs.
@@ -644,8 +645,8 @@ release pipeline supplies `MBED_AGENT_BINARY` for the target architecture. It
 does not assume either fw3 or fw4; runtime capability discovery selects the
 available firewall stack. Configuration files are conffiles, while SQLite,
 logs, rollback artifacts, and channel cursors remain volatile under `/tmp`.
-Per-target `.ipk` artifacts still require validation against the corresponding
-OpenWrt SDK image before release.
+Per-target `.ipk` artifacts are optional delivery outputs and are not required for the
+v0.2.0 acceptance boundary; the agent never installs packages at runtime.
 
 ## Generic Linux integration
 

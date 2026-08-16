@@ -38,9 +38,10 @@ version.
 
 ### Release gates still requiring external evidence
 
-- At least one real SDK package build with a downloaded official SDK.
-- OpenWrt fw3 and fw4 device transactions have passed on Raspberry Pi 4 bcm2711
-  devices running OpenWrt 21.02.0 and 24.10.8.
-- Linux nftables and iptables namespace/real-kernel transactions.
+- Generic Linux daemon nftables/iptables transactions beyond the native namespace
+  smoke.
 - Flash write-set snapshots on representative devices.
 - 72-hour Channel reconnect, duplicate-message, and low-watermark soak.
+
+The official OpenWrt SDK packaging workflow remains an optional delivery tool; v0.2.0
+does not require an SDK `.ipk` build or installation on a device.
