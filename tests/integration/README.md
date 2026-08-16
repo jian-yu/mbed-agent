@@ -27,8 +27,22 @@ sh scripts/run-linux-namespace-smoke.sh
 没有 `CAP_NET_ADMIN` 时默认报告 `SKIP`；CI 或设备回归可设置
 `MBED_AGENT_NAMESPACE_SMOKE_REQUIRED=1` 将 skip 变为失败。
 
-后续 namespace fixture 应增加 veth、nftables/iptables、dnsmasq、tc/netem，并把
-Agent-owned route/firewall transaction 接到真实 daemon socket。
+通用 Linux 防火墙原生控制面使用以下 Docker 入口验收。容器只读挂载仓库，特权只
+作用于临时 network namespace，退出后容器自动删除：
+
+```sh
+docker run --rm --privileged --network bridge \
+  -v "$PWD:/workspace:ro" alpine:3.20 sh -euxc '
+    apk add --no-cache iproute2 util-linux nftables iptables
+    MBED_AGENT_LINUX_FIREWALL_SMOKE_REQUIRED=1 \
+    MBED_AGENT_LINUX_FIREWALL_SMOKE_REQUIRE_BOTH=1 \
+    sh /workspace/scripts/run-linux-firewall-namespace-smoke.sh
+  '
+```
+
+该 smoke 覆盖 nftables check/apply/cleanup、iptables/ip6tables 双栈 restore test、
+Agent-owned chain hook 和前后 native snapshot 一致性；typed daemon transaction
+仍由 `platform-linux` 测试和真实 Linux daemon socket 回归继续覆盖。
 
 ## OpenWrt QEMU
 

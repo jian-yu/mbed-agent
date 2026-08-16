@@ -45,5 +45,9 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
   `scripts/check-release-footprint.sh` 已在本地通过；aarch64 musl 交叉二进制为
   6,542,656 bytes（SHA-256 `ce1636ddb25bd78880110c7b71e286f004cf533926b08afe409f818d38771c5d`），
   低于 8 MiB 门槛。原生 daemon idle RSS 实测 9,856 KiB，低于 64 MiB 门槛。
-- 尚未安装 `.ipk`；通用 Linux nftables/iptables、Flash 写集和 Channel soak 仍是
-  v0.2.0 的外部发布门槛。
+- `scripts/run-linux-firewall-namespace-smoke.sh` 已在 Docker Alpine Linux
+  特权 namespace 中通过 nftables 及 iptables/ip6tables 原生 check、apply、cleanup
+  和前后快照一致性验证；这项证据覆盖通用 Linux 内核控制面，daemon typed transaction
+  的行为仍由 `platform-linux` 的 85 个单元测试覆盖。
+- 尚未安装 `.ipk`；通用 Linux daemon transaction（超出原生 namespace smoke）、
+  Flash 写集和 Channel soak 仍是 v0.2.0 的外部发布门槛。
