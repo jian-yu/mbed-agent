@@ -55,7 +55,10 @@
 - `scripts/run-openwrt-qemu-smoke.sh`、`scripts/run-linux-namespace-smoke.sh` 和
   `scripts/check-persistent-write-set.sh` 分别提供 OpenWrt 启动、通用 Linux 能力、
   运行态 Flash 写入快照的有界验收入口。仓库不携带固件镜像，真实 fw3 事务、
-  namespace 内核能力和 72 小时 Channel 稳定性仍是 v0.2.0 RC 的外部验收门槛。
+  namespace 内核能力、Flash 写集和 72 小时 Channel 稳定性仍按发布门槛执行。
+- `scripts/run-linux-firewall-daemon-smoke.sh` 已在 Docker Alpine 特权 Linux 容器中
+  分别验证 generic nftables 与 iptables/ip6tables 的完整 daemon apply、confirmed-
+  commit 超时、独立 helper 回滚和 native 快照恢复。
 - `scripts/run-openwrt-device-readonly-smoke.sh` 已在 OpenWrt 24.10.8
   bcm27xx/bcm2711 真机重复通过：aarch64 daemon、ping/status/capabilities、13 个
   被动诊断和 firewall/network inventory 均成功，`/etc/config` 前后哈希一致。

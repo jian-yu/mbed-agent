@@ -21,6 +21,7 @@ policy rule；不会修改第三方网络管理器或未声明 ownership 的对�
 
 ## 交付要求
 
-正式发布前必须完成 OpenWrt SDK 的 target/subtarget/架构矩阵、QEMU fw3/fw4
-事务测试、Linux network namespace 测试，并记录 binary 大小、RSS、CPU 和非配置
-Flash 写入结果。
+正式发布前必须完成 OpenWrt target/subtarget/架构能力矩阵、QEMU fw3/fw4 事务测试、
+Linux network namespace 与 generic firewall daemon 事务测试，并记录 binary 大小、
+RSS、CPU 和非配置 Flash 写入结果。官方 SDK `.ipk` 构建与真实安装是可选交付流程，
+不属于 v0.2.0 验收门槛。

@@ -480,7 +480,11 @@ fn spec_with_uci(
 }
 
 fn executable(path: &Path) -> Result<PathBuf, FirewallCommandError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| FirewallCommandError::Unavailable)?;
+    // Standard Linux packages commonly expose fixed commands through symlinks
+    // (for example iptables-save -> xtables-nft-multi). The command name is
+    // closed by FirewallCommand, so follow the package link while still
+    // requiring the resolved target to be a regular executable.
+    let metadata = fs::metadata(path).map_err(|_| FirewallCommandError::Unavailable)?;
     if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
         Ok(path.to_path_buf())
     } else {
@@ -556,6 +560,22 @@ mod tests {
                 Some(b"*filter\nCOMMIT\n"),
             )
             .expect("run");
+        assert_eq!(output.stdout, b"*filter\nCOMMIT\n");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn fixed_runner_accepts_package_symlinked_commands() {
+        let root = fixture_root();
+        write_program(
+            &root.join("bin/xtables-nft-multi"),
+            "#!/bin/sh\nprintf '%s\\n' '*filter' 'COMMIT'\n",
+        );
+        symlink("xtables-nft-multi", root.join("bin/iptables-save")).expect("command symlink");
+        let runner = test_runner(&root, Duration::from_secs(1), 32, 32);
+        let output = runner
+            .run(&FirewallCommand::IptablesSave { ipv6: false }, None)
+            .expect("run symlinked command");
         assert_eq!(output.stdout, b"*filter\nCOMMIT\n");
         fs::remove_dir_all(root).expect("cleanup");
     }

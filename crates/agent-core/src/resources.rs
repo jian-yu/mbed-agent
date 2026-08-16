@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -35,9 +36,27 @@ impl TmpBudget {
             .parent()
             .ok_or_else(|| ResourceError::InvalidPath(config.path.clone()))?
             .to_path_buf();
+        if let Ok(metadata) = fs::symlink_metadata(&root) {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ResourceError::UnsafeRuntime(root));
+            }
+        }
         fs::create_dir_all(&root).map_err(|source| ResourceError::Create {
             path: root.clone(),
             source,
+        })?;
+        let metadata = fs::symlink_metadata(&root).map_err(|source| ResourceError::Inspect {
+            path: root.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ResourceError::UnsafeRuntime(root));
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            ResourceError::Create {
+                path: root.clone(),
+                source,
+            }
         })?;
         Ok(Self { root, config })
     }
@@ -241,6 +260,8 @@ fn classify_pressure(
 pub enum ResourceError {
     #[error("runtime path has no parent: {0}")]
     InvalidPath(PathBuf),
+    #[error("runtime directory is not a private directory: {0}")]
+    UnsafeRuntime(PathBuf),
     #[error("failed to create runtime directory {path}: {source}")]
     Create {
         path: PathBuf,
@@ -318,6 +339,14 @@ mod tests {
             ..StorageConfig::default()
         };
         let budget = TmpBudget::new(config).expect("budget");
+        assert_eq!(
+            fs::metadata(&root)
+                .expect("runtime metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         let artifacts = root.join("artifacts");
         let rollback = root.join("rollback");
         fs::create_dir_all(artifacts.join("nested")).expect("artifact directories");
@@ -339,5 +368,27 @@ mod tests {
         assert!(artifacts.join("nested/ignored.bin").exists());
 
         fs::remove_dir_all(root).expect("remove budget test directory");
+    }
+
+    #[test]
+    fn runtime_root_rejects_symlinks_and_is_private() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!("mbed-agent-budget-symlink-{nonce}"));
+        let target = parent.join("target");
+        let link = parent.join("link");
+        fs::create_dir_all(&target).expect("target directory");
+        symlink(&target, &link).expect("runtime symlink");
+        let config = StorageConfig {
+            path: link.join("agent.db"),
+            ..StorageConfig::default()
+        };
+        assert!(matches!(
+            TmpBudget::new(config),
+            Err(ResourceError::UnsafeRuntime(path)) if path == link
+        ));
+        fs::remove_dir_all(parent).expect("remove symlink fixture");
     }
 }

@@ -14,8 +14,8 @@ typed canonical inventory, staging data, and rollback artifacts live below
 ## Decisions
 
 1. Admit generic writes only when capability discovery selects native
-   nftables. The iptables dual-family transaction remains closed until its
-   separate recovery protocol is complete.
+   nftables. The separate iptables dual-family transaction is admitted only
+   after its own recovery protocol and native smoke are available.
 2. Planning, apply, and confirmation each collect a fresh fixed-table
    observation and reconcile it with the boot-bound canonical SQLite state.
    Orphan state, foreign ownership, stale boot IDs, and native drift fail
@@ -41,4 +41,3 @@ Linux nftables systems through one policy and state machine. Generic nftables
 changes do not add Flash writes. A device reboot intentionally discards the
 canonical database; any surviving externally persisted owned table is treated
 as orphaned rather than silently adopted.
-

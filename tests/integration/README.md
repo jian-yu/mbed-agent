@@ -41,8 +41,37 @@ docker run --rm --privileged --network bridge \
 ```
 
 该 smoke 覆盖 nftables check/apply/cleanup、iptables/ip6tables 双栈 restore test、
-Agent-owned chain hook 和前后 native snapshot 一致性；typed daemon transaction
-仍由 `platform-linux` 测试和真实 Linux daemon socket 回归继续覆盖。
+Agent-owned chain hook 和前后 native snapshot 一致性。
+
+通用 Linux daemon 的完整防火墙事务（管理员提权、R3 plan、一次性审批、apply、
+confirmed-commit 超时、独立 helper 回滚和 SQLite/native 状态恢复）使用同一个 ARM64
+musl binary 在特权 Linux 容器中分别执行：
+
+```sh
+docker run --rm --privileged --network bridge \
+  -v "$PWD:/workspace:ro" alpine:3.20 sh -euxc '
+    apk add --no-cache iproute2 nftables jq
+    MBED_AGENT_LINUX_FIREWALL_BACKEND=nftables \
+    sh /workspace/scripts/run-linux-firewall-daemon-smoke.sh \
+      /workspace/target/aarch64-unknown-linux-musl/release/mbed-agent \
+      /workspace/config/mbed-agent.example.toml \
+      /workspace/docs/examples/firewall-rollback-smoke.json
+  '
+
+docker run --rm --privileged --network bridge \
+  -v "$PWD:/workspace:ro" alpine:3.20 sh -euxc '
+    apk add --no-cache iproute2 iptables jq
+    MBED_AGENT_LINUX_FIREWALL_BACKEND=iptables \
+    sh /workspace/scripts/run-linux-firewall-daemon-smoke.sh \
+      /workspace/target/aarch64-unknown-linux-musl/release/mbed-agent \
+      /workspace/config/mbed-agent.example.toml \
+      /workspace/docs/examples/firewall-rollback-smoke.json
+  '
+```
+
+脚本只在容器内写入私有 `/tmp`，iptables 快照会去除 `iptables-save` 的时间头后再比较，
+并显式 materialize 三个 builtin table，避免把工具输出时间或空表初始化差异误报为
+回滚失败。
 
 ## OpenWrt QEMU
 

@@ -49,6 +49,6 @@ MAC blocking is supported as one combination of typed match fields rather than
 as a privileged special case. The same desired state can be rendered by
 OpenWrt fw3/fw4 and generic Linux nftables/iptables adapters.
 
-This slice plans but does not render or apply configuration. Public write APIs
-remain closed until backend-native validation and the full approval/rollback
-orchestration are connected.
+Backend-native validation and the full approval/rollback orchestration are now
+connected for OpenWrt fw3/fw4 and generic Linux nftables/iptables. Public writes
+remain capability-gated and fail closed for unsupported or third-party objects.

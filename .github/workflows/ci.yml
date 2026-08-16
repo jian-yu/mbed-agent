@@ -41,6 +41,7 @@ jobs:
         run: |
           sh -n scripts/run-linux-namespace-smoke.sh
           sh -n scripts/run-linux-firewall-namespace-smoke.sh
+          sh -n scripts/run-linux-firewall-daemon-smoke.sh
           sh -n scripts/run-openwrt-qemu-smoke.sh
           sh -n scripts/run-openwrt-device-readonly-smoke.sh
           sh -n scripts/run-openwrt-device-firewall-rollback-smoke.sh

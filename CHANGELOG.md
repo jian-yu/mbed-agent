@@ -24,6 +24,10 @@ version.
   snapshot verification and volatile cleanup.
 - Real-device OpenWrt network UCI apply/timeout-rollback smoke, plus canonical R3
   risk signals for native network reloads.
+- Privileged Alpine Linux daemon transaction smoke for both generic nftables and
+  iptables/ip6tables, including confirmed-commit timeout rollback and native snapshot
+  restoration; standard package command symlinks are accepted by the fixed runner and
+  watchdog helper.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.
@@ -38,8 +42,6 @@ version.
 
 ### Release gates still requiring external evidence
 
-- Generic Linux daemon nftables/iptables transactions beyond the native namespace
-  smoke.
 - Flash write-set snapshots on representative devices.
 - 72-hour Channel reconnect, duplicate-message, and low-watermark soak.
 

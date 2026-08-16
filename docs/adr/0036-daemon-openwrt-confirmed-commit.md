@@ -44,5 +44,5 @@ verification.
 Actual OpenWrt firewall writes are now reachable only through the complete
 approval and confirmed-commit path. CLI and future Channels share the same
 protocol commands and cannot submit replacement rule bodies at apply time.
-Generic Linux nftables/iptables still remain closed until equivalent concrete
-execution ports are connected.
+Generic Linux nftables/iptables use the same state machine through their own
+native execution ports; they do not add persistent Flash writes.

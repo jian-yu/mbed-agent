@@ -35,6 +35,7 @@ jobs:
           sh -n scripts/prepare-release-artifacts.sh
           sh -n scripts/build-openwrt-sdk-package.sh
           sh -n scripts/run-linux-firewall-namespace-smoke.sh
+          sh -n scripts/run-linux-firewall-daemon-smoke.sh
           sh -n scripts/run-openwrt-qemu-smoke.sh
       - name: Prepare auditable artifacts
         run: sh scripts/prepare-release-artifacts.sh target/release/mbed-agent

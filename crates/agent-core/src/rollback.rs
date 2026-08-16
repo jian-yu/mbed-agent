@@ -1320,7 +1320,11 @@ fn managed_nftables_table_exists(nft: &Path) -> Result<bool, RollbackError> {
 fn resolve_fixed_program(name: &str) -> Result<PathBuf, RollbackError> {
     for directory in ["/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
         let candidate = Path::new(directory).join(name);
-        match fs::symlink_metadata(&candidate) {
+        // Linux packages commonly publish fixed utilities through symlinks
+        // (for example iptables-save -> xtables-nft-multi). The executable
+        // name is closed by this helper, so following that package link still
+        // preserves the command allow-list while accepting normal installs.
+        match fs::metadata(&candidate) {
             Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
                 return Ok(candidate);
             }

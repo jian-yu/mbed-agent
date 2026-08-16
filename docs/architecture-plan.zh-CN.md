@@ -1090,10 +1090,12 @@ inventory，并执行 fw3 双栈 print 或 fw4 check。安装入口只在 valida
 漂移即拒绝。安装后 reload 并重建 typed inventory 验证；staging 在失败和 drop 时
 清理。daemon 已用单写锁把一次性 approval token 原子消费、SQLite 安全状态转换、
 rollback bundle、同一二进制独立 helper 与该原生事务接成闭环，并开放 `change apply`。
-token 只从 stdin 读取，不进入 argv；仅 OpenWrt 21.02+ 的 fw3/fw4 capability 可进入
-当前写路径。R3 变更进入 `awaiting_confirmation`，`change confirm` 会重新读取 live
+token 只从 stdin 读取，不进入 argv；OpenWrt 21.02+ 的 fw3/fw4 与 generic Linux
+nftables/iptables capability 均可进入当前写路径。R3 变更进入 `awaiting_confirmation`，
+`change confirm` 会重新读取 live
 UCI 并逐一核对所有受影响对象后才原子确认 watchdog；超时或执行/验证失败由 helper
-恢复。普通 Linux nftables/iptables execution port 仍按同一闭环继续接入。
+恢复。普通 Linux nftables/iptables execution port 已按同一闭环接入，并共享
+device-admin、一次性 approval、confirmed-commit 和独立 helper。
 
 OpenWrt 写路径已有公开但严格 typed 的计划入口：`change firewall-plan` 从 stdin
 读取有界 JSON mutation 数组，daemon 在单写锁内重新执行 `uci show firewall`，重建

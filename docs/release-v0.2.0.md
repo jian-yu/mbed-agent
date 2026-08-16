@@ -22,7 +22,8 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
 1. `cargo fmt --check`、`cargo clippy -D warnings`、workspace tests 全部通过。
 2. `openwrt/targets.tsv` 校验通过；本版本不要求官方 SDK `.ipk` 构建或设备安装。
 3. OpenWrt 21.02 fw3 和 22.03+ fw4 至少各完成一次 QEMU 或真实设备事务测试。
-4. 通用 Linux nftables 和 iptables 至少各完成一次 namespace/真实内核测试。
+4. 通用 Linux nftables 和 iptables/ip6tables 至少各完成一次完整 daemon 事务测试；
+   原生 namespace smoke 作为底层控制面前置证据。
 5. 运行态 Flash 写入快照只允许配置和批准的业务配置变化。
 6. 使用 `scripts/prepare-release-artifacts.sh` 生成 release binary、checksum、
    Cargo 依赖图（SBOM 输入）和构建元数据；组织级发布服务再将依赖图转换为要求的
@@ -42,12 +43,18 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
 - OpenWrt network UCI 写事务也已在 21.02 真机完成同样的提权、审批、reload、
   超时回滚和精确恢复验收。
 - `scripts/prepare-release-artifacts.sh`、checksum/manifest/SBOM 输入和
-  `scripts/check-release-footprint.sh` 已在本地通过；aarch64 musl 交叉二进制为
-  6,542,656 bytes（SHA-256 `ce1636ddb25bd78880110c7b71e286f004cf533926b08afe409f818d38771c5d`），
-  低于 8 MiB 门槛。原生 daemon idle RSS 实测 9,856 KiB，低于 64 MiB 门槛。
+  `scripts/check-release-footprint.sh` 已在本地通过；此前 aarch64 musl 交叉二进制及
+  当前验证产物均低于 8 MiB 门槛。原生 daemon idle RSS 实测 9,856 KiB，低于 64 MiB
+  门槛。
 - `scripts/run-linux-firewall-namespace-smoke.sh` 已在 Docker Alpine Linux
   特权 namespace 中通过 nftables 及 iptables/ip6tables 原生 check、apply、cleanup
-  和前后快照一致性验证；这项证据覆盖通用 Linux 内核控制面，daemon typed transaction
-  的行为仍由 `platform-linux` 的 85 个单元测试覆盖。
-- 通用 Linux daemon transaction（超出原生 namespace smoke）、Flash 写集和
-  Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK `.ipk` 构建与设备安装不属于本版本验收范围。
+  和前后快照一致性验证。
+- 2026-08-16 在 Docker Alpine Linux 特权容器中，使用 ARM64 musl daemon 分别完成
+  generic nftables 与 iptables/ip6tables 的完整 socket 事务：管理员提权、R3 plan、
+  一次性 approval、原生 apply、5 秒 confirmed-commit 超时、独立 helper 回滚、
+  SQLite canonical state 与 native snapshot 恢复均通过；iptables 包装器的标准
+  `iptables-* -> xtables-nft-multi` 符号链接也已纳入兼容性验收。
+- 当前 ARM64 musl 验证产物为 7,376,520 bytes（SHA-256
+  `a92eb2bf94c8bdd47b0f3d809c098318762e5965663cc6f1d41a92f1300a54dd`），低于 8 MiB
+  门槛。Flash 写集和 Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK `.ipk`
+  构建与设备安装不属于本版本验收范围。

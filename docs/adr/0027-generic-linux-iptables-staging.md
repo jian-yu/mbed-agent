@@ -72,7 +72,8 @@ iptables/ip6tables without rebuilding unknown host policy. The iptables path is
 broader than a MAC blocker and covers the same main firewall objects, while
 being honest about rule expansion and non-atomic multi-family apply.
 
-This slice renders and golden-tests restore artifacts but does not execute them
-on the current macOS development host. Real Linux restore `--test`, namespace,
-partial-commit fault injection, verification, and rollback tests remain gates
-before public writes open.
+This slice renders and golden-tests restore artifacts. The repository now also
+provides a privileged Alpine Linux daemon smoke that executes real dual-stack
+restore `--test`, apply, confirmed-commit timeout, watchdog rollback, and native
+snapshot verification; the macOS development host remains read-only for native
+iptables execution.
