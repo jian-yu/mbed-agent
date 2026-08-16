@@ -1740,6 +1740,10 @@ pub struct StatusResponse {
     pub llm_enabled: bool,
     pub llm_provider: String,
     pub llm_streaming: bool,
+    /// Number of configured ordered fallback routes. This is intentionally a
+    /// count only; endpoint, model, credentials, and route health stay private.
+    #[serde(default)]
+    pub llm_fallback_count: u8,
     pub logging_dropped_records: u64,
     pub degraded_reasons: Vec<String>,
 }
@@ -2011,6 +2015,34 @@ mod tests {
     fn sensitive_strings_are_redacted_from_debug_output() {
         let secret = SensitiveString::new("do-not-log".into());
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn status_response_defaults_fallback_count_for_legacy_clients() {
+        let legacy = serde_json::json!({
+            "daemon_version": "0.1.0",
+            "protocol_version": PROTOCOL_VERSION,
+            "uptime_secs": 1,
+            "profile": "default",
+            "storage": {
+                "database_bytes": 0,
+                "wal_bytes": 0,
+                "database_limit_bytes": 1024,
+                "database_soft_limit_bytes": 900,
+                "managed_bytes": 0,
+                "total_budget_bytes": 2048,
+                "tmp_available_bytes": 4096,
+                "pressure": "normal"
+            },
+            "platform_kind": "generic_linux",
+            "llm_enabled": true,
+            "llm_provider": "openai-compatible",
+            "llm_streaming": true,
+            "logging_dropped_records": 0,
+            "degraded_reasons": []
+        });
+        let status: StatusResponse = serde_json::from_value(legacy).expect("legacy status");
+        assert_eq!(status.llm_fallback_count, 0);
     }
 
     #[test]

@@ -3493,6 +3493,10 @@ fn status_response(state: &AppState) -> ResponseData {
             "logging rate limit dropped {logging_dropped_records} records"
         ));
     }
+    let llm_fallback_count = match u8::try_from(state.config.llm.fallbacks.len()) {
+        Ok(count) => count,
+        Err(_) => u8::MAX,
+    };
     ResponseData::Status(StatusResponse {
         daemon_version: AGENT_VERSION.into(),
         protocol_version: PROTOCOL_VERSION,
@@ -3512,6 +3516,7 @@ fn status_response(state: &AppState) -> ResponseData {
         llm_enabled: state.llm.is_some(),
         llm_provider: state.config.llm.provider.as_str().into(),
         llm_streaming: state.config.llm.streaming,
+        llm_fallback_count,
         logging_dropped_records,
         degraded_reasons,
     })

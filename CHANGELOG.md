@@ -34,6 +34,8 @@ version.
 - LLM configuration remains backward compatible with one primary profile and now accepts up
   to three ordered OpenAI-compatible fallback profiles; fallback is limited to retryable
   upstream failures and shares the primary resource budgets.
+- Status responses expose only the configured fallback count, preserving endpoint and
+  credential privacy while remaining backward-compatible with older clients.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

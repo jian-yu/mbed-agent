@@ -30,6 +30,7 @@
 - Channel 当前主要支持文本；媒体、按钮、签名 envelope 和证书热轮换仍未完成。
 - LLM 当前支持一个主 OpenAI-compatible Provider 和最多三个有序 fallback profile；
   fallback 复用同一请求/响应/超时预算，仅在 transport、HTTP、解码或有界响应故障时切换。
+  `status` 仅暴露 fallback 数量，不暴露 endpoint、凭据或路由健康状态。
   logical model 路由、配额和健康度仍属于后续阶段。
 
 ## 存储和运行态约束

@@ -564,6 +564,8 @@ Optional `[[llm.fallbacks]]` profiles are tried in order only for retryable upst
 failures (transport errors, rate limits, timeouts, 5xx, or bounded response/decoding
 failures); they share the primary request/response and timeout budgets, and route
 health or failure payloads are not persisted.
+`mbed-agent status` exposes only the configured fallback count; it never exposes
+fallback endpoints, model credentials, or route health.
 When the model requests WAN evidence, the daemon runs only the passive typed
 diagnostic and sends the minimum normalized projection needed by the selected
 tool. Multiple WAN tools in one `ask` reuse the same in-memory snapshot. Raw
