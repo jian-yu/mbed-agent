@@ -20,7 +20,7 @@ version.
   `bcm27xx/bcm2711` aarch64 matrix target.
 - Pinned Zig 0.14.1/cargo-zigbuild 0.20.1 CI path for the bcm2711 aarch64 musl
   binary, plus a fail-closed SSH device read-only smoke runner.
-- Opt-in real-device fw4 apply/timeout-rollback smoke with exact `/etc/config`
+- Opt-in real-device fw3/fw4 apply/timeout-rollback smoke with exact `/etc/config`
   snapshot verification and volatile cleanup.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
@@ -37,7 +37,8 @@ version.
 ### Release gates still requiring external evidence
 
 - At least one real SDK package build with a downloaded official SDK.
-- OpenWrt fw3 QEMU or device transaction; fw4 has passed on OpenWrt 24.10.8 bcm2711.
+- OpenWrt fw3 and fw4 device transactions have passed on Raspberry Pi 4 bcm2711
+  devices running OpenWrt 21.02.0 and 24.10.8.
 - Linux nftables and iptables namespace/real-kernel transactions.
 - Flash write-set snapshots on representative devices.
 - 72-hour Channel reconnect, duplicate-message, and low-watermark soak.

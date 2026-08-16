@@ -94,9 +94,13 @@ set -eu
 [ ! -e '$remote_test_root' ]
 [ ! -e '$remote_runtime_root' ]
 ! pidof mbed-agent >/dev/null 2>&1
-command -v fw4 >/dev/null 2>&1
+command -v fw4 >/dev/null 2>&1 || command -v fw3 >/dev/null 2>&1
 command -v jsonfilter >/dev/null 2>&1
-fw4 check >/dev/null
+if command -v fw4 >/dev/null 2>&1; then
+    fw4 check >/dev/null
+else
+    fw3 -q print >/dev/null
+fi
 ! uci -q show firewall | grep -F \".name='$smoke_rule'\" >/dev/null
 mkdir -m 0700 '$remote_test_root'
 find /etc/config -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1 >'$remote_test_root/before.sha256'
@@ -199,7 +203,11 @@ grep -q '\"ok\": true' apply.json
 state=\$(jsonfilter -i apply.json -e '@.result.data.state')
 [ \"\$state\" = awaiting_confirmation ]
 uci -q show firewall | grep -F \".name='$smoke_rule'\" >/dev/null
-fw4 check >/dev/null
+if command -v fw4 >/dev/null 2>&1; then
+    fw4 check >/dev/null
+else
+    fw3 -q print >/dev/null
+fi
 echo \"PASS: R3 firewall change applied and awaits confirmation\"
 
 i=0
@@ -215,7 +223,11 @@ while [ \"\$state\" != rolled_back ]; do
     state=\$(jsonfilter -i state.json -e '@.result.data.state')
 done
 ! uci -q show firewall | grep -F \".name='$smoke_rule'\" >/dev/null
-fw4 check >/dev/null
+if command -v fw4 >/dev/null 2>&1; then
+    fw4 check >/dev/null
+else
+    fw3 -q print >/dev/null
+fi
 after=\$(find /etc/config -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
 before=\$(cat before.sha256)
 [ \"\$before\" = \"\$after\" ]
@@ -234,6 +246,10 @@ set -eu
 [ ! -e '$remote_runtime_root' ]
 ! pidof mbed-agent >/dev/null 2>&1
 ! uci -q show firewall | grep -F \".name='$smoke_rule'\" >/dev/null
-fw4 check >/dev/null
+if command -v fw4 >/dev/null 2>&1; then
+    fw4 check >/dev/null
+else
+    fw3 -q print >/dev/null
+fi
 "
 echo "PASS: OpenWrt device firewall rollback smoke completed and cleaned up"

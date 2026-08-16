@@ -15,9 +15,9 @@ inventory → plan → approve → stage → native validate → arm rollback
 任何阶段失败都应进入 rollback。确认窗口内 daemon 退出、设备管理链路中断或业务
 探针失败时，由同一二进制的独立 rollback-helper 恢复本次启动内的快照。
 
-真实 fw4 设备可使用仓库中的受控回滚验收。该脚本会实际写入并 reload 防火墙，必须
+真实 OpenWrt fw3/fw4 设备可使用仓库中的受控回滚验收。该脚本会实际写入并 reload 防火墙，必须
 显式授权；测试规则使用不可路由地址、虚构 MAC 和 TCP/9，确认窗口为 5 秒，最终要求
-ChangeSet 为 `rolled_back`、`fw4 check` 成功且整个 `/etc/config` 哈希精确恢复：
+ChangeSet 为 `rolled_back`、原生校验成功且整个 `/etc/config` 哈希精确恢复：
 
 ```sh
 MBED_AGENT_ALLOW_DEVICE_WRITES=YES \

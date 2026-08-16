@@ -59,7 +59,7 @@
 - `scripts/run-openwrt-device-readonly-smoke.sh` 已在 OpenWrt 24.10.8
   bcm27xx/bcm2711 真机重复通过：aarch64 daemon、ping/status/capabilities、13 个
   被动诊断和 firewall/network inventory 均成功，`/etc/config` 前后哈希一致。
-- `scripts/run-openwrt-device-firewall-rollback-smoke.sh` 已在同一 fw4 真机通过：
-  CLI 管理员密码提权、R3 typed plan、一次性审批、staging、`fw4 check`、apply/reload、
+- `scripts/run-openwrt-device-firewall-rollback-smoke.sh` 已支持并在 fw3/fw4 真机验证：
+  CLI 管理员密码提权、R3 typed plan、一次性审批、staging、原生 `fw3 -q print`/`fw4 check`、apply/reload、
   5 秒独立 helper 超时回滚和 `rolled_back` 审计状态均成功；回滚后的整个
   `/etc/config` 聚合 SHA-256 与写入前完全一致，所有运行态资料已从 `/tmp` 清理。
