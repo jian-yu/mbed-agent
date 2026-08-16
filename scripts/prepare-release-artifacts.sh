@@ -20,13 +20,13 @@ version=${MBED_AGENT_VERSION:-}
 if [ -z "$version" ]; then
     version=$($binary --version | awk 'NR == 1 { print $2; exit }')
 fi
-case "$version" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *)
-        echo "could not determine a semantic version from $binary --version" >&2
-        exit 1
-        ;;
-esac
+if ! printf '%s\n' "$version" | awk -F. '
+    NF == 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { ok = 1 }
+    END { exit ok ? 0 : 1 }
+'; then
+    echo "could not determine a semantic version for $binary" >&2
+    exit 1
+fi
 
 mkdir -p "$output_dir"
 artifact="$output_dir/mbed-agent-$version"

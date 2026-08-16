@@ -39,6 +39,8 @@ version.
 - Release-candidate automation now builds and fingerprints the ARM64 musl binary with
   the pinned Zig/cargo-zigbuild toolchain; foreign binaries can supply their validated
   Cargo version to the artifact manifest without executing on the runner.
+- Release manifest version input is now restricted to three numeric components before
+  it is interpolated into metadata.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.
