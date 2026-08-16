@@ -41,5 +41,9 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
   ChangeSet `rolled_back` 状态同步；回滚后 `/etc/config` 聚合 SHA-256 精确恢复。
 - OpenWrt network UCI 写事务也已在 21.02 真机完成同样的提权、审批、reload、
   超时回滚和精确恢复验收。
+- `scripts/prepare-release-artifacts.sh`、checksum/manifest/SBOM 输入和
+  `scripts/check-release-footprint.sh` 已在本地通过；aarch64 musl 交叉二进制为
+  6,542,656 bytes（SHA-256 `ce1636ddb25bd78880110c7b71e286f004cf533926b08afe409f818d38771c5d`），
+  低于 8 MiB 门槛。原生 daemon idle RSS 实测 9,856 KiB，低于 64 MiB 门槛。
 - 尚未安装 `.ipk`；通用 Linux nftables/iptables、Flash 写集和 Channel soak 仍是
   v0.2.0 的外部发布门槛。
