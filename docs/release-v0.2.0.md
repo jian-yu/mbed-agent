@@ -61,6 +61,9 @@ firewall/network、MQTT、微信 ClawBot、企业微信文本 Channel 和多 LLM
   `MBED_AGENT_CHANNEL_SOAK_ITERS=2000 sh scripts/run-channel-protocol-soak.sh` 重复执行。
 - LLM 配置仍兼容原有单 profile `[llm]`，并可增加最多三个 `[[llm.fallbacks]]`；fallback
   在 daemon 启动时一次性校验，不把 API key、路由状态或失败响应写入 SQLite/Flash。
+- 本轮代码的主机 release 产物为 7,963,392 bytes，idle RSS 为 10,320 KiB，均低于
+  8 MiB/64 MiB 门槛；本机缺少 `aarch64-linux-musl-gcc`，ARM64 musl 重建仍需使用
+  CI 的 Zig/cargo-zigbuild 路径。
 - 既有基线 ARM64 musl 验证产物为 7,376,520 bytes（SHA-256
   `a92eb2bf94c8bdd47b0f3d809c098318762e5965663cc6f1d41a92f1300a54dd`），低于 8 MiB
   门槛；本轮 fallback 代码变更尚未重新生成该交叉产物，正式 RC 前必须重建并更新
