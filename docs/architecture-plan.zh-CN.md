@@ -1168,7 +1168,9 @@ OpenWrt 21.02 fw3、22.03+ fw4、普通 Linux nftables/iptables 均通过真实/
 - 企业微信官方长连接 adapter、CLI 官方凭据绑定、自动重连。
 - 微信 ClawBot/iLink Bot Rust adapter：QR 状态机、token 落配置、getupdates 长轮询、context token、媒体和自动重连。
 - 所有 Channel 的管理员密码提权、限速、TTL 与敏感消息旁路（首个跨 Channel `/elevate` 切片已完成）。
-- 多 provider 路由、配额和模型健康度。
+- v0.2 已落地最多三个有序 OpenAI-compatible fallback，沿用主 profile 的请求、响应、
+  流事件和超时预算，只对可重试的上游故障切换；更通用的 logical model 路由、配额
+  和模型健康度仍待后续阶段。
 - Channel/Provider 协议版本兼容检查；Skill/Runbook 只随外部软件包维护流程更新。
 
 当前进度：MQTT 5 首个纵向切片已完成，包含 TLS-only 配置（系统信任根或配置化

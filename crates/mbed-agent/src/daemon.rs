@@ -28,8 +28,8 @@ use agent_protocol::{
     TaskHistoryEntry,
 };
 use agent_provider::{
-    CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleProvider, ToolCall,
-    ToolDefinition,
+    CompletionRequest, ModelMessage, OpenAiCompatibleConfig, OpenAiCompatibleFallbackConfig,
+    OpenAiCompatibleProvider, ToolCall, ToolDefinition,
 };
 use agent_store::{
     ApprovalRecord, ChangeSetRecord, DiagnosticRecord, Store, StoreError, TaskRecord,
@@ -517,7 +517,27 @@ fn build_llm_provider(
         max_request_bytes: config.llm.max_request_bytes,
         max_response_bytes: config.llm.max_response_bytes,
         max_stream_event_bytes: config.llm.max_stream_event_bytes,
-    })?;
+    })?
+    .with_fallbacks(
+        config
+            .llm
+            .fallbacks
+            .iter()
+            .map(|fallback| OpenAiCompatibleFallbackConfig {
+                id: fallback.id.clone(),
+                config: OpenAiCompatibleConfig {
+                    base_url: fallback.base_url.clone(),
+                    api_key: fallback.api_key.expose().to_owned(),
+                    model: fallback.model.clone(),
+                    connect_timeout: Duration::from_secs(config.llm.connect_timeout_secs),
+                    request_timeout: Duration::from_secs(config.llm.request_timeout_secs),
+                    max_request_bytes: config.llm.max_request_bytes,
+                    max_response_bytes: config.llm.max_response_bytes,
+                    max_stream_event_bytes: config.llm.max_stream_event_bytes,
+                },
+            })
+            .collect(),
+    )?;
     Ok(Some(provider))
 }
 
@@ -3530,11 +3550,12 @@ async fn handle_completion(id: String, prompt: String, state: &AppState) -> Serv
     .await;
     match outcome {
         Ok(Ok(completion)) => {
+            let model = completion.model.clone();
             persist_task(
                 &id,
                 TaskAudit {
                     status: "succeeded",
-                    model: &state.config.llm.model,
+                    model: &model,
                     prompt_tokens: completion.prompt_tokens,
                     completion_tokens: completion.completion_tokens,
                     duration: started.elapsed(),

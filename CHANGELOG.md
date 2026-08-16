@@ -31,6 +31,9 @@ version.
 - Persistent-write-set checking now covers regular files, directories, deletions, and
   symlink target changes, with a deterministic fixture test; a bounded Channel protocol
   and volatile SQLite deduplication/retry soak harness is available for preflight runs.
+- LLM configuration remains backward compatible with one primary profile and now accepts up
+  to three ordered OpenAI-compatible fallback profiles; fallback is limited to retryable
+  upstream failures and shares the primary resource budgets.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

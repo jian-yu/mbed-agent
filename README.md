@@ -97,7 +97,8 @@ The current delivery status and pending RC gates are tracked in
   external inputs.
 - A bounded OpenAI-compatible HTTPS provider, invoked through
   `mbed-agent ask`, with strict request/response limits, timeouts, disabled
-  redirects, and redacted API-key configuration.
+  redirects, redacted API-key configuration, and up to three ordered fallback
+  profiles for provider outage or rate-limit recovery.
 - A bounded read-only Agent loop with locally allowlisted `diagnose_wan`,
   `inspect_default_routes`, `inspect_dns`, `inspect_dhcp`,
   `inspect_wan_firewall`, `inspect_interfaces`, and `inspect_neighbors` tools.
@@ -559,6 +560,10 @@ the whole-Agent `runtime.task_timeout_secs`, and the runtime concurrency limit.
 Prompts and responses are not written to SQLite. `ask` task metadata is retained
 only up to `storage.max_task_records` and is discarded with the rest of `/tmp`
 state at reboot.
+Optional `[[llm.fallbacks]]` profiles are tried in order only for retryable upstream
+failures (transport errors, rate limits, timeouts, 5xx, or bounded response/decoding
+failures); they share the primary request/response and timeout budgets, and route
+health or failure payloads are not persisted.
 When the model requests WAN evidence, the daemon runs only the passive typed
 diagnostic and sends the minimum normalized projection needed by the selected
 tool. Multiple WAN tools in one `ask` reuse the same in-memory snapshot. Raw

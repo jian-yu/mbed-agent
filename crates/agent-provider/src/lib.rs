@@ -62,6 +62,19 @@ pub struct OpenAiCompatibleConfig {
     pub max_stream_event_bytes: usize,
 }
 
+/// One bounded fallback route for an OpenAI-compatible provider. Fallbacks use
+/// the same request, response, timeout, and stream limits as the caller's
+/// primary profile; they only change endpoint credentials and model.
+pub struct OpenAiCompatibleFallbackConfig {
+    pub id: String,
+    pub config: OpenAiCompatibleConfig,
+}
+
+struct OpenAiCompatibleFallback {
+    id: String,
+    provider: OpenAiCompatibleProvider,
+}
+
 pub struct OpenAiCompatibleProvider {
     client: Client,
     endpoint: reqwest::Url,
@@ -70,6 +83,7 @@ pub struct OpenAiCompatibleProvider {
     max_request_bytes: usize,
     max_response_bytes: usize,
     max_stream_event_bytes: usize,
+    fallbacks: Vec<OpenAiCompatibleFallback>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -127,7 +141,53 @@ impl OpenAiCompatibleProvider {
             max_request_bytes: config.max_request_bytes,
             max_response_bytes: config.max_response_bytes,
             max_stream_event_bytes: config.max_stream_event_bytes,
+            fallbacks: Vec::new(),
         })
+    }
+
+    /// Adds at most three fallback routes to this provider.
+    ///
+    /// Fallback providers are constructed eagerly so malformed credentials or
+    /// endpoints fail at daemon startup instead of during a user request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when a fallback id is unsafe, duplicated,
+    /// or its provider cannot be constructed.
+    pub fn with_fallbacks(
+        mut self,
+        fallbacks: Vec<OpenAiCompatibleFallbackConfig>,
+    ) -> Result<Self, ProviderError> {
+        if fallbacks.len() > 3 {
+            return Err(ProviderError::InvalidConfiguration(
+                "at most three provider fallbacks are supported".into(),
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for fallback in fallbacks {
+            if fallback.id.is_empty()
+                || fallback.id.len() > 64
+                || !fallback
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                || !ids.insert(fallback.id.clone())
+            {
+                return Err(ProviderError::InvalidConfiguration(
+                    "fallback ids must be unique bounded identifiers".into(),
+                ));
+            }
+            let mut provider = Self::new(fallback.config)?;
+            // reqwest::Client is internally reference-counted. Reusing the
+            // primary client keeps the bounded route set from allocating one
+            // independent connection pool and TLS runtime per fallback.
+            provider.client = self.client.clone();
+            self.fallbacks.push(OpenAiCompatibleFallback {
+                id: fallback.id,
+                provider,
+            });
+        }
+        Ok(self)
     }
 
     /// Requests one bounded completion, optionally using an SSE stream.
@@ -136,6 +196,32 @@ impl OpenAiCompatibleProvider {
     ///
     /// Returns a typed error for transport, size, HTTP, or response-shape failures.
     pub async fn complete(&self, request: CompletionRequest) -> Result<Completion, ProviderError> {
+        if self.fallbacks.is_empty() {
+            return self.complete_once(request).await;
+        }
+        let (mut last_error, mut last_route) = match self.complete_once(request.clone()).await {
+            Ok(completion) => return Ok(completion),
+            Err(error) if !error.is_retryable_route_failure() => return Err(error),
+            Err(error) => (error, "primary".to_owned()),
+        };
+        for fallback in &self.fallbacks {
+            match fallback.provider.complete_once(request.clone()).await {
+                Ok(completion) => return Ok(completion),
+                Err(error) if !error.is_retryable_route_failure() => return Err(error),
+                Err(error) => {
+                    last_error = error;
+                    last_route.clone_from(&fallback.id);
+                }
+            }
+        }
+        Err(ProviderError::AllRoutesFailed {
+            attempts: self.fallbacks.len() + 1,
+            last_route,
+            last_error: last_error.to_string(),
+        })
+    }
+
+    async fn complete_once(&self, request: CompletionRequest) -> Result<Completion, ProviderError> {
         if request.messages.is_empty() {
             return Err(ProviderError::InvalidRequest(
                 "at least one model message is required".into(),
@@ -786,6 +872,33 @@ pub enum ProviderError {
     Decode(serde_json::Error),
     #[error("provider response contained no completion choice")]
     MissingChoice,
+    #[error("all {attempts} provider routes failed; last route {last_route}: {last_error}")]
+    AllRoutesFailed {
+        attempts: usize,
+        last_route: String,
+        last_error: String,
+    },
+}
+
+impl ProviderError {
+    fn is_retryable_route_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_)
+                | Self::ResponseTooLarge { .. }
+                | Self::StreamEventTooLarge { .. }
+                | Self::IncompleteStream
+                | Self::StreamProtocol(_)
+                | Self::Http { .. }
+                | Self::Decode(_)
+                | Self::MissingChoice
+        ) && match self {
+            Self::Http { status, .. } => {
+                status.is_server_error() || matches!(status.as_u16(), 408 | 409 | 425 | 429)
+            }
+            _ => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +906,78 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn small_request() -> CompletionRequest {
+        CompletionRequest {
+            messages: vec![ModelMessage::User("ping".into())],
+            tools: Vec::new(),
+            max_output_tokens: 8,
+            streaming: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_route_after_primary_transport_failure() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary");
+        let primary_address = primary_listener.local_addr().expect("primary address");
+        let primary = tokio::spawn(async move {
+            let (mut stream, _) = primary_listener.accept().await.expect("primary accept");
+            stream.shutdown().await.expect("primary close");
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fallback");
+        let fallback_address = fallback_listener.local_addr().expect("fallback address");
+        let fallback = tokio::spawn(async move {
+            let (mut stream, _) = fallback_listener.accept().await.expect("fallback accept");
+            let body = r#"{"model":"backup-model","choices":[{"message":{"content":"fallback"},"finish_reason":"stop"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("fallback write");
+        });
+
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: format!("http://{primary_address}/v1"),
+            api_key: "primary-key".into(),
+            model: "primary-model".into(),
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(2),
+            max_request_bytes: 4096,
+            max_response_bytes: 4096,
+            max_stream_event_bytes: 1024,
+        })
+        .expect("primary provider")
+        .with_fallbacks(vec![OpenAiCompatibleFallbackConfig {
+            id: "backup".into(),
+            config: OpenAiCompatibleConfig {
+                base_url: format!("http://{fallback_address}/v1"),
+                api_key: "backup-key".into(),
+                model: "backup-model".into(),
+                connect_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(2),
+                max_request_bytes: 4096,
+                max_response_bytes: 4096,
+                max_stream_event_bytes: 1024,
+            },
+        }])
+        .expect("fallback provider");
+
+        let completion = provider
+            .complete(small_request())
+            .await
+            .expect("completion");
+        assert_eq!(completion.text, "fallback");
+        primary.await.expect("primary server");
+        fallback.await.expect("fallback server");
+    }
 
     #[tokio::test]
     async fn parses_bounded_completion() {
@@ -1021,5 +1206,30 @@ mod tests {
         let error = validate_tool_call("call_1".into(), "tool".into(), "{}".into(), false)
             .expect_err("custom tool rejected");
         assert!(matches!(error, ProviderError::InvalidToolCall(_)));
+    }
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        assert!(
+            !ProviderError::Http {
+                status: StatusCode::BAD_REQUEST,
+                message: "invalid request".into(),
+            }
+            .is_retryable_route_failure()
+        );
+        assert!(
+            ProviderError::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "rate limited".into(),
+            }
+            .is_retryable_route_failure()
+        );
+        assert!(
+            ProviderError::Http {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "upstream unavailable".into(),
+            }
+            .is_retryable_route_failure()
+        );
     }
 }

@@ -28,8 +28,9 @@
 - 微信 ClawBot 支持官方二维码绑定、凭据原子落盘、长轮询和有界文本回复。
 - 企业微信智能机器人支持官方 WSS 绑定、心跳、文本回调和自动重连。
 - Channel 当前主要支持文本；媒体、按钮、签名 envelope 和证书热轮换仍未完成。
-- LLM 当前为单个 OpenAI-compatible Provider；多 Provider 原生适配、logical model
-  路由、配额和健康度属于后续阶段。
+- LLM 当前支持一个主 OpenAI-compatible Provider 和最多三个有序 fallback profile；
+  fallback 复用同一请求/响应/超时预算，仅在 transport、HTTP、解码或有界响应故障时切换。
+  logical model 路由、配额和健康度仍属于后续阶段。
 
 ## 存储和运行态约束
 

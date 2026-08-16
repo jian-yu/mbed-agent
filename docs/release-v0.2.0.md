@@ -7,8 +7,9 @@
 
 ## 版本范围
 
-v0.2.0 的核心不是新增配置域，而是把已有 OpenWrt 21+、通用 Linux firewall/network、
-MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线：
+v0.2.0 的核心不是新增高风险配置域，而是把已有 OpenWrt 21+、通用 Linux
+firewall/network、MQTT、微信 ClawBot、企业微信文本 Channel 和多 LLM fallback
+路由做成可验证交付基线：
 
 - capability 矩阵与实际 dispatcher 一致；
 - SQLite/WAL、日志、artifact、rollback 不突破 `/tmp` 配额；
@@ -58,8 +59,11 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
   目标变化；`scripts/test-persistent-write-set.sh` 已覆盖允许/拒绝和删除场景。Channel
   协议及 SQLite 去重/重试的有界 preflight 可用
   `MBED_AGENT_CHANNEL_SOAK_ITERS=2000 sh scripts/run-channel-protocol-soak.sh` 重复执行。
-- 当前 ARM64 musl 验证产物为 7,376,520 bytes（SHA-256
+- LLM 配置仍兼容原有单 profile `[llm]`，并可增加最多三个 `[[llm.fallbacks]]`；fallback
+  在 daemon 启动时一次性校验，不把 API key、路由状态或失败响应写入 SQLite/Flash。
+- 既有基线 ARM64 musl 验证产物为 7,376,520 bytes（SHA-256
   `a92eb2bf94c8bdd47b0f3d809c098318762e5965663cc6f1d41a92f1300a54dd`），低于 8 MiB
-  门槛。OpenWrt 21.02/fw3 的防火墙和网络事务已经完成逐文件 Flash 写集证据；
+  门槛；本轮 fallback 代码变更尚未重新生成该交叉产物，正式 RC 前必须重建并更新
+  checksum/manifest。OpenWrt 21.02/fw3 的防火墙和网络事务已经完成逐文件 Flash 写集证据；
   fw4 代表设备的同等快照和 Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK
   `.ipk` 构建与设备安装不属于本版本验收范围。

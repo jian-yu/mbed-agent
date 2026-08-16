@@ -756,6 +756,20 @@ pub struct LlmConfig {
     pub streaming: bool,
     pub max_agent_steps: u8,
     pub max_tool_context_bytes: usize,
+    /// Optional bounded fallback profiles. The primary profile above remains
+    /// the default route and keeps backward compatibility with schema v1 files.
+    #[serde(default)]
+    pub fallbacks: Vec<LlmFallbackConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmFallbackConfig {
+    /// Stable operator-facing identifier used in diagnostics and task metadata.
+    pub id: String,
+    pub base_url: String,
+    pub api_key: SecretString,
+    pub model: String,
 }
 
 impl Default for LlmConfig {
@@ -776,6 +790,7 @@ impl Default for LlmConfig {
             streaming: true,
             max_agent_steps: 4,
             max_tool_context_bytes: 16 * 1024,
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -798,20 +813,32 @@ impl LlmConfig {
                 "llm limits are inconsistent: buffers and steps must be non-zero, stream events must fit the response limit, tool context must fit a request, and agent steps must not exceed 16".into(),
             ));
         }
-        if self.enabled {
-            if !self.base_url.starts_with("https://")
-                || self.base_url.chars().any(char::is_whitespace)
+        if self.fallbacks.len() > 3 {
+            return Err(ConfigError::Validation(
+                "llm.fallbacks cannot contain more than three profiles".into(),
+            ));
+        }
+        let mut fallback_ids = std::collections::HashSet::new();
+        for fallback in &self.fallbacks {
+            if !valid_channel_identifier(&fallback.id)
+                || fallback.id.len() > 64
+                || fallback.id == "primary"
+                || !fallback_ids.insert(&fallback.id)
             {
                 return Err(ConfigError::Validation(
-                    "enabled llm.base_url must be an HTTPS URL without whitespace".into(),
-                ));
-            }
-            if self.api_key.is_empty() || self.model.trim().is_empty() || self.model.len() > 128 {
-                return Err(ConfigError::Validation(
-                    "enabled LLM requires llm.api_key and a model name no longer than 128 bytes"
+                    "llm fallback ids must be unique bounded identifiers and cannot be primary"
                         .into(),
                 ));
             }
+            validate_llm_profile(
+                &fallback.base_url,
+                &fallback.api_key,
+                &fallback.model,
+                &format!("llm.fallbacks.{}", fallback.id),
+            )?;
+        }
+        if self.enabled {
+            validate_llm_profile(&self.base_url, &self.api_key, &self.model, "llm")?;
             if self.system_prompt.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "enabled LLM requires a non-empty llm.system_prompt".into(),
@@ -820,6 +847,25 @@ impl LlmConfig {
         }
         Ok(())
     }
+}
+
+fn validate_llm_profile(
+    base_url: &str,
+    api_key: &SecretString,
+    model: &str,
+    field_prefix: &str,
+) -> Result<(), ConfigError> {
+    if !base_url.starts_with("https://") || base_url.chars().any(char::is_whitespace) {
+        return Err(ConfigError::Validation(format!(
+            "enabled {field_prefix}.base_url must be an HTTPS URL without whitespace"
+        )));
+    }
+    if api_key.is_empty() || model.trim().is_empty() || model.len() > 128 {
+        return Err(ConfigError::Validation(format!(
+            "enabled {field_prefix} requires an API key and a model name no longer than 128 bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -1076,6 +1122,37 @@ mod tests {
 
         config.llm.base_url = "https://example.test/v1".into();
         config.llm.model = "x".repeat(129);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn llm_fallback_profiles_are_bounded_and_unique() {
+        let mut config = AgentConfig::default();
+        config.llm.fallbacks = vec![LlmFallbackConfig {
+            id: "backup".into(),
+            base_url: "https://backup.example/v1".into(),
+            api_key: SecretString("backup-key".into()),
+            model: "backup-model".into(),
+        }];
+        config.validate().expect("valid fallback profile");
+
+        config.llm.fallbacks.push(LlmFallbackConfig {
+            id: "backup".into(),
+            base_url: "https://other.example/v1".into(),
+            api_key: SecretString("other-key".into()),
+            model: "other-model".into(),
+        });
+        assert!(config.validate().is_err());
+
+        config.llm.fallbacks.clear();
+        for index in 0..4 {
+            config.llm.fallbacks.push(LlmFallbackConfig {
+                id: format!("backup-{index}"),
+                base_url: "https://backup.example/v1".into(),
+                api_key: SecretString("backup-key".into()),
+                model: "backup-model".into(),
+            });
+        }
         assert!(config.validate().is_err());
     }
 

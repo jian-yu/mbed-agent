@@ -130,3 +130,11 @@ max_output_tokens = 1024
 streaming = true
 max_agent_steps = 4
 max_tool_context_bytes = 16384
+# Optional: up to three HTTPS OpenAI-compatible fallback routes. The primary
+# profile above is tried first; a fallback is used only after a transport,
+# HTTP, decode, or bounded-response failure.
+# [[llm.fallbacks]]
+# id = "backup"
+# base_url = "https://backup.example.com/v1"
+# api_key = ""
+# model = "backup-model"

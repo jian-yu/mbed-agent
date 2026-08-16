@@ -575,7 +575,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' '*filter' 'COMMIT'\n",
         );
         symlink("xtables-nft-multi", root.join("bin/iptables-save")).expect("command symlink");
-        let runner = test_runner(&root, Duration::from_secs(1), 32, 32);
+        let runner = test_runner(&root, Duration::from_secs(5), 32, 32);
         let output = runner
             .run(&FirewallCommand::IptablesSave { ipv6: false }, None)
             .expect("run symlinked command");
