@@ -22,6 +22,13 @@ jobs:
         run: cargo +1.85.1 clippy --workspace --all-targets --locked -- -D warnings
       - name: Build release binaries
         run: cargo +1.85.1 build --release --locked -p mbed-agent
+      - name: Prepare release manifest smoke
+        run: |
+          rm -rf /tmp/mbed-agent-ci-release
+          MBED_AGENT_METADATA_PLATFORM=x86_64-unknown-linux-gnu \
+            sh scripts/prepare-release-artifacts.sh \
+            target/release/mbed-agent /tmp/mbed-agent-ci-release
+          (cd /tmp/mbed-agent-ci-release && sha256sum -c checksums.sha256)
       - name: Validate OpenWrt service script
         run: sh -n openwrt/files/etc/init.d/mbed-agent
       - name: Validate OpenWrt package inputs
