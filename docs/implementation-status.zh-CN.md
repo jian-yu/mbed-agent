@@ -63,3 +63,6 @@
   CLI 管理员密码提权、R3 typed plan、一次性审批、staging、原生 `fw3 -q print`/`fw4 check`、apply/reload、
   5 秒独立 helper 超时回滚和 `rolled_back` 审计状态均成功；回滚后的整个
   `/etc/config` 聚合 SHA-256 与写入前完全一致，所有运行态资料已从 `/tmp` 清理。
+- `scripts/run-openwrt-device-network-rollback-smoke.sh` 已在 OpenWrt 21.02
+  真机通过：禁用 Agent-owned 路由完成 network UCI staging、netifd reload、R3
+  confirmed-commit 超时回滚、ChangeSet 状态同步和精确持久配置恢复。

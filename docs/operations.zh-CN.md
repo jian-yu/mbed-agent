@@ -25,6 +25,15 @@ MBED_AGENT_ALLOW_DEVICE_WRITES=YES \
   root@DEVICE target/aarch64-unknown-linux-musl/release/mbed-agent
 ```
 
+网络 UCI 事务使用同样的安全边界；验收脚本只创建禁用的 Agent-owned 测试路由，
+并要求 netifd reload 后自动回滚：
+
+```sh
+MBED_AGENT_ALLOW_DEVICE_WRITES=YES \
+  scripts/run-openwrt-device-network-rollback-smoke.sh \
+  root@DEVICE target/aarch64-unknown-linux-musl/release/mbed-agent
+```
+
 ## 存储压力
 
 优先清理可再生 artifact、已发送 Channel 响应和已完成历史；不得清理未确认变更的

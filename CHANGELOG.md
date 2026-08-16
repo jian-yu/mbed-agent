@@ -22,6 +22,8 @@ version.
   binary, plus a fail-closed SSH device read-only smoke runner.
 - Opt-in real-device fw3/fw4 apply/timeout-rollback smoke with exact `/etc/config`
   snapshot verification and volatile cleanup.
+- Real-device OpenWrt network UCI apply/timeout-rollback smoke, plus canonical R3
+  risk signals for native network reloads.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

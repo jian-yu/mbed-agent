@@ -39,4 +39,7 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
 - fw3 和 fw4 防火墙写事务均已完成真实的 `device-admin` 提权、R3 plan、一次性
   审批、原生校验、apply/reload、5 秒 confirmed-commit 超时、独立 helper 回滚和
   ChangeSet `rolled_back` 状态同步；回滚后 `/etc/config` 聚合 SHA-256 精确恢复。
-- 尚未安装 `.ipk`，也未执行 network 真机写事务；这些仍是 v0.2.0 的外部发布门槛。
+- OpenWrt network UCI 写事务也已在 21.02 真机完成同样的提权、审批、reload、
+  超时回滚和精确恢复验收。
+- 尚未安装 `.ipk`；通用 Linux nftables/iptables、Flash 写集和 Channel soak 仍是
+  v0.2.0 的外部发布门槛。

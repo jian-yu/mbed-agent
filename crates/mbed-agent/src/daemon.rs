@@ -1442,6 +1442,11 @@ async fn handle_network_plan(
             }
         };
     // A native network reload can sever the approval channel even for an otherwise local object.
+    // Keep the semantic risk signal aligned with the forced R3 level so the canonical plan
+    // digest and the executable payload cannot disagree about the reason for confirmation.
+    for change in &mut typed.changes {
+        change.diff.risk_signals.disrupts_service = true;
+    }
     typed.risk = typed.risk.max(agent_protocol::RiskLevel::R3);
     let now = match boot_monotonic_ms() {
         Ok(value) => value,
