@@ -28,6 +28,9 @@ version.
   iptables/ip6tables, including confirmed-commit timeout rollback and native snapshot
   restoration; standard package command symlinks are accepted by the fixed runner and
   watchdog helper.
+- Persistent-write-set checking now covers regular files, directories, deletions, and
+  symlink target changes, with a deterministic fixture test; a bounded Channel protocol
+  and volatile SQLite deduplication/retry soak harness is available for preflight runs.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.
@@ -42,7 +45,8 @@ version.
 
 ### Release gates still requiring external evidence
 
-- Flash write-set snapshots on representative devices.
+- Flash write-set snapshots on the fw4 representative device (fw3 device evidence is
+  now per-entry and complete for firewall/network transactions).
 - 72-hour Channel reconnect, duplicate-message, and low-watermark soak.
 
 The official OpenWrt SDK packaging workflow remains an optional delivery tool; v0.2.0

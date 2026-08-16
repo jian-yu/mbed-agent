@@ -631,4 +631,49 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn channel_protocol_soak_preserves_bounded_round_trips() {
+        let iterations = std::env::var("MBED_AGENT_CHANNEL_SOAK_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_000)
+            .clamp(1, 100_000);
+        let oversized = vec![b'x'; MAX_CHANNEL_MESSAGE_BYTES + 1];
+
+        for iteration in 0..iterations {
+            let message_id = format!("soak-{iteration}");
+            let request = ChannelRequest {
+                schema_version: CHANNEL_MESSAGE_SCHEMA_VERSION,
+                message_id: message_id.clone(),
+                actor_id: "soak-actor".into(),
+                conversation_id: "soak-conversation".into(),
+                expires_unix_ms: 60_000,
+                command: match iteration % 4 {
+                    0 => ChannelCommand::Ping,
+                    1 => ChannelCommand::Status,
+                    2 => ChannelCommand::Diagnose {
+                        target: DiagnosticTarget::Dns,
+                    },
+                    _ => ChannelCommand::Ask {
+                        text: "bounded protocol soak".into(),
+                    },
+                },
+            };
+            let payload = serde_json::to_vec(&request).expect("encode request");
+            let decoded = decode_request(&payload, 1_000).expect("decode request");
+            assert_eq!(decoded.message_id, message_id);
+
+            let response = ChannelResponse::success(
+                decoded.message_id,
+                serde_json::json!({"iteration": iteration}),
+            );
+            let encoded = encode_response(&response).expect("encode response");
+            assert!(encoded.len() <= MAX_CHANNEL_MESSAGE_BYTES);
+            assert_eq!(
+                decode_request(&oversized, 1),
+                Err(ChannelMessageError::Capacity)
+            );
+        }
+    }
 }

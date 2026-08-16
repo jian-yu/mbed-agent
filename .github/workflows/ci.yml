@@ -49,9 +49,14 @@ jobs:
           sh -n scripts/check-release-footprint.sh
           sh -n scripts/measure-daemon-rss.sh
           sh -n scripts/check-persistent-write-set.sh
+          sh -n scripts/snapshot-persistent-tree.sh
+          sh -n scripts/test-persistent-write-set.sh
+          sh -n scripts/run-channel-protocol-soak.sh
           sh -n scripts/build-openwrt-sdk-package.sh
           sh -n scripts/prepare-release-artifacts.sh
           sh -n scripts/validate-version.sh
           sh scripts/run-linux-namespace-smoke.sh
           sh scripts/check-release-footprint.sh target/release/mbed-agent
           sh scripts/measure-daemon-rss.sh target/release/mbed-agent config/mbed-agent.example.toml
+          sh scripts/test-persistent-write-set.sh
+          MBED_AGENT_CHANNEL_SOAK_ITERS=2000 sh scripts/run-channel-protocol-soak.sh

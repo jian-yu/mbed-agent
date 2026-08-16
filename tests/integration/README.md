@@ -96,5 +96,22 @@ sh scripts/check-persistent-write-set.sh BEFORE AFTER \
   etc/config/mbed-agent etc/mbed-agent etc/config/network etc/config/firewall
 ```
 
+校验器同时检查 regular file、目录、删除项和符号链接目标变化；本地回归可执行：
+
+```sh
+sh scripts/test-persistent-write-set.sh
+```
+
+Channel 的 72 小时外部 soak 需要真实 broker/企业微信/微信 ClawBot 端点，不能在没有
+凭据时伪造完成。提交前可先运行有界协议与 SQLite 去重/重试 soak，验证重复消息、过期
+清理、响应重试和 WAL 水位在固定迭代数内保持有界：
+
+```sh
+MBED_AGENT_CHANNEL_SOAK_ITERS=2000 sh scripts/run-channel-protocol-soak.sh
+```
+
+该 harness 是外部 72 小时验收的前置门，不替代真实 Channel 重连、低水位和服务端重复
+投递测试。
+
 当前仓库不提交固件镜像，避免把大文件或供应商密钥写入仓库；发布流水线应通过
 checksum 固定的外部 artifact 注入。

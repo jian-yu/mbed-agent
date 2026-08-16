@@ -54,8 +54,10 @@
   侧不引入额外生成器。
 - `scripts/run-openwrt-qemu-smoke.sh`、`scripts/run-linux-namespace-smoke.sh` 和
   `scripts/check-persistent-write-set.sh` 分别提供 OpenWrt 启动、通用 Linux 能力、
-  运行态 Flash 写入快照的有界验收入口。仓库不携带固件镜像，真实 fw3 事务、
-  namespace 内核能力、Flash 写集和 72 小时 Channel 稳定性仍按发布门槛执行。
+  运行态 Flash 写入快照的有界验收入口，并覆盖文件、目录、删除项和符号链接变化。
+  `scripts/test-persistent-write-set.sh` 与 `scripts/run-channel-protocol-soak.sh` 提供
+  本地确定性 preflight。仓库不携带固件镜像，真实 fw3 事务、namespace 内核能力、
+  代表性设备 Flash 写集和 72 小时 Channel 稳定性仍按发布门槛执行。
 - `scripts/run-linux-firewall-daemon-smoke.sh` 已在 Docker Alpine 特权 Linux 容器中
   分别验证 generic nftables 与 iptables/ip6tables 的完整 daemon apply、confirmed-
   commit 超时、独立 helper 回滚和 native 快照恢复。

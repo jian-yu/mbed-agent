@@ -1759,6 +1759,60 @@ mod tests {
     }
 
     #[test]
+    fn channel_store_soak_keeps_dedup_and_capacity_bounded() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mbed-agent-channel-soak-{nonce}"));
+        let store = Store::open(&root.join("agent.db"), 4 * 1024 * 1024).expect("open store");
+        let iterations = std::env::var("MBED_AGENT_CHANNEL_SOAK_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_000)
+            .clamp(1, 100_000);
+        let max_records = 32;
+        let pending_limit = 32_u16;
+        let mut now = 1_000_i64;
+
+        for iteration in 0..iterations {
+            let message_id = format!("soak-{iteration}");
+            let expires = now + 25;
+            assert_eq!(
+                store
+                    .claim_channel_message("soak", &message_id, expires, now, max_records)
+                    .expect("claim new message"),
+                ChannelMessageClaim::New
+            );
+            store
+                .complete_channel_message("soak", &message_id, "soak/replies", b"ok", 32, now + 1)
+                .expect("complete message");
+            assert!(matches!(
+                store
+                    .claim_channel_message("soak", &message_id, expires, now + 2, max_records)
+                    .expect("deduplicate message"),
+                ChannelMessageClaim::Completed { .. }
+            ));
+            let pending = store
+                .pending_channel_responses("soak", now + 2, pending_limit, 32)
+                .expect("read pending responses");
+            assert!(pending.len() <= max_records as usize);
+            store
+                .record_channel_response_attempt("soak", &message_id, now + 5)
+                .expect("record retry");
+            if iteration % 32 == 0 {
+                store.checkpoint(true).expect("checkpoint channel soak");
+            }
+            assert!(store.database_bytes() <= store.max_database_bytes());
+            now += 10;
+        }
+
+        store.health_check().expect("healthy after channel soak");
+        drop(store);
+        fs::remove_dir_all(root).expect("remove channel soak directory");
+    }
+
+    #[test]
     fn replaces_and_bounds_volatile_firewall_state() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -542,9 +542,12 @@ pub enum FirewallCommandError {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn fixed_runner_passes_bounded_stdin_without_a_shell() {
@@ -724,7 +727,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mbed-firewall-command-{nonce}"));
+        let serial = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("mbed-firewall-command-{nonce}-{serial}"));
         fs::create_dir_all(root.join("bin")).expect("bin");
         root
     }

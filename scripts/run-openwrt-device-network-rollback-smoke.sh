@@ -15,6 +15,8 @@ ssh_target=$1
 binary=$2
 config=${3:-config/mbed-agent.example.toml}
 mutation=docs/examples/network-rollback-smoke.json
+snapshot_helper=scripts/snapshot-persistent-tree.sh
+write_set_checker=scripts/check-persistent-write-set.sh
 remote_test_root=/tmp/mbed-agent-device-network-write-test
 remote_runtime_root=/tmp/mbed-agent
 smoke_route=mbed_agent_smoke_disabled_route
@@ -25,6 +27,8 @@ esac
 test -x "$binary"
 test -f "$config"
 test -f "$mutation"
+test -f "$snapshot_helper"
+test -f "$write_set_checker"
 command -v ssh >/dev/null 2>&1
 command -v scp >/dev/null 2>&1
 command -v file >/dev/null 2>&1
@@ -80,6 +84,15 @@ created=1
 scp -O -o BatchMode=yes -o ConnectTimeout=8 "$binary" "$ssh_target:$remote_test_root/mbed-agent"
 scp -O -o BatchMode=yes -o ConnectTimeout=8 "$config" "$ssh_target:$remote_test_root/config.toml"
 scp -O -o BatchMode=yes -o ConnectTimeout=8 "$mutation" "$ssh_target:$remote_test_root/mutation.json"
+scp -O -o BatchMode=yes -o ConnectTimeout=8 "$snapshot_helper" "$ssh_target:$remote_test_root/snapshot-persistent-tree.sh"
+scp -O -o BatchMode=yes -o ConnectTimeout=8 "$write_set_checker" "$ssh_target:$remote_test_root/check-persistent-write-set.sh"
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" "
+set -eu
+cd '$remote_test_root'
+chmod 0600 snapshot-persistent-tree.sh check-persistent-write-set.sh
+sh snapshot-persistent-tree.sh /etc/config persistent-before/etc/config
+"
 
 admin_password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 printf '%s\n' "$admin_password" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" "
@@ -164,6 +177,8 @@ rm -f approval.json
 grep -q '\"ok\": true' apply.json
 state=\$(jsonfilter -i apply.json -e '@.result.data.state')
 [ \"\$state\" = awaiting_confirmation ]
+sh snapshot-persistent-tree.sh /etc/config persistent-applied/etc/config
+sh check-persistent-write-set.sh persistent-before persistent-applied etc/config/network
 uci -q show network | grep -F \".mbed_id='$smoke_route'\" >/dev/null
 echo \"PASS: R3 network change applied and awaits confirmation\"
 "
@@ -186,6 +201,8 @@ while [ \"\$state\" != rolled_back ]; do
     state=\$(jsonfilter -i state.json -e '@.result.data.state')
 done
 ! uci -q show network | grep -F \".mbed_id='$smoke_route'\" >/dev/null
+sh snapshot-persistent-tree.sh /etc/config persistent-after/etc/config
+sh check-persistent-write-set.sh persistent-before persistent-after
 after=\$(find /etc/config -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
 before=\$(cat before.sha256)
 [ \"\$before\" = \"\$after\" ]

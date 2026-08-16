@@ -55,5 +55,10 @@ evidence remains pending.
 - Network transaction: a disabled Agent-owned route passed UCI staging, netifd reload,
   bounded timeout rollback, ChangeSet state synchronization, and exact aggregate
   `/etc/config` SHA-256 restoration.
+- The same two transactions were rerun with per-entry snapshots of `/etc/config` in
+  `/tmp`: while awaiting confirmation, the persistent-write-set checker accepted only
+  the expected `etc/config/firewall` or `etc/config/network` path; after timeout rollback,
+  the checker accepted the complete snapshot with an empty allowlist. This detects file,
+  directory, deletion, and symlink changes rather than relying only on an aggregate hash.
 - The daemon, SQLite/WAL, socket, logs, test binary, configuration copy, and test roots
   were removed from `/tmp` after both transactions. No package was installed.

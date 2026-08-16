@@ -15,6 +15,8 @@ ssh_target=$1
 binary=$2
 config=${3:-config/mbed-agent.example.toml}
 mutation=docs/examples/firewall-rollback-smoke.json
+snapshot_helper=scripts/snapshot-persistent-tree.sh
+write_set_checker=scripts/check-persistent-write-set.sh
 remote_test_root=/tmp/mbed-agent-device-write-test
 remote_runtime_root=/tmp/mbed-agent
 smoke_rule=mbed_agent_smoke_impossible
@@ -28,6 +30,8 @@ esac
 test -x "$binary"
 test -f "$config"
 test -f "$mutation"
+test -f "$snapshot_helper"
+test -f "$write_set_checker"
 command -v ssh >/dev/null 2>&1
 command -v scp >/dev/null 2>&1
 command -v file >/dev/null 2>&1
@@ -112,6 +116,17 @@ scp -O -o BatchMode=yes -o ConnectTimeout=8 "$config" \
     "$ssh_target:$remote_test_root/config.toml"
 scp -O -o BatchMode=yes -o ConnectTimeout=8 "$mutation" \
     "$ssh_target:$remote_test_root/mutation.json"
+scp -O -o BatchMode=yes -o ConnectTimeout=8 "$snapshot_helper" \
+    "$ssh_target:$remote_test_root/snapshot-persistent-tree.sh"
+scp -O -o BatchMode=yes -o ConnectTimeout=8 "$write_set_checker" \
+    "$ssh_target:$remote_test_root/check-persistent-write-set.sh"
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" "
+set -eu
+cd '$remote_test_root'
+chmod 0600 snapshot-persistent-tree.sh check-persistent-write-set.sh
+sh snapshot-persistent-tree.sh /etc/config persistent-before/etc/config
+"
 
 admin_password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 printf '%s\n' "$admin_password" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" "
@@ -202,6 +217,8 @@ rm -f approval.json
 grep -q '\"ok\": true' apply.json
 state=\$(jsonfilter -i apply.json -e '@.result.data.state')
 [ \"\$state\" = awaiting_confirmation ]
+sh snapshot-persistent-tree.sh /etc/config persistent-applied/etc/config
+sh check-persistent-write-set.sh persistent-before persistent-applied etc/config/firewall
 uci -q show firewall | grep -F \".name='$smoke_rule'\" >/dev/null
 if command -v fw4 >/dev/null 2>&1; then
     fw4 check >/dev/null
@@ -228,6 +245,8 @@ if command -v fw4 >/dev/null 2>&1; then
 else
     fw3 -q print >/dev/null
 fi
+sh snapshot-persistent-tree.sh /etc/config persistent-after/etc/config
+sh check-persistent-write-set.sh persistent-before persistent-after
 after=\$(find /etc/config -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
 before=\$(cat before.sha256)
 [ \"\$before\" = \"\$after\" ]

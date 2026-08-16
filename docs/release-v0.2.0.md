@@ -54,7 +54,12 @@ MQTT、微信 ClawBot 和企业微信文本 Channel 做成可验证交付基线�
   一次性 approval、原生 apply、5 秒 confirmed-commit 超时、独立 helper 回滚、
   SQLite canonical state 与 native snapshot 恢复均通过；iptables 包装器的标准
   `iptables-* -> xtables-nft-multi` 符号链接也已纳入兼容性验收。
+- `scripts/check-persistent-write-set.sh` 现在会检查 regular file、目录、删除项和符号链接
+  目标变化；`scripts/test-persistent-write-set.sh` 已覆盖允许/拒绝和删除场景。Channel
+  协议及 SQLite 去重/重试的有界 preflight 可用
+  `MBED_AGENT_CHANNEL_SOAK_ITERS=2000 sh scripts/run-channel-protocol-soak.sh` 重复执行。
 - 当前 ARM64 musl 验证产物为 7,376,520 bytes（SHA-256
   `a92eb2bf94c8bdd47b0f3d809c098318762e5965663cc6f1d41a92f1300a54dd`），低于 8 MiB
-  门槛。Flash 写集和 Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK `.ipk`
-  构建与设备安装不属于本版本验收范围。
+  门槛。OpenWrt 21.02/fw3 的防火墙和网络事务已经完成逐文件 Flash 写集证据；
+  fw4 代表设备的同等快照和 Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK
+  `.ipk` 构建与设备安装不属于本版本验收范围。
