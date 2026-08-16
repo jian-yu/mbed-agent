@@ -37,7 +37,22 @@ LAN addresses, credentials, tokens, SSIDs, public addresses, or customer identif
   and 1,621 bytes respectively. Response bodies remained in the volatile device test
   directory and were not copied into release evidence.
 
-Only read-only discovery, native firewall validation, and a volatile runtime smoke were
-executed. No package was installed and no UCI, firewall, network, DHCP, persistent
-filesystem, or service state was changed. Package installation, confirmed ChangeSet
-execution, rollback, and approved Flash write-set evidence remain pending.
+The same target also passed the real-device firewall confirmed-commit smoke: the
+Agent-owned typed rule reached `awaiting_confirmation`, the independent helper rolled it
+back after the bounded deadline, the `rolled_back` ChangeSet state was observed, and the
+aggregate `/etc/config` SHA-256 returned to its pre-test value. No package was installed;
+package installation and approved Flash write-set evidence remain pending.
+
+## 2026-08-16 — OpenWrt 21.02.0 fw3 transactions
+
+- Hardware: Raspberry Pi 4 Model B, `bcm2711`.
+- Kernel: Linux 5.4.143, aarch64.
+- OpenWrt: 21.02.0, revision `r16279-5cc0535800`.
+- Firewall: native `fw3 -q print` validation passed.
+- Firewall transaction: a typed Agent-owned rule passed device-admin elevation, R3
+  approval, apply/reload, bounded timeout rollback, and `rolled_back` audit state.
+- Network transaction: a disabled Agent-owned route passed UCI staging, netifd reload,
+  bounded timeout rollback, ChangeSet state synchronization, and exact aggregate
+  `/etc/config` SHA-256 restoration.
+- The daemon, SQLite/WAL, socket, logs, test binary, configuration copy, and test roots
+  were removed from `/tmp` after both transactions. No package was installed.
