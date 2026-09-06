@@ -36,6 +36,13 @@ pub enum FirewallCommand {
     UciExportDhcpAt {
         staging_dir: PathBuf,
     },
+    UciShowWireless,
+    UciShowWirelessAt {
+        staging_dir: PathBuf,
+    },
+    UciExportWirelessAt {
+        staging_dir: PathBuf,
+    },
     UciBatch {
         staging_dir: PathBuf,
     },
@@ -50,6 +57,7 @@ pub enum FirewallCommand {
     },
     OpenWrtFirewallReload,
     OpenWrtNetworkReload,
+    OpenWrtWirelessReload,
     IpJsonLink,
     IpJsonAddress,
     IpJsonRoute,
@@ -235,8 +243,12 @@ impl FirewallCommandRunner {
                 | FirewallCommand::UciExportNetworkAt { .. }
                 | FirewallCommand::UciExportDhcpAt { .. }
                 | FirewallCommand::OpenWrtNetworkReload
+                | FirewallCommand::UciShowWireless
+                | FirewallCommand::UciShowWirelessAt { .. }
+                | FirewallCommand::UciExportWirelessAt { .. }
+                | FirewallCommand::OpenWrtWirelessReload
         ) {
-            return self.network_specification(operation);
+            return self.openwrt_configuration_specification(operation);
         }
         let spec = match operation {
             FirewallCommand::UciShowFirewall => spec("uci", &["-q", "show", "firewall"]),
@@ -347,27 +359,35 @@ impl FirewallCommandRunner {
             | FirewallCommand::UciShowDhcpAt { .. }
             | FirewallCommand::UciExportNetworkAt { .. }
             | FirewallCommand::UciExportDhcpAt { .. }
-            | FirewallCommand::OpenWrtNetworkReload => unreachable!("handled above"),
+            | FirewallCommand::OpenWrtNetworkReload
+            | FirewallCommand::UciShowWireless
+            | FirewallCommand::UciShowWirelessAt { .. }
+            | FirewallCommand::UciExportWirelessAt { .. }
+            | FirewallCommand::OpenWrtWirelessReload => unreachable!("handled above"),
         };
         Ok(spec)
     }
 
-    fn network_specification(
+    fn openwrt_configuration_specification(
         &self,
         operation: &FirewallCommand,
     ) -> Result<CommandSpecification, FirewallCommandError> {
         match operation {
             FirewallCommand::UciShowNetwork => Ok(spec("uci", &["-q", "show", "network"])),
             FirewallCommand::UciShowDhcp => Ok(spec("uci", &["-q", "show", "dhcp"])),
+            FirewallCommand::UciShowWireless => Ok(spec("uci", &["-q", "show", "wireless"])),
             FirewallCommand::UciShowNetworkAt { staging_dir }
             | FirewallCommand::UciShowDhcpAt { staging_dir }
             | FirewallCommand::UciExportNetworkAt { staging_dir }
-            | FirewallCommand::UciExportDhcpAt { staging_dir } => {
+            | FirewallCommand::UciExportDhcpAt { staging_dir }
+            | FirewallCommand::UciShowWirelessAt { staging_dir }
+            | FirewallCommand::UciExportWirelessAt { staging_dir } => {
                 let dir = self.validate_staging_dir(staging_dir)?;
                 let action = if matches!(
                     operation,
                     FirewallCommand::UciShowNetworkAt { .. }
                         | FirewallCommand::UciShowDhcpAt { .. }
+                        | FirewallCommand::UciShowWirelessAt { .. }
                 ) {
                     "show"
                 } else {
@@ -378,6 +398,12 @@ impl FirewallCommandRunner {
                     FirewallCommand::UciShowDhcpAt { .. } | FirewallCommand::UciExportDhcpAt { .. }
                 ) {
                     "dhcp"
+                } else if matches!(
+                    operation,
+                    FirewallCommand::UciShowWirelessAt { .. }
+                        | FirewallCommand::UciExportWirelessAt { .. }
+                ) {
+                    "wireless"
                 } else {
                     "network"
                 };
@@ -394,7 +420,8 @@ impl FirewallCommandRunner {
                 })
             }
             FirewallCommand::OpenWrtNetworkReload => Ok(spec("/etc/init.d/network", &["reload"])),
-            _ => unreachable!("network operation checked by caller"),
+            FirewallCommand::OpenWrtWirelessReload => Ok(spec("/sbin/wifi", &["reload"])),
+            _ => unreachable!("OpenWrt configuration operation checked by caller"),
         }
     }
 
@@ -434,7 +461,10 @@ impl FirewallCommandRunner {
     }
 
     fn resolve(&self, program: &str) -> Result<PathBuf, FirewallCommandError> {
-        if matches!(program, "/etc/init.d/firewall" | "/etc/init.d/network") {
+        if matches!(
+            program,
+            "/etc/init.d/firewall" | "/etc/init.d/network" | "/sbin/wifi"
+        ) {
             return executable(Path::new(program));
         }
         self.command_dirs
@@ -712,6 +742,42 @@ mod tests {
         assert_eq!(staged.arguments[2], "-q");
         assert_eq!(staged.arguments[3], "export");
         assert_eq!(staged.arguments[4], "network");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn wireless_uci_operations_and_reload_are_fixed() {
+        let root = fixture_root();
+        let runtime = root.join("runtime");
+        let staging = runtime.join("staging/change-1");
+        fs::create_dir_all(&staging).expect("staging");
+        let runner = test_runner(&root, Duration::from_secs(5), 1024, 1024);
+        let live = runner
+            .specification(&FirewallCommand::UciShowWireless)
+            .expect("live specification");
+        assert_eq!(live.program, "uci");
+        assert_eq!(
+            live.arguments,
+            [
+                OsString::from("-q"),
+                OsString::from("show"),
+                OsString::from("wireless")
+            ]
+        );
+        let staged = runner
+            .specification(&FirewallCommand::UciExportWirelessAt {
+                staging_dir: staging,
+            })
+            .expect("staged specification");
+        assert_eq!(staged.program, "uci");
+        assert_eq!(staged.arguments[2], "-q");
+        assert_eq!(staged.arguments[3], "export");
+        assert_eq!(staged.arguments[4], "wireless");
+        let reload = runner
+            .specification(&FirewallCommand::OpenWrtWirelessReload)
+            .expect("reload specification");
+        assert_eq!(reload.program, "/sbin/wifi");
+        assert_eq!(reload.arguments, [OsString::from("reload")]);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

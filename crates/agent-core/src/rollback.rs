@@ -22,6 +22,7 @@ pub enum RollbackTarget {
     OpenWrtFirewall,
     OpenWrtNetwork,
     OpenWrtDhcp,
+    OpenWrtWireless,
     LinuxNftablesManaged,
     LinuxNftablesRuntime,
     LinuxFirewallCanonical,
@@ -39,6 +40,7 @@ impl RollbackTarget {
             Self::OpenWrtFirewall => Some(Path::new("/etc/config/firewall")),
             Self::OpenWrtNetwork => Some(Path::new("/etc/config/network")),
             Self::OpenWrtDhcp => Some(Path::new("/etc/config/dhcp")),
+            Self::OpenWrtWireless => Some(Path::new("/etc/config/wireless")),
             Self::LinuxNftablesManaged => Some(Path::new("/etc/mbed-agent/managed/firewall.nft")),
             Self::LinuxNftablesRuntime
             | Self::LinuxFirewallCanonical
@@ -57,6 +59,7 @@ impl RollbackTarget {
 pub enum RollbackReload {
     OpenWrtFirewall,
     OpenWrtNetwork,
+    OpenWrtWireless,
     LinuxNftables,
     LinuxNftablesRuntime,
     LinuxIptablesRuntime,
@@ -994,6 +997,9 @@ fn execute_reload(
             PathBuf::from("/etc/init.d/network"),
             vec![PathBuf::from("reload")],
         ),
+        RollbackReload::OpenWrtWireless => {
+            (PathBuf::from("/sbin/wifi"), vec![PathBuf::from("reload")])
+        }
         RollbackReload::LinuxNftables => (
             resolve_fixed_program("nft")?,
             vec![
@@ -1365,6 +1371,9 @@ fn targets_match_reload(targets: &HashSet<RollbackTarget>, reload: RollbackReloa
                 || targets
                     == &HashSet::from([RollbackTarget::OpenWrtNetwork, RollbackTarget::OpenWrtDhcp])
         }
+        RollbackReload::OpenWrtWireless => {
+            targets == &HashSet::from([RollbackTarget::OpenWrtWireless])
+        }
         RollbackReload::LinuxNftables => {
             targets == &HashSet::from([RollbackTarget::LinuxNftablesManaged])
         }
@@ -1703,6 +1712,48 @@ mod tests {
         assert_eq!(fs::read(&target).expect("restored"), b"config-before");
         assert_eq!(
             rollback_outcome(&rollback, "txn-openwrt-network").expect("outcome"),
+            RollbackOutcome::RolledBack
+        );
+        assert!(bundle.directory.join("rolled-back").is_file());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn openwrt_wireless_bundle_restores_config_before_reload() {
+        let root = test_root("openwrt-wireless");
+        let rollback = root.join("rollback");
+        let target = root.join("wireless");
+        fs::write(&target, b"radio-before").expect("target");
+        let bundle = create_bundle_with(
+            &rollback,
+            "txn-openwrt-wireless",
+            &[RollbackTarget::OpenWrtWireless],
+            RollbackReload::OpenWrtWireless,
+            5,
+            1024,
+            |_| target.clone(),
+        )
+        .expect("bundle");
+        fs::write(&target, b"radio-after").expect("activation");
+        request_rollback(&rollback, "txn-openwrt-wireless").expect("request rollback");
+        let reload_called = Cell::new(false);
+        run_helper_with(
+            &rollback,
+            "txn-openwrt-wireless",
+            1024,
+            |_| target.clone(),
+            |reload, _, _| {
+                assert_eq!(reload, RollbackReload::OpenWrtWireless);
+                assert_eq!(fs::read(&target).expect("restored first"), b"radio-before");
+                reload_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("helper");
+        assert!(reload_called.get());
+        assert_eq!(fs::read(&target).expect("restored"), b"radio-before");
+        assert_eq!(
+            rollback_outcome(&rollback, "txn-openwrt-wireless").expect("outcome"),
             RollbackOutcome::RolledBack
         );
         assert!(bundle.directory.join("rolled-back").is_file());

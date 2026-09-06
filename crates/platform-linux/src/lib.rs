@@ -19,6 +19,7 @@ pub mod network_openwrt_execute;
 pub mod network_runtime;
 pub mod network_runtime_execute;
 pub mod wireless_openwrt;
+pub mod wireless_openwrt_execute;
 
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;
 const DISCOVERED_COMMANDS: &[&str] = &[
