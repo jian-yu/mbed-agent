@@ -3832,10 +3832,17 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
         }
 
         fn executable(&self, relative: &str, content: &str) {
-            self.write(relative, content);
             let path = self.root.join(relative);
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture directory");
+            let temporary = path.with_extension(format!(
+                "mbed-agent-test-{}",
+                FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::write(&temporary, content).expect("write fixture executable");
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
                 .expect("make fixture executable");
+            fs::rename(temporary, path).expect("publish fixture executable");
         }
     }
 

@@ -27,7 +27,9 @@ MBED_AGENT_METADATA_PLATFORM=${MBED_AGENT_METADATA_PLATFORM:-x86_64-unknown-linu
     MBED_AGENT_VERSION=9.8.7-rc.1 \
     sh "$prepare_script" "$foreign_binary" "$output"
 grep -F '"version": "9.8.7-rc.1"' "$output/manifest.json" >/dev/null
-test "$(wc -c <"$foreign_binary")" -eq "$(awk -F': ' '/binary_size_bytes/ { gsub(/,/, "", $2); print $2 }' "$output/manifest.json")"
+expected_size=$(wc -c <"$foreign_binary" | tr -d '[:space:]')
+manifest_size=$(awk -F': ' '/binary_size_bytes/ { gsub(/,/, "", $2); print $2 }' "$output/manifest.json")
+test "$expected_size" -eq "$manifest_size"
 (cd "$output" && sha256sum -c checksums.sha256 >/dev/null)
 
 echo "PASS: release artifact script rejects unsafe versions and fingerprints foreign binaries"

@@ -32,7 +32,7 @@ mkdir -p "$output_dir"
 artifact="$output_dir/mbed-agent-$version"
 cp "$binary" "$artifact"
 
-size=$(stat -f '%z' "$artifact" 2>/dev/null || stat -c '%s' "$artifact")
+size=$(wc -c <"$artifact" | tr -d '[:space:]')
 binary_sha256=$(sha256sum "$artifact" | awk '{print $1}')
 git_revision=unknown
 if command -v git >/dev/null 2>&1; then
