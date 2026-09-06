@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const COMMAND_DIRS: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+const EXECUTABLE_BUSY_RETRIES: u32 = 3;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Closed native operations used by firewall execution ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,7 +173,7 @@ impl FirewallCommandRunner {
             command.env("UCI_CONFIG_DIR", staging_dir);
         }
         let started = Instant::now();
-        let mut child = command.spawn().map_err(FirewallCommandError::Io)?;
+        let mut child = spawn_command(&mut command, self.timeout, started)?;
         let stdout = child
             .stdout
             .take()
@@ -459,6 +461,30 @@ struct CommandSpecification {
     uci_config_dir: Option<PathBuf>,
 }
 
+fn spawn_command(
+    command: &mut Command,
+    timeout: Duration,
+    started: Instant,
+) -> Result<std::process::Child, FirewallCommandError> {
+    for retry in 0..=EXECUTABLE_BUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && retry < EXECUTABLE_BUSY_RETRIES =>
+            {
+                let delay = EXECUTABLE_BUSY_RETRY_DELAY.saturating_mul(1 << retry);
+                if delay >= timeout.saturating_sub(started.elapsed()) {
+                    return Err(FirewallCommandError::Io(error));
+                }
+                thread::sleep(delay);
+            }
+            Err(error) => return Err(FirewallCommandError::Io(error)),
+        }
+    }
+    unreachable!("bounded firewall command spawn loop always returns")
+}
+
 fn spec(program: &'static str, arguments: &[&str]) -> CommandSpecification {
     CommandSpecification {
         program,
@@ -540,6 +566,7 @@ pub enum FirewallCommandError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -563,6 +590,34 @@ mod tests {
                 Some(b"*filter\nCOMMIT\n"),
             )
             .expect("run");
+        assert_eq!(output.stdout, b"*filter\nCOMMIT\n");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_runner_retries_a_transient_executable_busy_error() {
+        let root = fixture_root();
+        let executable = root.join("bin/iptables-save");
+        write_program(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' '*filter' 'COMMIT'\n",
+        );
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("hold fixture executable open for writing");
+        let release_writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            drop(writer);
+        });
+
+        let runner = test_runner(&root, Duration::from_secs(1), 32, 32);
+        let output = runner
+            .run(&FirewallCommand::IptablesSave { ipv6: false }, None)
+            .expect("run after the transient writer closes");
+        release_writer.join().expect("writer release thread");
+
         assert_eq!(output.stdout, b"*filter\nCOMMIT\n");
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -727,15 +782,38 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let serial = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("mbed-firewall-command-{nonce}-{serial}"));
-        fs::create_dir_all(root.join("bin")).expect("bin");
-        root
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let serial = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("mbed-firewall-command-{pid}-{nonce}-{serial}"));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    fs::create_dir(root.join("bin")).expect("bin");
+                    return root;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("fixture root: {error}"),
+            }
+        }
+        panic!("could not allocate a unique fixture root")
     }
 
     fn write_program(path: &Path, body: &str) {
-        fs::write(path, body).expect("program");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("permissions");
+        let temporary = path.with_extension(format!(
+            "mbed-agent-test-{}",
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .expect("create program");
+        file.write_all(body.as_bytes()).expect("write program");
+        file.sync_all().expect("sync program");
+        drop(file);
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700)).expect("permissions");
+        fs::rename(temporary, path).expect("publish program");
     }
 
     fn test_runner(
