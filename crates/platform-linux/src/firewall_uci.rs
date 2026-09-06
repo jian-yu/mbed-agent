@@ -60,7 +60,7 @@ pub(crate) fn parse_uci_show_package(
             return Err(FirewallRenderError::MalformedUci);
         }
         let section_type = values[0].clone();
-        if !safe_uci_identifier(&section_type) || !valid_section(key, &section_type) {
+        if !safe_uci_section_type(&section_type) || !valid_section(key, &section_type) {
             return Err(FirewallRenderError::MalformedUci);
         }
         if indexes.contains_key(key) {
@@ -199,6 +199,14 @@ pub(crate) fn safe_uci_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+fn safe_uci_section_type(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +225,20 @@ mod tests {
         assert_eq!(parsed[1].order, 1);
         assert_eq!(parsed[1].first("name"), Some("lan"));
         assert_eq!(parsed[1].values("network"), ["lan", "guest"]);
+    }
+
+    #[test]
+    fn parses_official_hyphenated_wireless_section_types() {
+        let parsed = parse_uci_show_package(
+            "wireless.radio0=wifi-device\n\
+             wireless.radio0.type='mac80211'\n\
+             wireless.default_radio0=wifi-iface\n\
+             wireless.default_radio0.device='radio0'\n",
+            "wireless",
+        )
+        .expect("parse wireless");
+        assert_eq!(parsed[0].section_type, "wifi-device");
+        assert_eq!(parsed[1].section_type, "wifi-iface");
     }
 
     #[test]

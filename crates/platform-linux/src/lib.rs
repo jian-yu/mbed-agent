@@ -18,6 +18,7 @@ pub mod network_openwrt;
 pub mod network_openwrt_execute;
 pub mod network_runtime;
 pub mod network_runtime_execute;
+pub mod wireless_openwrt;
 
 pub const MINIMUM_OPENWRT_MAJOR: u32 = 21;
 const DISCOVERED_COMMANDS: &[&str] = &[
@@ -42,6 +43,7 @@ const DISCOVERED_COMMANDS: &[&str] = &[
     "openrc",
     "iw",
     "iwinfo",
+    "wifi",
     "ip",
     "tc",
     "ss",
