@@ -44,9 +44,9 @@ version.
 - CI now runs a deterministic release-artifact preflight covering foreign binaries,
   unsafe version rejection, manifest size, and checksum verification.
 - Release artifact sizing is portable across GNU/BSD hosts; Linux executable fixtures
-  are uniquely and atomically published, while collector startup retries only transient
-  `ETXTBSY` failures within a 70 ms bound. GitHub checkout actions are pinned to the
-  verified v7.0.1 commit.
+  are uniquely and atomically published, while diagnostic collector and native firewall
+  command startup retry only transient `ETXTBSY` failures within a 70 ms bound. GitHub
+  checkout actions are pinned to the verified v7.0.1 commit.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

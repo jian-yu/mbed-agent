@@ -67,13 +67,14 @@ firewall/network、MQTT、微信 ClawBot、企业微信文本 Channel 和多 LLM
   在 daemon 启动时一次性校验，不把 API key、路由状态或失败响应写入 SQLite/Flash。
 - 本轮代码的主机 release 产物为 7,963,376 bytes，idle RSS 为 10,208 KiB，均低于
   8 MiB/64 MiB 门槛。
-- 2026-09-06 使用固定 Zig 0.14.1/cargo-zigbuild 0.20.1 对生产代码提交 `732622e`
-  重新生成 ARM64 musl 静态 stripped ELF，大小为 6,569,656 bytes，SHA-256 为
-  `5ab0ce61f174dbbea66232a2ac5edb20679007b1ad3adf3aa7d711f7eeacb56a`；对应
+- 2026-09-06 使用固定 Zig 0.14.1/cargo-zigbuild 0.20.1 对生产代码提交 `6cb196b`
+  重新生成 ARM64 musl 静态 stripped ELF，大小为 6,570,168 bytes，SHA-256 为
+  `223aedd38874476fd463c7fcb504d9fb0330c8b3f80311c68ff1dc9bac213322`；对应
   manifest、Cargo 依赖图、toolchain 元数据和全量 checksum 均验证通过。OpenWrt
   21.02/fw3 的防火墙和网络事务已经完成逐文件 Flash 写集证据；
   fw4 代表设备的同等快照和 Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK
   `.ipk` 构建与设备安装不属于本版本验收范围。
 - 同日，2,000 轮 Channel 协议/易失 SQLite 去重与容量 preflight 通过；GitHub CI
-  `34026631652` 在 Ubuntu 上通过 workspace tests（包含 Linux `ETXTBSY` 回归测试）、
-  Clippy、release 构建、artifact、OpenWrt/通用 Linux 服务脚本和 footprint 全部门禁。
+  `34031185168` 在 Ubuntu 上通过 workspace tests（包含诊断 collector 和防火墙命令
+  runner 的 Linux `ETXTBSY` 回归测试）、Clippy、release 构建、artifact、OpenWrt/
+  通用 Linux 服务脚本和 footprint 全部门禁。
