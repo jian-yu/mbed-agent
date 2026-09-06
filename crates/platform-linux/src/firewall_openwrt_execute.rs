@@ -637,6 +637,7 @@ pub enum OpenWrtExecutionError {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use agent_core::{
@@ -650,6 +651,8 @@ mod tests {
 
     use super::*;
     use crate::firewall_command::FirewallCommandOutput;
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct FakeRunner {
         responses: Mutex<VecDeque<Vec<u8>>>,
@@ -839,6 +842,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("mbed-openwrt-execution-{nonce}"))
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let sequence = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("mbed-openwrt-execution-{pid}-{nonce}-{sequence}"));
+            match fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("root: {error}"),
+            }
+        }
+        panic!("could not allocate a unique fixture root")
     }
 }

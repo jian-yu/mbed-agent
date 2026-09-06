@@ -396,6 +396,7 @@ pub enum GenericNftablesExecutionError {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use agent_core::{
@@ -413,6 +414,7 @@ mod tests {
 
     const OWNED_TABLE: &str = "table inet mbed_agent {\n\tcomment \"mbed-agent-owned:v1\"\n}\n";
     const BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct MockNft {
         managed: Cell<bool>,
@@ -540,10 +542,22 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mbed-agent-nft-execute-{nonce}"));
-        fs::create_dir(&root).expect("root");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("permissions");
-        root
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let sequence = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("mbed-agent-nft-execute-{pid}-{nonce}-{sequence}"));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                        .expect("permissions");
+                    return root;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("root: {error}"),
+            }
+        }
+        panic!("could not allocate a unique fixture root")
     }
 
     fn execution_plan() -> FirewallExecutionPlan {
