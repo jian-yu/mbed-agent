@@ -24,11 +24,8 @@ jobs:
         run: cargo +1.85.1 build --release --locked -p mbed-agent
       - name: Prepare release manifest smoke
         run: |
-          rm -rf /tmp/mbed-agent-ci-release
           MBED_AGENT_METADATA_PLATFORM=x86_64-unknown-linux-gnu \
-            sh scripts/prepare-release-artifacts.sh \
-            target/release/mbed-agent /tmp/mbed-agent-ci-release
-          (cd /tmp/mbed-agent-ci-release && sha256sum -c checksums.sha256)
+            sh scripts/test-release-artifacts.sh
       - name: Validate OpenWrt service script
         run: sh -n openwrt/files/etc/init.d/mbed-agent
       - name: Validate OpenWrt package inputs
@@ -61,6 +58,7 @@ jobs:
           sh -n scripts/run-channel-protocol-soak.sh
           sh -n scripts/build-openwrt-sdk-package.sh
           sh -n scripts/prepare-release-artifacts.sh
+          sh -n scripts/test-release-artifacts.sh
           sh -n scripts/validate-version.sh
           sh scripts/run-linux-namespace-smoke.sh
           sh scripts/check-release-footprint.sh target/release/mbed-agent

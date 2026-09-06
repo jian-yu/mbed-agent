@@ -41,6 +41,8 @@ version.
   Cargo version to the artifact manifest without executing on the runner.
 - Release manifest version input is now restricted to a semver core with safe optional
   pre-release/build identifiers before it is interpolated into metadata.
+- CI now runs a deterministic release-artifact preflight covering foreign binaries,
+  unsafe version rejection, manifest size, and checksum verification.
 - Bounded OpenWrt QEMU readiness smoke and release artifact preparation containing
   binary checksums, Cargo dependency graph, toolchain provenance, and manifest.
 - Cargo, OpenWrt package, and configuration sample version consistency validation.

@@ -52,8 +52,9 @@
   提供手动、可复现的 x86/64 矩阵构建。
 - `scripts/prepare-release-artifacts.sh` 聚合版本化 binary、Cargo 依赖图、Rust
   toolchain provenance、manifest 和 checksums；`.github/workflows/release-candidate.yml`
-  提供手动 RC 产物工作流，普通 CI 也会执行主机 manifest/checksum preflight。依赖图
-  到 SPDX/CycloneDX 的转换由发布侧服务完成，设备侧不引入额外生成器。
+  提供手动 RC 产物工作流，普通 CI 也会通过 `scripts/test-release-artifacts.sh` 执行
+  主机 manifest/checksum preflight，并覆盖 foreign binary 与非法版本输入。依赖图到
+  SPDX/CycloneDX 的转换由发布侧服务完成，设备侧不引入额外生成器。
 - `scripts/run-openwrt-qemu-smoke.sh`、`scripts/run-linux-namespace-smoke.sh` 和
   `scripts/check-persistent-write-set.sh` 分别提供 OpenWrt 启动、通用 Linux 能力、
   运行态 Flash 写入快照的有界验收入口，并覆盖文件、目录、删除项和符号链接变化。
