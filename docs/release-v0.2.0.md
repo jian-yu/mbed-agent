@@ -49,7 +49,8 @@ firewall/network、MQTT、微信 ClawBot、企业微信文本 Channel 和多 LLM
   门槛。
 - `.github/workflows/release-candidate.yml` 现已增加独立 ARM64 musl job，固定 Zig
   0.14.1/cargo-zigbuild 0.20.1，并使用 `MBED_AGENT_VERSION` 生成 foreign binary 的
-  checksum/manifest；该 job 仍需在 CI 实际运行后替换下方基线摘要。
+  checksum/manifest；workflow 进入默认分支后仍需执行一次 `workflow_dispatch`，当前分支已
+  使用完全相同的固定工具链在本机完成等价构建和产物校验。
 - `scripts/run-linux-firewall-namespace-smoke.sh` 已在 Docker Alpine Linux
   特权 namespace 中通过 nftables 及 iptables/ip6tables 原生 check、apply、cleanup
   和前后快照一致性验证。
@@ -65,11 +66,11 @@ firewall/network、MQTT、微信 ClawBot、企业微信文本 Channel 和多 LLM
 - LLM 配置仍兼容原有单 profile `[llm]`，并可增加最多三个 `[[llm.fallbacks]]`；fallback
   在 daemon 启动时一次性校验，不把 API key、路由状态或失败响应写入 SQLite/Flash。
 - 本轮代码的主机 release 产物为 7,963,376 bytes，idle RSS 为 10,208 KiB，均低于
-  8 MiB/64 MiB 门槛；本机缺少 `aarch64-linux-musl-gcc`，ARM64 musl 重建仍需使用
-  CI 的 Zig/cargo-zigbuild 路径。
-- 既有基线 ARM64 musl 验证产物为 7,376,520 bytes（SHA-256
-  `a92eb2bf94c8bdd47b0f3d809c098318762e5965663cc6f1d41a92f1300a54dd`），低于 8 MiB
-  门槛；本轮 fallback 代码变更尚未重新生成该交叉产物，正式 RC 前必须重建并更新
-  checksum/manifest。OpenWrt 21.02/fw3 的防火墙和网络事务已经完成逐文件 Flash 写集证据；
+  8 MiB/64 MiB 门槛。
+- 2026-09-06 使用固定 Zig 0.14.1/cargo-zigbuild 0.20.1 对当前代码重新生成 ARM64 musl
+  静态 stripped ELF，大小为 6,567,904 bytes，SHA-256 为
+  `c662696e262d768d7cf04c99dfd1ccd31ca71038517d13a5e083fa1a93b62591`；对应
+  manifest、Cargo 依赖图、toolchain 元数据和全量 checksum 均验证通过。OpenWrt
+  21.02/fw3 的防火墙和网络事务已经完成逐文件 Flash 写集证据；
   fw4 代表设备的同等快照和 Channel soak 仍是 v0.2.0 的外部发布门槛；官方 SDK
   `.ipk` 构建与设备安装不属于本版本验收范围。
