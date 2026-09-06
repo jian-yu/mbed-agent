@@ -319,6 +319,17 @@ pub struct NetworkInventoryEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessInventoryResponse {
+    pub objects: Vec<WirelessInventoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessInventoryEntry {
+    pub digest: String,
+    pub object: WirelessObject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompletionResponse {
     pub text: String,
     pub model: String,
@@ -989,6 +1000,77 @@ pub enum NetworkPolicyAction {
     Blackhole,
     Unreachable,
     Prohibit,
+}
+
+/// Platform-neutral wireless configuration object. The first writable slice
+/// intentionally models physical radio settings without SSIDs or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "spec", rename_all = "snake_case")]
+pub enum WirelessObject {
+    Radio(WirelessRadioConfig),
+}
+
+impl WirelessObject {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Radio(value) => &value.id,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Radio(_) => "radio",
+        }
+    }
+
+    #[must_use]
+    pub const fn ownership(&self) -> ObjectOwnership {
+        match self {
+            Self::Radio(value) => value.ownership,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WirelessRadioConfig {
+    pub id: String,
+    pub ownership: ObjectOwnership,
+    pub enabled: bool,
+    pub band: WirelessBand,
+    pub channel: WirelessChannel,
+    pub width: WirelessChannelWidth,
+    pub country: Option<String>,
+    pub tx_power_dbm: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WirelessBand {
+    #[serde(rename = "2ghz")]
+    Ghz2,
+    #[serde(rename = "5ghz")]
+    Ghz5,
+    #[serde(rename = "6ghz")]
+    Ghz6,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WirelessChannel {
+    Auto,
+    Fixed { channel: u16 },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WirelessChannelWidth {
+    Auto,
+    Mhz20,
+    Mhz40,
+    Mhz80,
+    Mhz160,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1923,6 +2005,34 @@ mod tests {
         assert!(
             serde_json::from_str::<NetworkMutationRequest>(
                 r#"{"operation":"delete","kind":"route","id":"x","expected_digest":"abc","argv":["ip","route","flush"]}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn wireless_radio_object_is_closed_typed_and_secret_free() {
+        let object = WirelessObject::Radio(WirelessRadioConfig {
+            id: "radio0".into(),
+            ownership: ObjectOwnership::PlatformNative,
+            enabled: true,
+            band: WirelessBand::Ghz5,
+            channel: WirelessChannel::Fixed { channel: 149 },
+            width: WirelessChannelWidth::Mhz80,
+            country: Some("CN".into()),
+            tx_power_dbm: Some(20),
+        });
+        let encoded = serde_json::to_string(&object).expect("encode wireless object");
+        let decoded: WirelessObject =
+            serde_json::from_str(&encoded).expect("decode wireless object");
+        assert_eq!(decoded, object);
+        assert_eq!(decoded.kind(), "radio");
+        assert_eq!(decoded.id(), "radio0");
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("key"));
+        assert!(
+            serde_json::from_str::<WirelessObject>(
+                r#"{"kind":"radio","spec":{"id":"radio0","ownership":"platform_native","enabled":true,"band":"5ghz","channel":{"mode":"auto"},"width":"auto","country":null,"tx_power_dbm":null,"uci":"set wireless.radio0.disabled=1"}}"#
             )
             .is_err()
         );

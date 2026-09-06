@@ -7,6 +7,7 @@ pub mod firewall;
 pub mod network;
 pub mod resources;
 pub mod rollback;
+pub mod wireless;
 
 pub use actions::{
     ACTION_MANIFEST_SCHEMA_VERSION, ActionArgSpec, ActionChangeDomain, ActionChangeInvocation,
@@ -49,4 +50,11 @@ pub use rollback::{
     create_nftables_runtime_rollback_bundle, create_rollback_bundle,
     nftables_runtime_rollback_canonical_state, request_rollback, rollback_outcome,
     run_rollback_helper, runtime_rollback_canonical_state,
+};
+pub use wireless::{
+    WIRELESS_EXECUTION_PLAN_SCHEMA_VERSION, WirelessExecutionPlan, WirelessExecutionPlanError,
+    WirelessInventory, WirelessMutation, WirelessMutationPlan, WirelessPlanError,
+    WirelessPlannedChange, WirelessRiskContext, plan_wireless_mutations,
+    project_wireless_inventory, validate_wireless_object, verify_wireless_plan_result,
+    wireless_object_digest,
 };
