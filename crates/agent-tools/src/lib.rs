@@ -23,7 +23,7 @@ use agent_protocol::{
 use platform_linux::{FirewallBackend, PlatformCapabilities, PlatformKind};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const WAN_INTERFACE: &str = "wan";
 const MAX_INTERFACES: usize = 32;
@@ -38,6 +38,8 @@ const MAX_WIRELESS_RADIOS: usize = 16;
 const MAX_WIRELESS_INTERFACES: usize = 32;
 const MAX_INTERFACE_STATS: usize = 32;
 const MAX_QDISCS: usize = 64;
+const EXECUTABLE_BUSY_RETRIES: u32 = 3;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone)]
 pub struct ToolRunner {
@@ -390,13 +392,7 @@ impl ToolRunner {
             });
         };
         let started = Instant::now();
-        let mut child = Command::new(&executable)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut child = Self::spawn_collector(&executable, args).await?;
         let stdout = child
             .stdout
             .take()
@@ -441,6 +437,32 @@ impl ToolRunner {
             truncated: stdout_truncated || stderr_truncated,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
+    }
+
+    async fn spawn_collector(
+        executable: &Path,
+        args: &[&str],
+    ) -> io::Result<tokio::process::Child> {
+        for retry in 0..=EXECUTABLE_BUSY_RETRIES {
+            let result = Command::new(executable)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn();
+            match result {
+                Ok(child) => return Ok(child),
+                Err(error)
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy
+                        && retry < EXECUTABLE_BUSY_RETRIES =>
+                {
+                    sleep(EXECUTABLE_BUSY_RETRY_DELAY.saturating_mul(1 << retry)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded collector spawn loop always returns")
     }
 
     fn read_file(&self, probe: &str, absolute: &str) -> ProbeEvidence {
@@ -3199,6 +3221,31 @@ printf '%s\n' '[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],
         assert_eq!(eth0.carrier, Some(true));
         assert_eq!(eth0.addresses, ["192.0.2.10/24", "2001:db8::10/64"]);
         assert!(eth0.dynamic_address);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn collector_retries_a_transient_executable_busy_error() {
+        let fixture = Fixture::new();
+        fixture.executable("bin/ip", "#!/bin/sh\nprintf '%s\\n' 'ready'\n");
+        let executable = fixture.root.join("bin/ip");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("hold fixture executable open for writing");
+        let release_writer = tokio::spawn(async move {
+            sleep(Duration::from_millis(15)).await;
+            drop(writer);
+        });
+
+        let child = ToolRunner::spawn_collector(&executable, &[])
+            .await
+            .expect("collector starts after the transient writer closes");
+        let output = child.wait_with_output().await.expect("collector output");
+        release_writer.await.expect("writer release task");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready\n");
     }
 
     #[tokio::test]
