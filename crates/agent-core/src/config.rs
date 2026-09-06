@@ -1311,6 +1311,25 @@ mod tests {
     }
 
     #[test]
+    fn llm_fallback_toml_is_backward_compatible() {
+        let mut source = include_str!("../../../config/mbed-agent.example.toml").to_owned();
+        source.push_str(
+            r#"
+
+[[llm.fallbacks]]
+id = "backup"
+base_url = "https://backup.example.com/v1"
+api_key = "backup-key"
+model = "backup-model"
+"#,
+        );
+        let config: AgentConfig = toml::from_str(&source).expect("fallback config syntax");
+        config.validate().expect("fallback config validation");
+        assert_eq!(config.llm.fallbacks.len(), 1);
+        assert_eq!(config.llm.fallbacks[0].id, "backup");
+    }
+
+    #[test]
     fn volatile_task_history_must_retain_at_least_one_record() {
         let mut config = AgentConfig::default();
         config.storage.max_task_records = 0;
