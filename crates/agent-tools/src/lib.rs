@@ -2770,8 +2770,10 @@ mod tests {
     use platform_linux::{
         FirewallCapabilities, InitSystem, NetworkDeviceModel, PackageManager, PlatformKind,
     };
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
     // Rust's parallel test runner can briefly starve local shell fixtures on
@@ -3815,13 +3817,22 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
 
     impl Fixture {
         fn new() -> Self {
-            let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "mbed-agent-tools-test-{}-{fixture_id}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&root).expect("create fixture root");
-            Self { root }
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("fixture clock")
+                .as_nanos();
+            let pid = std::process::id();
+            for _ in 0..8 {
+                let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir()
+                    .join(format!("mbed-agent-tools-test-{pid}-{nonce}-{fixture_id}"));
+                match fs::create_dir(&root) {
+                    Ok(()) => return Self { root },
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create fixture root: {error}"),
+                }
+            }
+            panic!("could not allocate a unique fixture root")
         }
 
         fn write(&self, relative: &str, content: &str) {
@@ -3839,7 +3850,15 @@ printf '%s\n' '{"up":true,"available":true,"l3_device":"wan0","ipv4-address":[{"
                 "mbed-agent-test-{}",
                 FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::write(&temporary, content).expect("write fixture executable");
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .expect("create fixture executable");
+            file.write_all(content.as_bytes())
+                .expect("write fixture executable");
+            file.sync_all().expect("sync fixture executable");
+            drop(file);
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
                 .expect("make fixture executable");
             fs::rename(temporary, path).expect("publish fixture executable");
